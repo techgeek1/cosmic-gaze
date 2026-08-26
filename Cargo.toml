@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members  = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+gaze-core               = { path = "crates/gaze-core" }
+gaze-snap               = { path = "crates/gaze-snap" }
+gaze-detect             = { path = "crates/gaze-detect" }
+gaze-capture            = { path = "crates/gaze-capture" }
+gaze-overlay            = { path = "crates/gaze-overlay" }
+gaze-inject             = { path = "crates/gaze-inject" }
+gaze-provider-synthetic = { path = "crates/gaze-provider-synthetic" }
+gaze-provider-webcam    = { path = "crates/gaze-provider-webcam" }
+
+anyhow      = "1"
+thiserror   = "2"
+glam        = { version = "0.30", features = ["serde"] }
+serde       = { version = "1", features = ["derive"] }
+toml        = "0.9"
+serde_json  = "1"
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap        = { version = "4", features = ["derive"] }
+image       = { version = "0.25", default-features = false, features = ["png"] }
+rand        = "0.9"
+rand_distr  = "0.5"
+crossbeam-channel = "0.5"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

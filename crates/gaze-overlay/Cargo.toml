@@ -1,0 +1,20 @@
+[package]
+name    = "gaze-overlay"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+gaze-core = { workspace = true }
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+clap      = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+tiny-skia = "0.12"
+
+# `xkbcommon` is in sctk's default feature set and pulls a system library we do not need:
+# the overlay never takes keyboard focus. `calloop` gives us the event loop and the
+# wayland event source, and re-exports every wayland crate so versions cannot skew.
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }

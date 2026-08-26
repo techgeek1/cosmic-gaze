@@ -1,0 +1,17 @@
+[package]
+name    = "gaze-inject"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+gaze-core           = { workspace = true }
+gaze-capture        = { workspace = true }
+thiserror           = { workspace = true }
+serde               = { workspace = true }
+toml                = { workspace = true }
+clap                = { workspace = true }
+anyhow              = { workspace = true }
+tracing             = { workspace = true }
+tracing-subscriber  = { workspace = true }
+evdev               = "0.13"

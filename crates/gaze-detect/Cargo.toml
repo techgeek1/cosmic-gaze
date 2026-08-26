@@ -1,0 +1,26 @@
+[package]
+name              = "gaze-detect"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+gaze-core  = { workspace = true }
+anyhow     = { workspace = true }
+clap       = { workspace = true }
+image      = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+rayon      = "1"
+
+# `load-dynamic` opens the system onnxruntime (1.29 at /usr/lib/libonnxruntime.so) at
+# runtime instead of linking or downloading one; `default-features = false` is what turns
+# the `download-binaries` default off. `api-24` is the newest C API this `ort` knows and
+# 1.29 still serves it.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "api-24", "tracing"] }
+
+[[bin]]
+name = "gaze-detect-cli"
+path = "src/bin/gaze-detect-cli.rs"

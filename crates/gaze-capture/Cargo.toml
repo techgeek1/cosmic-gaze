@@ -1,0 +1,28 @@
+[package]
+name    = "gaze-capture"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+gaze-core = { workspace = true }
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+
+wayland-client    = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging", "unstable"] }
+memmap2           = "0.9"
+rustix            = { version = "1.1", features = ["event", "fs", "time"] }
+
+# Used only by `gaze-capture-cli`.
+anyhow = { workspace = true }
+clap   = { workspace = true }
+image  = { workspace = true }
+
+[[bin]]
+name = "gaze-capture-cli"
+path = "src/bin/gaze-capture-cli.rs"
+
+[lints.clippy]
+# The workspace style mandates explicit `Foo { x: x }` field syntax everywhere.
+redundant_field_names = "allow"

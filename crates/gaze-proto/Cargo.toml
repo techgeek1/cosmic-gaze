@@ -1,0 +1,26 @@
+[package]
+name              = "gaze-proto"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+gaze-core               = { workspace = true }
+gaze-snap               = { workspace = true }
+gaze-capture            = { workspace = true }
+gaze-detect             = { workspace = true }
+gaze-overlay            = { workspace = true }
+gaze-inject             = { workspace = true }
+gaze-provider-synthetic = { workspace = true }
+gaze-provider-webcam    = { workspace = true }
+
+anyhow             = { workspace = true }
+clap               = { workspace = true }
+crossbeam-channel  = { workspace = true }
+evdev              = "0.13"
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bin]]
+name = "gaze-proto"
+path = "src/main.rs"

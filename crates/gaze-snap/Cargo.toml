@@ -1,0 +1,9 @@
+[package]
+name    = "gaze-snap"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+gaze-core = { workspace = true }
+glam      = { workspace = true }
