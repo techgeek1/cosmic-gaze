@@ -9,6 +9,12 @@ tracker axis, lagged head features, target point, residual yaw/pitch, is_mean) â
 `schema.py`'s docstring for the exact mapping. If B2 ships different header names,
 add the rename to `COLUMN_ALIASES` below rather than touching any other module; every
 downstream file only imports `schema.COLUMNS` / `features.FEATURE_COLS`.
+
+The Rust exporter also writes columns this schema has no place for, and `load` drops
+them after printing what it dropped: `hold_key`, `session_phase`, the raw eye origins,
+the alternative combined residual, and the four passive-click columns
+(`element_kind`, `element_w_px`, `element_h_px`, `crop_luma`) that only rows from
+`gaze-clicks` fill in. Promote one into `schema.COLUMNS` when a model wants it.
 """
 
 from __future__ import annotations

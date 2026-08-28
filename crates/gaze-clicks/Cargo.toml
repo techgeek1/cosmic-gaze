@@ -1,0 +1,32 @@
+[package]
+name              = "gaze-clicks"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+gaze-core         = { workspace = true }
+gaze-capture      = { workspace = true }
+gaze-detect       = { workspace = true }
+gaze-provider-et5 = { workspace = true }
+
+anyhow             = { workspace = true }
+clap               = { workspace = true }
+crossbeam-channel  = { workspace = true }
+glam               = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+toml               = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+evdev       = "0.13"
+signal-hook = { version = "0.3", default-features = false }
+
+[[bin]]
+name = "gaze-clicks-cli"
+path = "src/bin/gaze-clicks-cli.rs"
+
+[lints.clippy]
+# The workspace style mandates explicit `Foo { x: x }` field syntax everywhere.
+redundant_field_names = "allow"

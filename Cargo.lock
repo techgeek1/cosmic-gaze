@@ -422,6 +422,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "gaze-clicks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossbeam-channel",
+ "evdev",
+ "gaze-capture",
+ "gaze-core",
+ "gaze-detect",
+ "gaze-provider-et5",
+ "glam",
+ "serde",
+ "serde_json",
+ "signal-hook",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "gaze-core"
 version = "0.1.0"
 dependencies = [

@@ -17,6 +17,7 @@ gaze-inject             = { path = "crates/gaze-inject" }
 gaze-provider-synthetic = { path = "crates/gaze-provider-synthetic" }
 gaze-provider-webcam    = { path = "crates/gaze-provider-webcam" }
 gaze-provider-et5       = { path = "crates/gaze-provider-et5" }
+gaze-clicks             = { path = "crates/gaze-clicks" }
 
 anyhow      = "1"
 thiserror   = "2"

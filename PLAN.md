@@ -136,6 +136,20 @@ then relative delta) and document the choice. Bin: `gaze-inject-cli --move x y`,
 `--click x y`, and `--probe` that walks the corners of each output and reports (by asking
 the user to confirm) where the cursor landed.
 
+### gaze-clicks (DONE; passive gaze labels from ordinary mouse clicks; PLAN-ET5 B4)
+```rust
+gaze-clicks-cli run [--out PATH] [--mouse PATH] [--mouse-name SUBSTR] [--models DIR] [--desk config/desk.toml] [--calibration config/calibration-et5.toml] [--blob config/calibration-et5.bin] [--no-tracker] [--capture-hz 1] [--crop-px 256]
+gaze-clicks-cli devices | probe
+```
+A background collector: reads the real mouse read-only (never `EVIOCGRAB`), captures the
+output under the pointer **on the press**, recognises a ±256 px crop, and writes the gaze
+frames around the press against the element's box as a `gaze-provider-et5` session file
+(`config/sessions/<unix>-<blobkey>-clicks.jsonl`). Rejects drags, off-desk clicks, stale
+frames, clicks on nothing, and clicks with no gaze over the approach. Holds the tracker
+for the whole run, so `gaze-proto` and `gaze-et5-cli` cannot run alongside it. Its status
+line's running median firmware offset is the daily drift number. See
+`crates/gaze-clicks/README.md`.
+
 ### gaze-bench (after core, detect, snap)
 Offline Monte Carlo as described above. Inputs: a directory of `<output>-<n>.png` with
 sidecar JSON from `gaze-detect-cli`. Fixation landing model: uniform inside the box

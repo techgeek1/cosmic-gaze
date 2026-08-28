@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
-use crossbeam_channel::TryRecvError;
+use crossbeam_channel::{RecvTimeoutError, TryRecvError};
 use glam::{DQuat, DVec3};
 use gaze_core::{DesktopGeometry, GazeSample, GlobalPx, Ray};
 use gaze_provider_synthetic::GazeProvider;
@@ -126,6 +126,10 @@ pub struct Et5Provider {
     backoff      : Duration,
     /// Consecutive failed reconnect attempts, for the log line.
     attempts     : u32,
+    /// Successful connects over the life of the provider, starting at one. Bumped by
+    /// every reconnect, so a caller streaming raw frames can notice that the device
+    /// went away and came back without watching the log.
+    connects     : u64,
     /// Host time of the last invalid sample emitted during a gap, for pacing.
     last_gap     : Instant,
     t0           : Instant,
@@ -165,6 +169,68 @@ impl Et5Provider {
         let t_s = self.t0.elapsed().as_secs_f64();
 
         self.convert.sample(frame, t_s)
+    }
+
+    /// The next raw device frame, or `None` when `timeout` expires with nothing to
+    /// report.
+    ///
+    /// Same device story as [`next`](GazeProvider::next): a transport error tears the
+    /// session down and the reconnect (blob re-uploaded and re-verified) is attempted
+    /// from here on the same backoff. The difference is what a gap looks like. `next`
+    /// has to keep a consumer's sample stream flowing, so it emits explicitly invalid
+    /// samples; a frame recorder has nothing honest to write, so a gap is simply an
+    /// absence of frames and every call during one returns `None`.
+    ///
+    /// Callers that need to know a gap happened watch [`connects`](Self::connects).
+    pub fn next_frame(&mut self, timeout: Duration) -> Option<Et5Frame> {
+        if self.stopped {
+            return None;
+        }
+
+        if self.device.is_none() {
+            self.reconnect_if_due();
+
+            // Still down: park for the caller's timeout rather than spinning on it.
+            if self.device.is_none() {
+                std::thread::sleep(timeout.min(GAP_TICK));
+
+                return None;
+            }
+        }
+
+        match self.frames.recv_timeout(timeout) {
+            Ok(frame)                           => Some(frame),
+            Err(RecvTimeoutError::Timeout)      => None,
+            Err(RecvTimeoutError::Disconnected) => {
+                self.link_lost();
+
+                None
+            }
+        }
+    }
+
+    /// How many times this provider has had a live session, starting at one. A change
+    /// means the link dropped and came back, and everything the device holds (the eye
+    /// model above all) was re-declared in between.
+    pub fn connects(&self) -> u64 {
+        self.connects
+    }
+
+    /// Retrieves the on-device calibration blob and reports its identity. `None` while
+    /// the link is down or when the retrieve fails.
+    ///
+    /// Costs a full blob transfer, so this is a start-of-session and post-reconnect
+    /// question, not a per-frame one.
+    pub fn device_blob_report(&mut self) -> Option<BlobReport> {
+        let bytes = self.device.as_mut()?.cal_retrieve().ok()?;
+
+        Some(BlobReport::of(&bytes))
+    }
+
+    /// The display area currently declared on the device. `None` while the link is
+    /// down or when the query fails.
+    pub fn device_display_area(&mut self) -> Option<DisplayArea> {
+        self.device.as_mut()?.display_area().ok()
     }
 }
 
@@ -253,12 +319,8 @@ impl Et5Provider {
     /// `None` means the caller should go back to receiving (the link is back) or that
     /// nothing is due yet (`block` false).
     fn gap_sample(&mut self, block: bool) -> Option<GazeSample> {
-        if Instant::now() >= self.next_attempt {
-            self.reconnect();
-
-            if self.device.is_some() {
-                return None;
-            }
+        if self.reconnect_if_due() {
+            return None;
         }
 
         let due = self.last_gap + GAP_TICK;
@@ -283,6 +345,17 @@ impl Et5Provider {
         })
     }
 
+    /// Attempts a reconnect when one is due. Returns true when the link came back.
+    fn reconnect_if_due(&mut self) -> bool {
+        if Instant::now() < self.next_attempt {
+            return false;
+        }
+
+        self.reconnect();
+
+        self.device.is_some()
+    }
+
     /// One reconnect attempt with the connect options this provider started with, so
     /// the blob is re-uploaded and re-verified. A failure schedules the next attempt
     /// and doubles the backoff.
@@ -300,6 +373,7 @@ impl Et5Provider {
                 self.device   = Some(device);
                 self.backoff  = RECONNECT_BACKOFF_MIN;
                 self.attempts = 0;
+                self.connects += 1;
             }
             Err(e)     => {
                 warn!(
@@ -408,6 +482,7 @@ impl Et5ProviderBuilder {
             next_attempt : Instant::now(),
             backoff      : RECONNECT_BACKOFF_MIN,
             attempts     : 0,
+            connects     : 1,
             last_gap     : Instant::now(),
             convert      : Converter {
                 geometry       : geometry,

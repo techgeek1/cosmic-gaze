@@ -33,7 +33,7 @@ use serde::Deserialize;
 use gaze_core::{DesktopGeometry, GlobalPx, OutputGeometry};
 
 use crate::gaze::{Et5Frame, VALIDITY_OK, combined_ray};
-use crate::record::{SessionEnd, SessionMeta};
+use crate::record::{CLICK_PHASE, ClickRecord, SessionEnd, SessionMeta};
 use crate::sweep::{
     FALLBACK_PX_PER_DEG, RaySample, StopWindow, TimedFrame, TrajPoint, desk_to_sensor,
     estimate_lag, saccade_mask, target_at, was_moving,
@@ -60,9 +60,10 @@ const STOP_MIN_FRAMES: usize = 5;
 /// untracked one, and the loader on the other side needs to be able to tell.
 ///
 /// Field names and units follow `model/gaze_model/schema.py`, which the Phase C harness
-/// reads without a rename shim. The four fields that schema has no column for
-/// ([`Row::hold_key`], [`Row::session_phase`], the raw origins and the alternative
-/// residual) are exported as extra columns; the harness drops what it does not know.
+/// reads without a rename shim. The fields that schema has no column for
+/// ([`Row::hold_key`], [`Row::session_phase`], the raw origins, the alternative
+/// residual and the four passive-click columns) are exported as extra columns;
+/// `load_export.py` prints them and drops them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     /// Session this row came from, and the export's `group_key`: leave-one-session-out
@@ -140,6 +141,19 @@ pub struct Row {
     pub residual_yaw_deg_combined   : f64,
     /// See [`Row::residual_yaw_deg_combined`].
     pub residual_pitch_deg_combined : f64,
+
+    /// Kind of the element a passive click landed on, lowercase (`button`, `text`,
+    /// `icon`, ...). Empty for every row that did not come from a click, so a
+    /// consumer can filter on it without joining anything.
+    pub element_kind    : String,
+    /// Width of that element's box, logical pixels. NaN for a non-click row.
+    pub element_w_px    : f64,
+    /// Height of that element's box, logical pixels. NaN for a non-click row.
+    pub element_h_px    : f64,
+    /// Mean luminance of the screen crop the element was found in, [0, 1]. The pupil
+    /// covariate a passive session gets in place of a driven background. NaN for a
+    /// non-click row.
+    pub crop_luma       : f64,
 }
 
 /// The CSV header, in the order [`Row::to_csv`] writes the fields.
@@ -166,6 +180,7 @@ pub const CSV_COLUMNS: &[&str] = &[
     "origin_raw_l_x_mm", "origin_raw_l_y_mm", "origin_raw_l_z_mm",
     "origin_raw_r_x_mm", "origin_raw_r_y_mm", "origin_raw_r_z_mm",
     "residual_yaw_deg_combined", "residual_pitch_deg_combined",
+    "element_kind", "element_w_px", "element_h_px", "crop_luma",
 ];
 
 /// How many leading columns are the Phase C harness's shared schema.
@@ -182,6 +197,8 @@ pub struct Session {
     pub end    : Option<SessionEnd>,
     /// Fixation and hold windows in file order.
     pub stops  : Vec<TaggedStop>,
+    /// Passive click records by their index `n`, empty for a recorded session.
+    pub clicks : BTreeMap<u64, ClickRecord>,
     /// The target trajectory over the whole session, sorted by time. Dense and
     /// continuous, which is what lets a frame be attributed to a phase.
     pub traj   : Vec<TrajPoint>,
@@ -195,9 +212,17 @@ pub struct Session {
 #[derive(Clone, Debug)]
 pub struct TaggedStop {
     /// The window itself.
-    pub stop : StopWindow,
+    pub stop    : StopWindow,
     /// Which part of the session it ran in.
-    pub tag  : Tag,
+    pub tag     : Tag,
+    /// Connector this window's target was on, from the record's own `display` field.
+    /// A recorded session runs on one display and every stop repeats the meta line's;
+    /// a passive click session clicks wherever the pointer is, so the stop's own value
+    /// is the authority and the meta line only names the tracker's declared plane.
+    pub display : Option<String>,
+    /// Index of the click this window belongs to, for a `click` phase record. `None`
+    /// for a recorded session's stops, which are identified by file order.
+    pub n       : Option<u64>,
 }
 
 /// The phase and background labels a record carries.
@@ -224,6 +249,7 @@ impl Session {
         let mut meta   = None;
         let mut end    = None;
         let mut stops  = Vec::new();
+        let mut clicks = BTreeMap::new();
         let mut traj   = Vec::new();
         let mut tags   = Vec::new();
         let mut frames = Vec::new();
@@ -238,7 +264,20 @@ impl Session {
                 "meta_end" => end  = serde_json::from_str::<SessionEnd>(line).ok(),
                 "stop"     => {
                     if let Some(stop) = record.stop {
-                        stops.push(TaggedStop { stop: stop, tag: record.tag() });
+                        stops.push(TaggedStop {
+                            stop    : stop,
+                            tag     : record.tag(),
+                            display : record.display.clone(),
+                            n       : record.n,
+                        });
+                    }
+                }
+                // An unknown kind is skipped by the arm below, so a reader that
+                // predates clicks still loads a click session; this arm is what makes
+                // the element columns available to one that does not.
+                "click"    => {
+                    if let Some(click) = record.click {
+                        clicks.insert(click.n, click);
                     }
                 }
                 "traj"     => {
@@ -268,6 +307,7 @@ impl Session {
             meta   : meta,
             end    : end,
             stops  : stops,
+            clicks : clicks,
             traj   : sorted_traj,
             tags   : sorted_tags,
             frames : frames,
@@ -364,19 +404,43 @@ pub fn rows(session: &Session, geometry: &DesktopGeometry) -> Vec<Row> {
     // the data and the whole reason the head features exist; `sweep`'s field fit drops
     // them only because a moving head is bad for a static 2D correction field.
     for (index, tagged) in session.stops.iter().enumerate() {
-        let hold_key = format!("stop_{index}");
-        let kind     = if tagged.stop.parallax { "hold" } else { "stop" };
-        let first    = rows.len();
+        // A passive click session clicks on whichever panel the pointer is on, so the
+        // target is resolved against the stop's own display and only falls back to the
+        // meta line's when the record does not name one (every recorded session).
+        let stop_out = tagged.display.as_deref()
+            .and_then(|name| geometry.outputs.iter().find(|o| o.name == name))
+            .unwrap_or(out);
+
+        let click = tagged.n.and_then(|n| session.clicks.get(&n));
+
+        let hold_key = {
+            match tagged.n {
+                Some(n) if tagged.tag.phase == CLICK_PHASE => format!("click_{n}"),
+                _                                          => format!("stop_{index}"),
+            }
+        };
+
+        let kind  = if tagged.stop.parallax { "hold" } else { "stop" };
+        let first = rows.len();
 
         for ((i, sample), _) in indexed.iter().zip(&keep).filter(|(_, k)| **k) {
             if sample.t_s < tagged.stop.t_start || sample.t_s > tagged.stop.t_end {
                 continue;
             }
 
-            rows.push(build_row(
-                session, out, pitch, axis, &heads, *i, sample, tagged.stop.px,
+            let mut row = build_row(
+                session, stop_out, pitch, axis, &heads, *i, sample, tagged.stop.px,
                 hold_key.clone(), kind, &tagged.tag.phase, &tagged.tag.background,
-            ));
+            );
+
+            if let Some(click) = click {
+                row.element_kind = click.element.kind.clone();
+                row.element_w_px = click.element.bbox.w;
+                row.element_h_px = click.element.bbox.h;
+                row.crop_luma    = click.crop_luma;
+            }
+
+            rows.push(row);
         }
 
         if rows.len() - first >= STOP_MIN_FRAMES {
@@ -503,6 +567,11 @@ impl Row {
         push(&mut fields, self.residual_yaw_deg_combined);
         push(&mut fields, self.residual_pitch_deg_combined);
 
+        fields.push(self.element_kind.clone());
+        push(&mut fields, self.element_w_px);
+        push(&mut fields, self.element_h_px);
+        push(&mut fields, self.crop_luma);
+
         fields.join(",")
     }
 
@@ -557,8 +626,14 @@ impl Head {
 /// One line of a session file, as far as the loader cares.
 #[derive(Deserialize)]
 struct RawRecord {
-    /// `meta`, `stop`, `traj`, `frame` or `meta_end`.
+    /// `meta`, `stop`, `traj`, `frame`, `click` or `meta_end`.
     kind       : String,
+    /// Connector the record's target was on. Every writer emits it.
+    #[serde(default)]
+    display    : Option<String>,
+    /// Click index, on the paired `stop` and `click` records of a passive session.
+    #[serde(default)]
+    n          : Option<u64>,
     /// Present on records written by `record`; absent in imported legacy data.
     #[serde(default)]
     phase      : Option<String>,
@@ -571,6 +646,8 @@ struct RawRecord {
     point      : Option<TrajPoint>,
     #[serde(default)]
     frame      : Option<TimedFrame>,
+    #[serde(default)]
+    click      : Option<ClickRecord>,
 }
 
 // --- RawRecord ---
@@ -819,6 +896,12 @@ fn build_row(
         residual_pitch_deg  : residual_pitch_deg,
         residual_yaw_deg_combined   : residual_yaw_deg_combined,
         residual_pitch_deg_combined : residual_pitch_deg_combined,
+        // Filled in by the caller for a click stop; a row from a recorded session has
+        // no element and no measured screen luminance to report.
+        element_kind        : String::new(),
+        element_w_px        : f64::NAN,
+        element_h_px        : f64::NAN,
+        crop_luma           : f64::NAN,
     }
 }
 
@@ -868,6 +951,12 @@ fn mean_row(rows: &[Row]) -> Row {
     mean.residual_pitch_deg  = avg(&|r| r.residual_pitch_deg);
     mean.residual_yaw_deg_combined   = avg(&|r| r.residual_yaw_deg_combined);
     mean.residual_pitch_deg_combined = avg(&|r| r.residual_pitch_deg_combined);
+
+    // Constant across a click's frames, so the mean is the value; averaging anyway
+    // keeps every numeric field on one rule.
+    mean.element_w_px        = avg(&|r| r.element_w_px);
+    mean.element_h_px        = avg(&|r| r.element_h_px);
+    mean.crop_luma           = avg(&|r| r.crop_luma);
 
     mean
 }
@@ -1248,6 +1337,171 @@ mod tests {
         assert!(!rows.is_empty());
         assert!(rows.iter().all(|r| r.phase == "hold"),
                 "the head-sweep hold is kept, tagged `hold`, not dropped");
+    }
+
+    /// The other panel a click can land on, which is never the meta line's display in
+    /// the click test: the point of that test is that the stop's own `display` wins.
+    const OTHER: &str = "DP-2";
+
+    /// Writes a passive click session: the meta line on `FLAT` (the tracker's declared
+    /// plane), one click on `OTHER`, and the frames around it.
+    fn click_session_file(
+        geometry : &DesktopGeometry,
+        name     : &str,
+        uv       : (f64, f64),
+        window   : (f64, f64),
+        frames   : Vec<serde_json::Value>,
+    )
+        -> Session
+    {
+        let other = geometry.outputs.iter().find(|o| o.name == OTHER).expect("the second panel");
+        let px    = other.uv_to_px(uv.0, uv.1);
+
+        let meta = SessionMeta {
+            kind              : "meta".into(),
+            format            : SESSION_FORMAT,
+            session_id        : name.into(),
+            created_unix_s    : 0.0,
+            blob_sha256       : "0".repeat(64),
+            blob_bytes        : 0,
+            display           : FLAT.into(),
+            display_area      : area(geometry),
+            desk_sha256       : "0".repeat(64),
+            tracker_pitch_deg : 0.0,
+            glasses           : false,
+            note              : "clicks".into(),
+        };
+
+        let mut lines = vec![json!(meta).to_string()];
+
+        lines.push(json!({
+            "kind"       : "stop",
+            "display"    : OTHER,
+            "phase"      : "click",
+            "background" : "screen",
+            "n"          : 0,
+            "stop"       : {
+                "u": uv.0, "v": uv.1, "px": px,
+                "t_start": window.0, "t_end": window.1, "parallax": false,
+            },
+        }).to_string());
+
+        lines.push(json!({
+            "kind"    : "click",
+            "display" : OTHER,
+            "phase"   : "click",
+            "n"       : 0,
+            "click"   : {
+                "n"           : 0,
+                "button"      : "left",
+                "output"      : OTHER,
+                "px"          : px,
+                "t_press"     : window.1 - 0.1,
+                "t_release"   : window.1 - 0.02,
+                "moved_px"    : 0.4,
+                "multi"       : 1,
+                "element"     : {
+                    "kind"  : "button",
+                    "bbox"  : { "x": px.x - 30.0, "y": px.y - 12.0, "w": 60.0, "h": 24.0 },
+                    "text"  : "Save",
+                    "score" : 0.87,
+                },
+                "crop_luma"   : 0.21,
+                "frame_age_s" : 0.031,
+            },
+        }).to_string());
+
+        // A kind no reader knows. Skipping it rather than failing is what lets the
+        // format grow without orphaning every tool that reads it.
+        lines.push(json!({ "kind": "future", "display": OTHER, "whatever": 1 }).to_string());
+
+        for frame in frames {
+            lines.push(frame.to_string());
+        }
+
+        let path = std::env::temp_dir().join(format!("gaze-et5-{name}.jsonl"));
+        std::fs::write(&path, lines.join("\n")).expect("write the synthetic session");
+
+        let session = Session::load(&path).expect("the synthetic session loads");
+        let _ = std::fs::remove_file(&path);
+
+        session
+    }
+
+    #[test]
+    fn a_click_session_exports_click_rows_with_their_element_columns() {
+        let geometry = desk();
+        let uv       = (0.4, 0.6);
+
+        // The frames only have to be valid; where they look is not what this checks.
+        let frames = (0..20)
+            .map(|i| frame(1.0 + i as f64 * 0.011, [0.0, 100.0, 600.0], 0.5, 0.5))
+            .collect();
+
+        let session = click_session_file(&geometry, "clicks", uv, (1.0, 1.2), frames);
+
+        assert_eq!(session.clicks.len(), 1, "the click record loaded");
+        assert_eq!(session.stops.len() , 1);
+        assert_eq!(session.stops[0].n  , Some(0));
+        assert_eq!(session.stops[0].display.as_deref(), Some(OTHER));
+
+        let rows = rows(&session, &geometry);
+
+        assert!(!rows.is_empty(), "the click produced rows");
+
+        for row in &rows {
+            assert_eq!(row.session_phase, "click");
+            assert_eq!(row.background   , "screen");
+            assert_eq!(row.hold_key     , "click_0");
+            assert_eq!(row.phase        , "stop");
+
+            assert_eq!(row.element_kind, "button");
+            assert!((row.element_w_px - 60.0).abs() < 1e-9);
+            assert!((row.element_h_px - 24.0).abs() < 1e-9);
+            assert!((row.crop_luma - 0.21).abs() < 1e-9);
+        }
+
+        // The target came off the stop's own display, not the meta line's. The two
+        // panels are far apart, so reading the wrong one is unmissable.
+        let other = geometry.outputs.iter().find(|o| o.name == OTHER).expect("the second panel");
+        let flat  = geometry.outputs.iter().find(|o| o.name == FLAT).expect("the flat panel");
+        let px    = other.uv_to_px(uv.0, uv.1);
+
+        let want = desk_to_sensor(other.px_to_world(px).to_array(), 0.0);
+        let wrong = desk_to_sensor(flat.px_to_world(px).to_array(), 0.0);
+
+        for (c, axis) in want.iter().enumerate() {
+            assert!((rows[0].target_mm[c] - axis).abs() < 1e-9,
+                    "target axis {c}: {} vs {axis}", rows[0].target_mm[c]);
+        }
+
+        assert!((0..3).any(|c| (want[c] - wrong[c]).abs() > 1.0),
+                "the two panels have to disagree for this test to mean anything");
+
+        // And every row still has one field per column.
+        for row in &rows {
+            assert_eq!(row.to_csv().split(',').count(), CSV_COLUMNS.len());
+        }
+    }
+
+    #[test]
+    fn a_recorded_session_leaves_the_click_columns_empty() {
+        let geometry = desk();
+        let uv       = (0.5, 0.5);
+        let frames   = (0..10)
+            .map(|i| frame(1.0 + i as f64 * 0.011, [0.0, 100.0, 600.0], uv.0, uv.1))
+            .collect();
+
+        let session = session_file("noclick", &geometry, uv, (1.0, 1.15), frames);
+        let rows    = rows(&session, &geometry);
+
+        assert!(!rows.is_empty());
+
+        for row in &rows {
+            assert!(row.element_kind.is_empty());
+            assert!(row.element_w_px.is_nan());
+            assert!(row.crop_luma.is_nan());
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # ET5 provider build plan: host-owned device state, then a state-conditioned model
 
-**Status 2026-08-28: A0–A3, B1–B2 and the Phase C harness built (see DESIGN.md §10c results
+**Status 2026-08-28: A0–A3, B1–B2, B4 and the Phase C harness built (see DESIGN.md §10c results
 log); A5 built — `calibrate` is now the retrain ceremony (no `--retrain` flag; it confirms
 before touching the device). A4, B3 and the device checks are the user's.** Background and the research that led here:
 DESIGN.md §10c. This plan replaces the compound sweep's client-side fitting (correction
@@ -132,6 +132,64 @@ own limit (~0.7° inside the cone), with drift that corrects itself from ordinar
   vector (3), pupil L/R (2), validity flags, angle of the combined ray from the tracker axis,
   and the head features again lagged 300 ms.
 
+### B4. Passive click labels (`gaze-clicks`)
+
+A background collector that runs all day while the user works the mouse normally. People
+look at what they click, so every deliberate click on a recognised control is a labelled
+gaze sample with no calibration screen and no dot: the element's box is the target, the
+frames around the press are the observation. It feeds the same model B2 exports for, and
+it is the data source E1/E2's flywheel acceptance will eventually run on.
+
+- **Reads the real mouse read-only, never `EVIOCGRAB`.** The compositor keeps every
+  event. Default node is the one named `input-remapper mouse` (the clone cosmic-comp
+  reads on this desk); `--mouse`/`--mouse-name` override, fallback is the first device
+  with `BTN_LEFT` that is not a keyboard. `BTN_LEFT` and `BTN_RIGHT` only; the wheel and
+  the side buttons point at no element.
+- **Capture on the press, not from a rolling buffer.** Everything that destroys a click
+  target fires on the *release* (menu activation, navigation, popup dismissal), so
+  between press and release the target is still under the pointer; pressed-state
+  highlights and popups opening underneath are harmless. The evdev reader fires
+  `capture_output` the moment the press arrives and that frame is used if it lands
+  within 150 ms (measured: 20 to 40 ms). A 1 Hz rolling capture is the fallback only,
+  never used past 500 ms old or after the release; using it tallies `late-capture`.
+- **Recognition on a crop**, ±256 logical px around the pointer, so a click costs tens of
+  milliseconds rather than the ~400 ms a whole ultrawide frame costs. Smallest accepted
+  box containing the pointer wins (boxes nest; the innermost is what was aimed at).
+  `Unknown` boxes are refused even as containers. `Icon` and `Slider` are accepted and
+  recorded as themselves so the export can filter them.
+- **Rejections, in order:** `drag` (held > 400 ms or moved > 6 px), `off-desk` (an output
+  `desk.toml` does not describe), `stale` (no usable frame), `no-element`, `no-gaze`
+  (under 20% of the frames in `[t_press - 0.6, t_press]` carrying a valid combined gaze).
+  `no-element` is the one that matters: a focus click on empty space says nothing about
+  gaze and is the most common press on a desktop.
+- **Output** is B1's session format verbatim, one file per on-device eye model:
+  `config/sessions/<unix>-<blobkey>-clicks.jsonl`, rotated if the tracker reconnects
+  holding a different blob body hash. Per click: a `"stop"` (`phase: "click"`,
+  `background: "screen"`, window `[t_press - 0.6, t_press + 0.1]`), a new `"click"`
+  record (`n`, button, output, px, press/release times, `moved_px`, `multi`, the element,
+  `crop_luma`, `frame_age_s`), and the `"frame"` records of
+  `[t_press - 1.2, t_press + 0.4]`, deduplicated across overlapping clicks. Flushed per
+  click; a session killed without its `meta_end` line still loads.
+- **B2 changes.** Stops are now resolved against the record's own `display` rather than
+  the meta line's, because a click lands on any of the three panels while the meta line
+  names only the display the tracker's plane is declared on. Rows from a `click` stop get
+  `hold_key = click_<n>`, `session_phase = "click"`, and four extra columns
+  (`element_kind`, `element_w_px`, `element_h_px`, `crop_luma`), empty or NaN elsewhere.
+  Unknown record kinds are skipped, so an older reader still loads a click session.
+- **Provider change.** `Et5Provider::next_frame(timeout)` yields raw `Et5Frame`s with the
+  same connect-time upload and reconnect behaviour as `next()`, reporting a gap as an
+  absence of frames rather than as invalid samples; `connects()`, `device_blob_report()`
+  and `device_display_area()` support the session meta and the rotation check.
+  `next()` is unchanged.
+- **Live feedback.** A line per accepted click, and a ten-second status line with the
+  tallies and the running median firmware offset over the last twenty accepted clicks.
+  That offset is the angle between the firmware's filtered gaze point and where the user
+  clicked, measured the way `retrain::run_health` measures its grid, which makes it a
+  free daily drift number.
+- `--no-tracker` runs the whole pipeline without the device (clicks, recognition,
+  tallies, click records) and is the test mode. `devices` lists candidate nodes; `probe`
+  prints the pointer, its output and the element under it once a second.
+
 ### B3. Collection **[user]**
 - ≥ 6 sessions over ≥ 3 days, morning and evening, glasses state noted. Nothing else moves
   (tracker, monitors, desk config) during the collection window.
@@ -183,8 +241,8 @@ own limit (~0.7° inside the cone), with drift that corrects itself from ordinar
 
 ## Order and parallelism
 
-A0, A1, A2, A3, A5 code, B1, B2 and the C1–C4 harness (against session zero) are all agent
-work and mostly independent; A1 first because everything else connects through it. A4 and
+A0, A1, A2, A3, A5 code, B1, B2, B4 and the C1–C4 harness (against session zero) are all
+agent work and mostly independent; A1 first because everything else connects through it. A4 and
 B3 are the user's, and Phase C's real result waits on B3. D1–D2 can start against C3's
 exported model before the gate if the harness is ready; D3–D5 and E wait for the gate.
 

@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 use serde::{Deserialize, Serialize};
 use tracing::info;
-use gaze_core::{DesktopGeometry, GlobalPx, OutputGeometry, Ray};
+use gaze_core::{DesktopGeometry, GlobalPx, OutputGeometry, Ray, Rect};
 use gaze_overlay::{OverlayHandle, OverlayState};
 
 use crate::blob::{BlobReport, sha256_hex};
@@ -48,8 +48,8 @@ use crate::device::Device;
 use crate::gaze::Et5Frame;
 use crate::sweep::{
     COLLECT_HOLD_S, COLLECT_PROMPTS, COLLECT_U_MAX, COLLECT_U_MIN, COLLECT_V_MAX,
-    COLLECT_V_MIN, PassData, StopWindow, SweepError, SweepKey, glide, set_overlay_background,
-    show_target, wait_draining,
+    COLLECT_V_MIN, PassData, StopWindow, SweepError, SweepKey, TimedFrame, glide,
+    set_overlay_background, show_target, wait_draining,
 };
 use crate::ttp::DisplayArea;
 
@@ -237,6 +237,63 @@ pub struct SessionEnd {
     pub frames       : usize,
     /// How many of them had at least one tracked eye.
     pub valid_frames : usize,
+}
+
+/// `phase` value on the records `gaze-clicks` writes. Not a [`Phase`] variant: the
+/// three variants there each paint an overlay background, and a passive click session
+/// paints nothing at all.
+pub const CLICK_PHASE: &str = "click";
+
+/// `background` value on those records. The screen is whatever the user was working on,
+/// which is neither of the two controlled pupil extremes a recorded session drives.
+pub const CLICK_BACKGROUND: &str = "screen";
+
+/// The element a click landed on, as the recogniser saw it just before the press.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClickElement {
+    /// `gaze_core::ElementKind` in lowercase: `button`, `text`, `icon` and so on.
+    pub kind  : String,
+    /// The element's box in global logical pixels.
+    pub bbox  : Rect,
+    /// Recognised text, when the box came from OCR or carried a label.
+    pub text  : Option<String>,
+    /// The recogniser's confidence in [0, 1].
+    pub score : f32,
+}
+
+/// One accepted click: everything about the press that is not a gaze frame.
+///
+/// Written as a `"click"` record next to the `"stop"` record that carries the same
+/// press's collection window. Readers that do not know the kind skip it, so a session
+/// file with clicks in it still loads in every older tool.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClickRecord {
+    /// Index of this click within the session, from zero. The `"stop"` record repeats
+    /// it as its own `n`, which is the only key tying the two together.
+    pub n           : u64,
+    /// `left` or `right`.
+    pub button      : String,
+    /// Connector the pointer was on.
+    pub output      : String,
+    /// Where the pointer was at the press, global logical pixels.
+    pub px          : GlobalPx,
+    /// Host time of the press, seconds since the collector started.
+    pub t_press     : f64,
+    /// Host time of the release.
+    pub t_release   : f64,
+    /// How far the pointer moved between press and release, logical pixels.
+    pub moved_px    : f64,
+    /// 1 for a single click, 2 for the second of a double, and so on.
+    pub multi       : u32,
+    /// The element under the pointer.
+    pub element     : ClickElement,
+    /// Mean luminance of the crop the element was found in, [0, 1]. The pupil
+    /// covariate a passive session gets instead of a driven background.
+    pub crop_luma   : f64,
+    /// Capture-completion time of the frame the element came from, relative to the
+    /// press. Positive for the capture fired by the press itself, negative for a
+    /// fallback frame taken from the rolling cache.
+    pub frame_age_s : f64,
 }
 
 /// What a finished session produced.
@@ -839,6 +896,58 @@ fn run_wander(
     Ok(())
 }
 
+// --- Lines ---
+
+/// One `"stop"` line. `n` is the click index for a passive click session and `None`
+/// for a recorded one, where a stop is identified by its position in the file.
+///
+/// Every writer of the session format goes through these three builders, so the shape
+/// of a line is decided in one place rather than in each producer.
+pub fn stop_line(
+    display    : &str,
+    phase      : &str,
+    background : &str,
+    stop       : &StopWindow,
+    n          : Option<u64>,
+)
+    -> serde_json::Value
+{
+    let mut value = serde_json::json!({
+        "kind"       : "stop",
+        "display"    : display,
+        "phase"      : phase,
+        "background" : background,
+        "stop"       : stop,
+    });
+
+    if let (Some(n), Some(object)) = (n, value.as_object_mut()) {
+        object.insert("n".into(), serde_json::json!(n));
+    }
+
+    value
+}
+
+/// One `"frame"` line. Frames stay exactly as the readings format has them, so the
+/// archive readers in `sweep` can still parse a session file.
+pub fn frame_line(display: &str, frame: &TimedFrame) -> serde_json::Value {
+    serde_json::json!({
+        "kind"    : "frame",
+        "display" : display,
+        "frame"   : frame,
+    })
+}
+
+/// One `"click"` line.
+pub fn click_line(display: &str, click: &ClickRecord) -> serde_json::Value {
+    serde_json::json!({
+        "kind"    : "click",
+        "display" : display,
+        "phase"   : CLICK_PHASE,
+        "n"       : click.n,
+        "click"   : click,
+    })
+}
+
 // --- Writing ---
 
 /// Writes a session: meta line, every phase's records, end line.
@@ -857,13 +966,10 @@ fn write_session(
 
     for (phase, pass) in phases {
         for stop in &pass.stops {
-            writeln!(w, "{}", serde_json::json!({
-                "kind"       : "stop",
-                "display"    : meta.display,
-                "phase"      : phase.as_str(),
-                "background" : phase.background_name(),
-                "stop"       : stop,
-            }))?;
+            let line = stop_line(&meta.display, phase.as_str(), phase.background_name(),
+                                 stop, None);
+
+            writeln!(w, "{line}")?;
         }
 
         for point in &pass.traj {
@@ -876,14 +982,8 @@ fn write_session(
             }))?;
         }
 
-        // Frames stay exactly as the readings format has them, so the archive readers in
-        // `sweep` can still parse a session file.
         for frame in &pass.frames {
-            writeln!(w, "{}", serde_json::json!({
-                "kind"    : "frame",
-                "display" : meta.display,
-                "frame"   : frame,
-            }))?;
+            writeln!(w, "{}", frame_line(&meta.display, frame))?;
         }
     }
 
