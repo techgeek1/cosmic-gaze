@@ -45,12 +45,18 @@ Before leaving it running, two checks:
 
 ```sh
 cargo run --bin gaze-clicks-cli -- devices     # is it reading the right node?
-cargo run --bin gaze-clicks-cli -- probe       # does it see what you see?
+cargo run --bin gaze-clicks-cli -- probe       # does it see what you see? (runs until Ctrl-C)
 ```
 
-`probe` prints the pointer, its output and the element under it once a second, and when
-nothing is under the pointer it names the nearest box instead, so a systematic
-coordinate offset would be obvious.
+`probe` runs until Ctrl-C (`--seconds N` to stop early). Once a second it prints the
+pointer, its output and the element under it, and draws the same thing on screen: the
+chosen box outlined with its kind, size and text, and a cross where the pointer was
+read, so the cross should sit under the real cursor and the outline should be the thing
+you would say you are pointing at. When nothing contains the pointer it outlines the
+nearest box labelled `NEAREST` (a systematic coordinate offset would show as every box
+sitting a fixed distance away), and `NOTHING` when the crop had no boxes. The overlay
+blanks for 60 ms before each capture so its own outline is never what gets recognised —
+the once-a-second blink is that.
 
 `--no-tracker` runs everything except the device: clicks, recognition, tallies and click
 records, with no gaze frames or stop windows. It is the way to exercise the rules with

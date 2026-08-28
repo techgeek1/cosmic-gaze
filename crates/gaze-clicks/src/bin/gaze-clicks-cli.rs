@@ -20,7 +20,8 @@ use gaze_clicks::collect::{self, CollectConfig};
 use gaze_clicks::element::smallest_containing;
 use gaze_clicks::mouse;
 use gaze_clicks::perceive::{DetectOutcome, DetectRequest, Perception, PerceptionConfig};
-use gaze_core::{Element, GlobalPx};
+use gaze_core::{Element, GlobalPx, Rect};
+use gaze_overlay::{Overlay, OverlayState};
 use signal_hook::consts::SIGINT;
 use signal_hook::flag;
 use tracing_subscriber::EnvFilter;
@@ -95,15 +96,18 @@ enum Command {
         mouse_name : String,
     },
 
-    /// Print the pointer, its output and the element under it, once a second.
+    /// Show what the recogniser sees under the pointer, once a second, until
+    /// interrupted: the chosen box is outlined on screen with its kind and text, and a
+    /// cross marks where the pointer was read. Nothing containing the pointer outlines
+    /// the nearest box instead, labelled NEAREST.
     Probe {
         /// Directory holding the ONNX models.
         #[arg(long, default_value = "models")]
         models  : PathBuf,
 
-        /// How long to run for, seconds.
-        #[arg(long, default_value_t = 10.0)]
-        seconds : f64,
+        /// Stop after this many seconds instead of waiting for Ctrl-C.
+        #[arg(long)]
+        seconds : Option<f64>,
 
         /// Half-width of the recognition crop, logical pixels.
         #[arg(long, default_value_t = 256.0)]
@@ -153,6 +157,14 @@ fn main() -> Result<()> {
         Command::Probe { models, seconds, crop_px } => probe(models, seconds, crop_px),
     }
 }
+
+/// How often the probe looks, wall clock.
+const PROBE_PERIOD: Duration = Duration::from_millis(1000);
+
+/// How long the probe leaves the overlay blank before capturing, so the frame it
+/// recognises is the desktop and not its own last outline. Two or three refresh
+/// intervals on the slowest panel here.
+const PROBE_BLANK: Duration = Duration::from_millis(60);
 
 // --- Commands ---
 
@@ -233,8 +245,13 @@ fn devices(mouse_name: &str) -> Result<()> {
 }
 
 /// Prints what the recogniser sees under the pointer, once a second.
-fn probe(models: PathBuf, seconds: f64, crop_px: f64) -> Result<()> {
+fn probe(models: PathBuf, seconds: Option<f64>, crop_px: f64) -> Result<()> {
     let t0 = Instant::now();
+
+    // The overlay's own marks are on the captured screen, and a stroked box is exactly
+    // what the widget model calls a button. Every tick therefore blanks the overlay,
+    // waits for the compositor to repaint without it, and only then captures.
+    let (overlay, overlay_join) = Overlay::spawn().context("spawning the overlay")?;
 
     // The probe fires its own captures down the channel the mouse reader would use,
     // so it exercises exactly the path a click takes.
@@ -250,15 +267,18 @@ fn probe(models: PathBuf, seconds: f64, crop_px: f64) -> Result<()> {
         press_rx,
     )?;
 
-    let deadline = Instant::now() + Duration::from_secs_f64(seconds);
+    let deadline = seconds.map(|s| Instant::now() + Duration::from_secs_f64(s));
     let stop     = Arc::new(AtomicBool::new(false));
 
     flag::register(SIGINT, Arc::clone(&stop)).context("registering the SIGINT handler")?;
 
     let mut id = 0u64;
 
-    while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_secs(1));
+    while deadline.is_none_or(|d| Instant::now() < d) && !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(PROBE_PERIOD - PROBE_BLANK);
+
+        overlay.set(OverlayState::default()).context("the overlay thread exited")?;
+        std::thread::sleep(PROBE_BLANK);
 
         let Some(sample) = perception.pointer_now() else {
             println!("pointer: not reported on any output yet");
@@ -287,35 +307,78 @@ fn probe(models: PathBuf, seconds: f64, crop_px: f64) -> Result<()> {
         let reply = perception.replies().recv_timeout(Duration::from_secs(5))
             .context("the recogniser did not answer")?;
 
-        let line = {
+        let (line, shown) = {
             match reply.outcome {
                 DetectOutcome::Found { elements, crop_luma, choice } => {
-                    let hit = {
+                    // The nearest box when nothing contains the pointer: a systematic
+                    // offset between what the recogniser reports and what is on screen
+                    // shows up here as every box sitting a fixed distance away.
+                    let (hit, shown) = {
                         match smallest_containing(&elements, sample.global) {
-                            Some(e) => describe(e),
-                            // The nearest box instead: a systematic offset between
-                            // what the recogniser reports and what is on screen shows
-                            // up here as every box sitting a fixed distance away.
-                            None    => nearest(&elements, sample.global),
+                            Some(e) => (describe(e), Some((e.bbox, caption("", e)))),
+                            None    => {
+                                match nearest(&elements, sample.global) {
+                                    Some(e) => (
+                                        format!("nothing under the pointer; nearest is {}",
+                                                describe(e)),
+                                        Some((e.bbox, caption("NEAREST ", e))),
+                                    ),
+                                    None => ("nothing in the crop".to_string(), None),
+                                }
+                            }
                         }
                     };
 
-                    format!("{} boxes, luma {crop_luma:.2}, {choice:?} — {hit}",
-                            elements.len())
+                    (format!("{} boxes, luma {crop_luma:.2}, {choice:?} — {hit}",
+                             elements.len()), shown)
                 }
-                DetectOutcome::Stale     => "no usable frame".to_string(),
-                DetectOutcome::OffFrame  => "the pointer left the captured output".to_string(),
-                DetectOutcome::Failed(e) => format!("recognition failed: {e}"),
+                DetectOutcome::Stale     => ("no usable frame".to_string(), None),
+                DetectOutcome::OffFrame  => {
+                    ("the pointer left the captured output".to_string(), None)
+                }
+                DetectOutcome::Failed(e) => (format!("recognition failed: {e}"), None),
             }
         };
 
         println!("{} ({:.0}, {:.0}): {}",
                  sample.output, sample.global.x, sample.global.y, line);
+
+        // The cross is where the pointer was read, so a coordinate error in the cursor
+        // path shows as the cross sitting away from the real cursor.
+        let (highlight, label): (Option<Rect>, Option<String>) = {
+            match shown {
+                Some((bbox, label)) => (Some(bbox), Some(label)),
+                None                => (None, Some("NOTHING".to_string())),
+            }
+        };
+
+        overlay.set(OverlayState {
+            gaze       : None,
+            highlight  : highlight,
+            truth      : Some(sample.global),
+            label      : label,
+            background : None,
+        })
+        .context("the overlay thread exited")?;
     }
 
+    overlay.stop();
+    let _ = overlay_join.join();
     perception.stop();
 
     Ok(())
+}
+
+/// The overlay caption for a box: prefix, kind, size and any text, ASCII only and
+/// short enough to read at a glance.
+fn caption(prefix: &str, e: &Element) -> String {
+    let text = e.text.as_deref()
+        .map(|t| t.trim().chars().take(24).collect::<String>())
+        .filter(|t| !t.is_empty())
+        .map(|t| format!(" \"{t}\""))
+        .unwrap_or_default();
+
+    format!("{prefix}{:?} {:.0}x{:.0}{text}", e.kind, e.bbox.w, e.bbox.h)
 }
 
 // --- Reporting ---
@@ -330,8 +393,8 @@ fn describe(e: &Element) -> String {
 }
 
 /// The box whose centre is closest to `p`, for when nothing contains it.
-fn nearest(elements: &[Element], p: GlobalPx) -> String {
-    let closest = elements.iter().min_by(|a, b| {
+fn nearest(elements: &[Element], p: GlobalPx) -> Option<&Element> {
+    elements.iter().min_by(|a, b| {
         let d = |e: &Element| {
             let c = e.bbox.center();
 
@@ -339,10 +402,5 @@ fn nearest(elements: &[Element], p: GlobalPx) -> String {
         };
 
         d(a).total_cmp(&d(b))
-    });
-
-    match closest {
-        Some(e) => format!("nothing under the pointer; nearest is {}", describe(e)),
-        None    => "nothing in the crop".to_string(),
-    }
+    })
 }

@@ -9,6 +9,7 @@ gaze-core         = { workspace = true }
 gaze-capture      = { workspace = true }
 gaze-detect       = { workspace = true }
 gaze-provider-et5 = { workspace = true }
+gaze-overlay      = { workspace = true }
 
 anyhow             = { workspace = true }
 clap               = { workspace = true }

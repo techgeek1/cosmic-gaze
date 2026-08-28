@@ -432,6 +432,7 @@ dependencies = [
  "gaze-capture",
  "gaze-core",
  "gaze-detect",
+ "gaze-overlay",
  "gaze-provider-et5",
  "glam",
  "serde",
