@@ -16,7 +16,9 @@ use gaze_core::DesktopGeometry;
 use gaze_provider_webcam::sweep::SweepRecord;
 use gaze_provider_webcam::{CameraPose, check, sweep, webcam_profile};
 
-const DESK_TOML: &str = include_str!("../../../config/desk.toml");
+/// The frozen 2026-08-25 desk snapshot these assertions were written against;
+/// the live `config/desk.toml` drifts with the physical desk.
+const FIXTURE_TOML: &str = include_str!("../../../config/desk-fixture.toml");
 const FIXTURE: &str   = include_str!("fixtures/sweep.jsonl");
 
 /// Largest RMS difference between the fit and the replay that is not a bug, degrees.
@@ -25,8 +27,8 @@ const TOLERANCE_DEG: f64 = 0.01;
 
 fn desk() -> (DesktopGeometry, CameraPose) {
     (
-        DesktopGeometry::from_toml(DESK_TOML).unwrap(),
-        CameraPose::from_desk_toml(DESK_TOML).unwrap(),
+        DesktopGeometry::from_toml(FIXTURE_TOML).unwrap(),
+        CameraPose::from_desk_toml(FIXTURE_TOML).unwrap(),
     )
 }
 

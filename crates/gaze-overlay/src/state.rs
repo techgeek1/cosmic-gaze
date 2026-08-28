@@ -20,6 +20,11 @@ pub struct OverlayState {
     /// Debug only: a short ASCII caption drawn next to the highlight. Rendered with the
     /// built in 5x7 bitmap font, so anything outside printable ASCII becomes `?`.
     pub label     : Option<String>,
+    /// A solid colour painted over the whole of every surface, behind everything else,
+    /// as straight-alpha RGBA. `None` is the transparent debug overlay: the desktop
+    /// shows through. Anything else hides the desktop, which is what a recording
+    /// session wants when it needs the pupil at a known illumination.
+    pub background : Option<[u8; 4]>,
 }
 
 // --- OverlayState ---
@@ -32,5 +37,6 @@ impl OverlayState {
             && self.highlight.is_none()
             && self.truth.is_none()
             && self.label.is_none()
+            && self.background.is_none()
     }
 }

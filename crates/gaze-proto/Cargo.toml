@@ -13,6 +13,7 @@ gaze-overlay            = { workspace = true }
 gaze-inject             = { workspace = true }
 gaze-provider-synthetic = { workspace = true }
 gaze-provider-webcam    = { workspace = true }
+gaze-provider-et5       = { workspace = true }
 
 anyhow             = { workspace = true }
 clap               = { workspace = true }

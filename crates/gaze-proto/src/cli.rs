@@ -30,6 +30,11 @@ pub enum Provider {
     /// discards its motion.
     Webcam,
 
+    /// Real gaze from the Tobii ET5 over native USB (`gaze-provider-et5`). Controls
+    /// come from the Lenovo's buttons like `webcam`; calibrate first with
+    /// `gaze-et5-cli calibrate`.
+    Et5,
+
     /// Replay a recorded JSONL session (`--record` from an earlier run). Controls come
     /// from the same button source as `webcam` when the device is available, and the run
     /// is otherwise driven entirely by the recording.
@@ -83,8 +88,10 @@ pub struct Args {
     #[arg(long)]
     pub camera: Option<PathBuf>,
 
-    /// Calibration file for the webcam provider. Omitted runs uncalibrated, which is worth
-    /// several degrees of error: fit one with `gaze-webcam-cli calibrate`.
+    /// Calibration file for the webcam or ET5 provider. Omitted, the provider's
+    /// conventional file (`config/calibration.toml` / `config/calibration-et5.toml`)
+    /// is used when it exists; truly uncalibrated runs are worth several degrees of
+    /// error (`gaze-webcam-cli calibrate` / `gaze-et5-cli calibrate` fit one).
     #[arg(long)]
     pub calibration: Option<PathBuf>,
 

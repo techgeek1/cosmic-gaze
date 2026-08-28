@@ -226,15 +226,16 @@ fn frame_at(desk: &Desk, t: f64) -> OverlayState {
     let trail = figure_eight(desk, t - 0.25);
 
     OverlayState {
-        gaze      : Some(gaze),
-        highlight : Some(Rect {
+        gaze       : Some(gaze),
+        highlight  : Some(Rect {
             x : trail.x - BOX_W * 0.5,
             y : trail.y - BOX_H * 0.5,
             w : BOX_W,
             h : BOX_H,
         }),
-        truth     : Some(figure_eight(desk, t + 0.25)),
-        label     : Some(format!("GAZE {:.0} {:.0}", gaze.x, gaze.y)),
+        truth      : Some(figure_eight(desk, t + 0.25)),
+        label      : Some(format!("GAZE {:.0} {:.0}", gaze.x, gaze.y)),
+        background : None,
     }
 }
 

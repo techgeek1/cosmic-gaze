@@ -688,11 +688,12 @@ mod tests {
         assert_eq!(map_button(KeyCode::BTN_SIDE), None);
     }
 
-    /// Loads the real desk config, exercising `build_sample` against the now-implemented
-    /// `gaze-core` geometry (px_to_ray, off_axis_deg, sigma_at, perturb_ray, intersect).
+    /// Loads the frozen desk fixture (the live config drifts with the physical desk),
+    /// exercising `build_sample` against the now-implemented `gaze-core` geometry
+    /// (px_to_ray, off_axis_deg, sigma_at, perturb_ray, intersect).
     fn desk() -> (DesktopGeometry, NoiseModel) {
-        let geometry = DesktopGeometry::from_toml(include_str!("../../../config/desk.toml")).unwrap();
-        let model = geometry.noise.expect("config/desk.toml has a [noise] section");
+        let geometry = DesktopGeometry::from_toml(include_str!("../../../config/desk-fixture.toml")).unwrap();
+        let model = geometry.noise.expect("the desk fixture has a [noise] section");
 
         (geometry, model)
     }

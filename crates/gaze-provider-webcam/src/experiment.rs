@@ -606,12 +606,14 @@ mod tests {
     use crate::camera::gaze_dir_from_yaw_pitch_deg;
     use crate::sweep::{self, SweepTarget};
 
-    const DESK_TOML: &str = include_str!("../../../config/desk.toml");
+    /// The frozen 2026-08-25 desk snapshot these assertions were written against;
+    /// the live `config/desk.toml` drifts with the physical desk.
+    const FIXTURE_TOML: &str = include_str!("../../../config/desk-fixture.toml");
 
     fn desk() -> (DesktopGeometry, CameraPose) {
         (
-            DesktopGeometry::from_toml(DESK_TOML).unwrap(),
-            CameraPose::from_desk_toml(DESK_TOML).unwrap(),
+            DesktopGeometry::from_toml(FIXTURE_TOML).unwrap(),
+            CameraPose::from_desk_toml(FIXTURE_TOML).unwrap(),
         )
     }
 

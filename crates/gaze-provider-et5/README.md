@@ -1,0 +1,143 @@
+# gaze-provider-et5
+
+A `GazeProvider` for the Tobii Eye Tracker 5, speaking the device's USB protocol
+natively. No vendor SDK, no daemon, no Windows.
+
+## Protocol provenance
+
+The wire formats (TTP framing, TLV payloads, the HMAC-MD5 realm unlock, the 0x500
+gaze stream columns, calibration ops) are a from-scratch Rust implementation of the
+byte-level protocol documented by the tobiifree reverse-engineering project and
+verified against this unit. No code was copied; `src/ttp.rs` ports the observed byte
+layouts and test vectors only.
+
+## Device setup
+
+- The tracker must be in runtime mode (`lsusb -d 2104:0313`). A factory-fresh unit
+  ships in bootloader mode (`2104:0102`) and needs a one-time firmware flash via the
+  official installer in a Windows VM (see the project notes; the DFU container is
+  encrypted, so it cannot be flashed directly from Linux).
+- udev rule for user access: `/etc/udev/rules.d/70-tobii-et5.rules` granting rw on
+  `2104:0102/0313/031e`.
+- A flashed-but-never-calibrated device streams empty frames (validity 4) even though
+  the handshake succeeds. Run `calibrate` (the retrain ceremony) once.
+- **The host owns the eye model.** The device's flash is a cache, refilled on every
+  connect. The provider uploads `config/calibration-et5.bin` (override with
+  `.device_blob(path)`) and verifies it by reading it back; a mismatch fails the
+  start. Without the file it warns and runs on whatever the flash holds, which is the
+  state that drifts between sessions. This is the Windows driver's and Talon's
+  behaviour, and the reason it matters is in `DESIGN.md` §10c.
+- The firmware can crash and re-enumerate mid-session (observed 2026-08-27 as a
+  one-second USB drop), and a reboot can reset the stored eye model to its ~1.5 KB
+  factory default. The provider now handles that directly: on a transport error it
+  drops its dropout hold, emits explicitly invalid samples for the length of the gap,
+  and reconnects on a backoff with the same blob and plane, re-verifying the upload.
+  Manual recovery is `blob-push <blob backup>`.
+
+## Connect sequence
+
+`Device::connect_with(ConnectOptions)` performs, in this order (nottobii's
+pcap-derived Windows order; `device::connect_sequence` is the same list as data, and a
+unit test asserts it):
+
+    hello -> realm unlock -> cal_apply(blob) -> set display area (corners)
+          -> enabled eyes = 3 -> unpause -> [cal_apply again if double_upload]
+          -> cal_retrieve and compare -> subscribe
+
+The blob goes up *before* the plane is declared and eye-enable/unpause come after it,
+which is what the references do and what earlier failed restores got wrong.
+Verification happens before the subscribe so the ~600 KB inbound transfer reassembles
+with no gaze notifications interleaved. Comparison is `BlobCheck::Exact` by default
+(`blob-info` on this unit, 2026-08-27: two consecutive retrieves are byte-identical,
+604948 bytes, sha256 `d32f6c4b...`); `BlobCheck::SizeAndPrefix` exists for a unit
+where retrieve turns out not to be deterministic.
+
+`Device::connect()` is `connect_with(ConnectOptions::default())`: no upload, the
+device's stored plane left alone. That is what the read-only diagnostics use.
+
+Realm handling stays per-operation: `realm_unlock` is safe to repeat and `cal_apply`
+unlocks and closes around itself, so no realm session spans the plane declaration.
+nottobii keeps one session across its whole init; nothing observed here needs that.
+
+## CLI
+
+`gaze-et5-cli` (see `--help`):
+
+- `info` — connect, print the declared display area, sample the stream for 2 s.
+- `dump --seconds 10 --jsonl out.jsonl` — decoded frames plus desk intersection.
+- `set-display-area` — declare the display plane (defaults: the 237x148 mm small
+  panel with the tracker centred on its top edge).
+- `cal-backup FILE` — download the on-device calibration blob to a file.
+- `blob-info [--file F]` — retrieve the blob twice and report both sizes and SHA-256
+  hashes, whether the two reads are byte-identical (is retrieve deterministic?), and,
+  with `--file`, the same for a saved blob plus the first offset at which it and the
+  device disagree. Read-only on the device, safe to run unattended.
+- `blob-watch --minutes N` — retrieve, stream for N minutes with a status line every
+  10 s, retrieve again, report the diff: does the firmware mutate its model during
+  ordinary use? Read-only.
+- `blob-push FILE [--double] [--calibration F]` — upload a blob through the
+  connect-time path above and verify it. `--double` sends it twice, as the Windows
+  driver does. SIGINT is held off for the duration; **a process killed mid-upload
+  wedges the tracker until it is physically unplugged and replugged**. Replaces the
+  old `cal-restore`, which uploaded with no plane and no verification.
+- `calibrate` — **the retrain ceremony** (`src/retrain.rs`): the one command that
+  writes the tracker's own eye model. It declares the panel's measured plane from
+  `desk.toml` (corners rotated into the sensor frame by `tracker_pitch_deg` — the
+  same plane the provider re-declares on every connect), lays a 600x340 mm training
+  area bottom-aligned to the panel and centred on the tracker (`--area WxH`,
+  `--area-full`), and runs six rounds of Talon's schedule — centre, four mid-edges,
+  four corners — on a black background and then a white one, with a 4 s pupil
+  adaptation wait at each flip and `cal_points_apply` after every round. A point is
+  only fed to the device once the firmware's own gaze has named it for 60 of the last
+  120 frames *and* the median of those frames is within `--accept-deg` (default 3°)
+  of it; `--point-timeout-s` (default 15) skips a point that will not settle, Enter
+  forces one in, `s` skips it, `q` aborts and commits nothing. After `cal_stop` +
+  `cal_retrieve` it saves the blob, runs a 3x3 health check on neutral grey (1 s per
+  stop, the firmware's gaze against the target in degrees) and writes both the
+  numbers and the plane into `config/calibration-et5.toml`. The previous blob and
+  calibration are moved aside as `*.prev-<unix>`, never overwritten. `--suggest`
+  additionally queries `CALIBRATE_GET_POINT_SUGGESTION` (0x442) after each round and
+  logs the raw reply; nothing depends on it. `--dry-run` prints the plane, the area,
+  the nine points and the round schedule without touching the device or the
+  compositor. Needs a live compositor and a seated user.
+
+  **Retrain once.** The firmware model is a feature extractor, not the thing that
+  improves: every session file and every host-side fit is keyed to the blob's hash, so
+  a retrain orphans all of it. Run this after a remount, a fresh device, or a
+  deliberate experiment — not when a session feels off. Accuracy work happens in
+  `record` + the Phase C/D model, on top of a fixed blob.
+
+- `record --minutes 5` — one training session (stop grid on black, prompted wander on
+  white, stop grid on white) written to `config/sessions/`. This is where data for the
+  model comes from; nothing is fitted and nothing is uploaded.
+- `collect`, `refit` — **deprecated**, removed in Phase D. They belong to the old
+  compound sweep (client-side correction field, head-gain regression) that `calibrate`
+  no longer runs. `--help` points at `record`. The pass archive under
+  `config/calibration-et5-history/` is also orphaned twice over: its files were keyed
+  by a `DefaultHasher` digest (`blob_key` now uses the first 16 hex characters of the
+  blob's SHA-256, matching `device_blob_sha256`), and they describe an eye model that
+  no longer exists.
+- `view` — live gaze marker on every display through `gaze-overlay`.
+
+`gaze-proto --provider et5` runs the full snap/click prototype on this provider;
+it picks up `config/calibration-et5.toml` automatically and takes commits from the
+grabbed Lenovo's buttons like the webcam mode.
+
+Calibration files, blobs, and the pass history are gitignored
+(`/config/calibration*`).
+
+## What was and was not run
+
+Unit tests cover the wire protocol against captured reference vectors, the gaze
+decoder, the pose solver (synthetic flat and curved panels, exact and noisy rays),
+the pose-from-points solve and ray-bundle triangulation (outlier and degeneracy
+cases included), the correction field fits, the head-gain regression, the
+retrain's plan (plane pitch, training rectangle, round schedule) and its acceptance
+gate as a pure function, the point-suggestion decoder, the
+provider's edge-pinning and dropout-hold behaviour, the connect sequence ordering
+(`device::connect_sequence` for every combination of blob, plane and double upload),
+the blob hashing and diff helpers, and the sweep's lag/saccade/interpolation helpers.
+The `info`/`dump` paths and `blob-info` were exercised against the real device, and
+`calibrate --dry-run` against the real desk config. `blob-push`, `blob-watch`,
+`calibrate`, `record` and `view` write device state or need the user seated and a
+compositor; run them manually as above.

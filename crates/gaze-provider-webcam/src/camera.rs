@@ -220,7 +220,9 @@ pub enum CameraError {
 mod tests {
     use super::*;
 
-    const DESK_TOML: &str = include_str!("../../../config/desk.toml");
+    /// The frozen 2026-08-25 desk snapshot these assertions were written against;
+    /// the live `config/desk.toml` drifts with the physical desk.
+    const FIXTURE_TOML: &str = include_str!("../../../config/desk-fixture.toml");
 
     /// Angle between two directions, degrees.
     fn angle_deg(a: DVec3, b: DVec3) -> f64 {
@@ -228,8 +230,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_camera_block_of_the_real_desk_config() {
-        let c = CameraPose::from_desk_toml(DESK_TOML).unwrap();
+    fn parses_the_camera_block_of_the_desk_fixture() {
+        let c = CameraPose::from_desk_toml(FIXTURE_TOML).unwrap();
 
         assert_eq!(c.device, "/dev/video0");
         assert_eq!(c.position_mm, [100.0, 80.0, 250.0]);
@@ -315,7 +317,7 @@ mod tests {
 
     #[test]
     fn camera_and_desk_conversions_round_trip_on_the_real_pose() {
-        let c = CameraPose::from_desk_toml(DESK_TOML).unwrap();
+        let c = CameraPose::from_desk_toml(FIXTURE_TOML).unwrap();
 
         for p in [DVec3::new(10.0, -20.0, 600.0), DVec3::new(-90.0, 45.0, 500.0), DVec3::ZERO] {
             let back = c.point_to_camera(c.point_to_desk(p));
@@ -362,7 +364,7 @@ mod tests {
 
     #[test]
     fn a_degenerate_direction_does_not_produce_nans() {
-        let c = CameraPose::from_desk_toml(DESK_TOML).unwrap();
+        let c = CameraPose::from_desk_toml(FIXTURE_TOML).unwrap();
 
         assert!(c.dir_to_desk(DVec3::ZERO).is_finite());
         assert!(c.dir_to_desk(DVec3::splat(f64::NAN)).is_finite());

@@ -286,10 +286,11 @@ pub fn run(args: &Args) -> Result<()> {
 
         if moved || target_id != last_target {
             let state = OverlayState {
-                gaze      : gaze,
-                highlight : target.as_ref().map(|t| t.element.bbox),
-                truth     : if args.show_truth { source.truth() } else { None },
-                label     : Some(label(&target, &filtered)),
+                gaze       : gaze,
+                highlight  : target.as_ref().map(|t| t.element.bbox),
+                truth      : if args.show_truth { source.truth() } else { None },
+                label      : Some(label(&target, &filtered)),
+                background : None,
             };
 
             if overlay.set(state).is_err() {

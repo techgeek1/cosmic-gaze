@@ -116,11 +116,13 @@ mod tests {
 
     use crate::geometry::DesktopGeometry;
 
-    const DESK_TOML: &str = include_str!("../../../config/desk.toml");
+    /// The frozen 2026-08-25 desk snapshot these assertions were written against;
+    /// the live `config/desk.toml` drifts with the physical desk.
+    const FIXTURE_TOML: &str = include_str!("../../../config/desk-fixture.toml");
 
     #[test]
     fn desk_profile_matches_the_config() {
-        let g = DesktopGeometry::from_toml(DESK_TOML).unwrap();
+        let g = DesktopGeometry::from_toml(FIXTURE_TOML).unwrap();
         let n = g.noise.expect("desk config carries a noise model");
 
         assert_eq!(n.rate_hz, 120.0);

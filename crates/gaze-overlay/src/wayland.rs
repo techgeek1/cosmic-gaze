@@ -321,10 +321,14 @@ struct Buffers {
 
 /// One buffer plus what is currently in it.
 struct Slot {
-    buffer  : Buffer,
+    buffer     : Buffer,
     /// Bounding box of the pixels last drawn into this buffer, in buffer pixels. The next
     /// repaint has to cover this as well as the new content, or the old marker stays.
-    content : PixelBox,
+    content    : PixelBox,
+    /// The background this buffer's untouched pixels currently hold. Every pixel outside
+    /// `content` is exactly this colour, so a state whose background differs has to
+    /// repaint the whole surface once; after that the partial repaints are correct again.
+    background : Option<[u8; 4]>,
 }
 
 impl App {
@@ -402,8 +406,10 @@ impl App {
             }
         }
 
-        let items  = draw::scene(&self.state, &self.surfaces[index].mapping);
-        let wanted = draw::bounds(&items).unwrap_or(PixelBox::EMPTY).clip_to(width, height);
+        let items      = draw::scene(&self.state, &self.surfaces[index].mapping);
+        let wanted     = draw::bounds(&items).unwrap_or(PixelBox::EMPTY).clip_to(width, height);
+        let background = self.state.background;
+        let whole      = PixelBox { x: 0, y: 0, w: width as i32, h: height as i32 };
 
         // Prefer the buffer that is not on screen. If it is somehow still busy the other
         // one will do; if both are, stay dirty and wait for a release.
@@ -422,7 +428,14 @@ impl App {
         // Anything outside that rectangle is still valid from an earlier frame.
         let repaint = {
             let slot    = &mut self.surfaces[index].buffers.as_mut().unwrap().slots[slot_index];
-            let repaint = slot.content.union(wanted);
+            let repaint = {
+                if slot.background == background {
+                    slot.content.union(wanted)
+                }
+                else {
+                    whole
+                }
+            };
 
             let Some(canvas) = self.pool.canvas(&slot.buffer) else {
                 return;
@@ -434,12 +447,13 @@ impl App {
             };
 
             if !repaint.is_empty() {
-                draw::clear(&mut pixmap, repaint);
+                draw::clear(&mut pixmap, repaint, background);
                 draw::draw(&mut pixmap, &items);
                 draw::rgba_to_argb(&mut pixmap, repaint);
             }
 
-            slot.content = wanted;
+            slot.content    = wanted;
+            slot.background = background;
             repaint
         };
 
@@ -776,7 +790,11 @@ fn allocate(pool: &mut SlotPool, width: u32, height: u32) -> Result<Buffers, Ove
             Format::Argb8888,
         )?;
 
-        Ok(Slot { buffer: buffer, content: PixelBox::EMPTY })
+        Ok(Slot {
+            buffer     : buffer,
+            content    : PixelBox::EMPTY,
+            background : None,
+        })
     };
 
     Ok(Buffers {

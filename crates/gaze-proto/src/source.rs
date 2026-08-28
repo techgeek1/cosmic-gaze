@@ -26,6 +26,7 @@ use gaze_provider_synthetic::{
     ReplayProvider,
     SyntheticProvider,
 };
+use gaze_provider_et5::{Et5Calibration, Et5Provider};
 use gaze_provider_webcam::{CameraPose, DEFAULT_SIGMA_DEG, SampleMeta, WebcamProvider};
 use tracing::{info, warn};
 
@@ -34,6 +35,9 @@ use crate::cli::{Args, Provider};
 
 /// Conventional calibration file, used when `--calibration` is not given.
 const DEFAULT_CALIBRATION_PATH : &str = "config/calibration.toml";
+
+/// Conventional ET5 calibration file, used when `--calibration` is not given.
+const DEFAULT_ET5_CALIBRATION_PATH : &str = "config/calibration-et5.toml";
 
 /// A discrete control the session acts on, whatever produced it.
 ///
@@ -124,6 +128,16 @@ pub enum GazeSource {
         health   : WebcamHealth,
     },
 
+    /// Real gaze from the ET5 over native USB. Controls come from the Lenovo, as in
+    /// `webcam`: gaze cannot commit itself.
+    Et5 {
+        /// Where the samples come from. Boxed: the provider embeds the USB session
+        /// and converter state, and would otherwise dominate the enum's size.
+        provider : Box<Et5Provider>,
+        /// The Lenovo's buttons and wheel. Required, as in `webcam`.
+        buttons  : ButtonSource,
+    },
+
     /// A recorded session. Controls come from the same reader as `webcam` when the device
     /// is available.
     Replay {
@@ -145,6 +159,7 @@ impl GazeSource {
         match args.provider {
             Provider::Synthetic => open_synthetic(args, geometry, model),
             Provider::Webcam    => open_webcam(args, geometry),
+            Provider::Et5       => open_et5(args, geometry),
             Provider::Replay    => open_replay(args),
         }
     }
@@ -154,6 +169,7 @@ impl GazeSource {
         match self {
             GazeSource::Synthetic(provider)      => provider.next(),
             GazeSource::Webcam { provider, .. }  => provider.next(),
+            GazeSource::Et5 { provider, .. }     => provider.next(),
             GazeSource::Replay { provider, .. }  => provider.next(),
         }
     }
@@ -163,6 +179,7 @@ impl GazeSource {
         match self {
             GazeSource::Synthetic(provider)     => provider.events().map(control_of).collect(),
             GazeSource::Webcam { buttons, .. }  => buttons.events().collect(),
+            GazeSource::Et5 { buttons, .. }     => buttons.events().collect(),
 
             GazeSource::Replay { buttons, .. } => {
                 match buttons {
@@ -195,6 +212,7 @@ impl GazeSource {
         match self {
             GazeSource::Synthetic(_)           => true,
             GazeSource::Webcam { buttons, .. } => buttons.grabbed(),
+            GazeSource::Et5 { buttons, .. }    => buttons.grabbed(),
 
             // No device means no wheel to own in the first place.
             GazeSource::Replay { buttons, .. } => {
@@ -208,6 +226,7 @@ impl GazeSource {
         match self {
             GazeSource::Synthetic(_)     => "synthetic",
             GazeSource::Webcam { .. }    => "webcam",
+            GazeSource::Et5 { .. }       => "et5",
             GazeSource::Replay { .. }    => "replay",
         }
     }
@@ -253,6 +272,11 @@ impl GazeSource {
             GazeSource::Synthetic(provider) => provider.stop(),
 
             GazeSource::Webcam { provider, buttons, .. } => {
+                provider.stop();
+                buttons.stop();
+            }
+
+            GazeSource::Et5 { provider, buttons } => {
                 provider.stop();
                 buttons.stop();
             }
@@ -362,6 +386,58 @@ fn open_webcam(args: &Args, geometry: &DesktopGeometry) -> Result<GazeSource> {
         provider : provider,
         buttons  : buttons,
         health   : WebcamHealth::default(),
+    })
+}
+
+/// Real gaze from the ET5 over native USB, with controls from the Lenovo.
+///
+/// The provider claims the tracker's USB interface exclusively, so a sweep or a
+/// `gaze-et5-cli view` cannot run at the same time. The calibration matters more
+/// here than for the webcam: without one the tracker runs under an oversized
+/// virtual plane and the firmware's trained end-to-end mapping never applies, so
+/// the conventional file is picked up when present and its absence is loud.
+fn open_et5(args: &Args, geometry: &DesktopGeometry) -> Result<GazeSource> {
+    let default_cal = PathBuf::from(DEFAULT_ET5_CALIBRATION_PATH);
+    let path        = args.calibration.clone()
+        .or_else(|| default_cal.exists().then_some(default_cal));
+
+    let calibration = {
+        match &path {
+            Some(path) => Some(Et5Calibration::load(path)
+                .with_context(|| format!("loading {}", path.display()))?),
+            None       => None,
+        }
+    };
+
+    if calibration.is_none() {
+        warn!("running uncalibrated: the trained on-device mapping will not apply \
+               (gaze-et5-cli calibrate fixes it)");
+    }
+
+    let provider = Et5Provider::create()
+        .geometry(geometry.clone())
+        .calibration(calibration)
+        .start()
+        .context("starting the ET5 provider (tracker on the bus, nothing else holding it?)")?;
+
+    let buttons = ButtonSource::open(None, &args.device, !args.no_grab).with_context(|| {
+        format!(
+            "opening {:?} for commits: an ET5 run has no other commit channel",
+            args.device,
+        )
+    })?;
+
+    info!(
+        calibration = ?path.as_ref().map(|p| p.display().to_string()),
+        device      = %buttons.path().display(),
+        grabbed     = buttons.grabbed(),
+        commits     = commit_note(buttons.grabbed()),
+        "provider: et5"
+    );
+
+    Ok(GazeSource::Et5 {
+        provider : Box::new(provider),
+        buttons  : buttons,
     })
 }
 

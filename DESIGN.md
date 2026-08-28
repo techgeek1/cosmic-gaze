@@ -432,6 +432,81 @@ Roles, in order of expected value:
 This makes the post-pivot design concrete: gaze = coarse (where), controller = fine
 (exactly which) + commit (now), voice = text and content-addressed commands.
 
+## 10c. ET5 provider (2026-08-27/28): host-owned device state, then a state-conditioned model
+
+**Status 2026-08-27.** `gaze-provider-et5` speaks the ET5's USB protocol natively (TTP framing,
+HMAC-MD5 realm unlock, 0x500 gaze stream: per-eye origins raw and calibrated, per-eye rays as
+plane intersections, combined uv, pupil diameters). A compound sweep trained the on-device eye
+model on a ring of points, then fitted a per-display polynomial correction field and a
+head-gain regression on top (best cross-validated R² for the head channel 0.64; per-eye
+triangulation carried 120–350 mm of head-generalisation bias). Lived experience: constant
+regression, recalibration needed every other sitting even after the device sat off for hours,
+and every calibration slightly off and drifting. Restoring a blob backup made things worse.
+
+**Research (2026-08-27, night).** The Windows Tobii Platform Runtime stores `calibration.setpm`
+and `screenplane.setpm` per user profile on the host and, per nottobii's pcap-derived init
+sequence, uploads the blob on **every connect, twice** (after hello and before `CONFIG_3D_SET`;
+again after auth and eye-enable, before subscribe). Talon's plaintext `eye_mouse.py` does
+`display_setup` then `CALIBRATE_UPLOAD(calib.bin)` on every attach. Neither trusts the device's
+flash; we did, and only compared the blob's size. Elsewhere, blob restores silently failed
+until the ~400–600 KB blob was sent in 8 KB transfers with a per-transfer envelope (our
+transport already does this). The two references disagree on order: nottobii's captured
+Windows sequence uploads before the plane is declared and again after eye-enable; Talon
+declares the plane first and uploads after. Killing a process mid-upload wedges the tracker
+until unplugged.
+Talon calibrates in rounds (1, 4, 4) with `POINTS_APPLY` after each over a 600×340 mm area
+bottom-centred on the screen, adds a point only once the device's gaze has settled on it, and a
+third party measured 0.69° from one round. Full opcode map recovered from Talon:
+START 0x3f2, STOP 0x3fc, POINT_ADD2D 0x406, CLEAR 0x424, POINTS_APPLY 0x42e, EYE_APPLY 0x42f,
+GET_POINT_SUGGESTION 0x442, DOWNLOAD 0x44c, UPLOAD 0x456. Tobii's consumer software offers only
+profiles, a second "improve" calibration per profile for other lighting, and separate profiles
+for glasses — no automatic recalibration.
+
+Patent directions worth copying (host-side, all feasible on our stream): implicit
+recalibration from interactions with stimulus-type time windows, RANSAC, inlier-ratio and
+minimum-count gates (Tobii [patent reference removed]), a foveal-tolerance accept plus an error buffer that
+escalates to explicit recalibration (Microsoft [patent reference removed]), per-pair validation against held
+ground truth and head-jump-triggered episodes (Apple [patent reference removed]); pupil-radius offset
+k·R + m per eye fitted from calibrations at two illumination levels (Tobii [patent reference removed]); per-eye
+weighting from rolling pupil-signal variance through a sigmoid with a moving average (Tobii
+[patent reference removed]); zone-wise offsets and zone-wise smoothing windows updated from button
+selections (Tobii [patent reference removed]); corneal radius re-estimated every 10–60 min because it
+drifts (Tobii [patent reference removed]); a radial gain with angle from the axis (Tobii [patent reference removed]);
+read-back of typed text as an unbiased offset signal (Microsoft [patent reference removed]) and
+reading-line assignment for vertical drift. One ET5 paper reports 1.13–1.37° stock and 0.19°
+after a neural net, almost certainly in-sample.
+
+**Decisions.** The host owns device state: upload the blob on every connect in the Windows
+order and verify by retrieving it; retrain the firmware once and key all client data to the
+blob hash. Replace per-session calibration with one model across sessions conditioned on head
+position, interocular vector, pupil diameter and angle from the axis — a residual in angle
+space before intersection, kernel ridge / sparse GP so the correction fades and σ widens away
+from data — trained from short recording sessions and, in steady state, from accepted mouse
+clicks (the online-recalibration item of §3, now with the acceptance machinery above) plus a
+minutes-scale online offset that resets on head jumps. Evaluation is leave-one-session-out
+only. Build plan and contracts: `PLAN-ET5.md`.
+
+**Results log.** (append per experiment: date, blob hash, split, numbers)
+
+- 2026-08-28 00:xx, A0 `blob-info` ×3 over 5 min, separate connects: `cal_retrieve` is
+  deterministic (604948 B, sha256 `d32f6c4b…30f7c4`, identical within and across runs) and
+  the device holds exactly `config/calibration-et5.bin` (16:12 retrain). So the tracker had
+  *not* lost its model at that moment; whether it does across a power cycle, and whether it
+  mutates during use (`blob-watch`), are still open. `BlobCheck::Exact` is the verify mode.
+- 2026-08-28, session zero (the 16:24 readings imported as `config/sessions/1787873083-d32f6c4b.jsonl`,
+  1462 rows after saccade gating, no outlier gates). Firmware-only residual of the filtered
+  ray, in-sample, no split: **3.75° rms** overall (p50 2.12, p90 5.69); stops 2.48°, glides
+  3.04°, **head-sweep holds 5.16°** — the head-generalisation failure as 466 labelled rows.
+  Mean bias −0.14° yaw / −0.91° pitch. Pupil range 2.4–7.3 mm. Python harness smoke test
+  (one session split by stop parity — not the gate number): firmware 4.01°, kernel model
+  3.56° held-out / 1.55° in-sample, old per-session quadratic 8.99° held-out; pupil slope
+  −0.22°/mm left eye (R² 0.01, significant), right eye nil; predicted variance vs |error|
+  Spearman 0.13 in-sample.
+- 2026-08-28, bug: `load_tracker_pitch` used `str::parse::<toml::Value>` (a single value since
+  toml 0.9), silently returned 0, so **every `calibrate` so far declared the trained plane in
+  the desk frame, without the 13° mount pitch**. Fixed; changes session zero's residual only
+  3.68 → 3.75° rms, but the next retrain declares a different plane than all previous ones.
+
 ## 11. Open questions
 
 - nottobii code quality/completeness as a base vs. writing a fresh ET5 driver against its protocol notes.
@@ -447,4 +522,5 @@ This makes the post-pivot design concrete: gaze = coarse (where), controller = f
 **Vision/CUA:** TargetFinder arXiv 2607.19907 · GoClick arXiv 2604.23941 · OmniParser V2 + icon_detect_v3 (microsoft/OmniParser, HF PR#37) · GPA-GUI-Detector (HF Salesforce) · ReVision arXiv 2605.11212 · UFO2 arXiv 2504.14603 · ScreenParse arXiv 2602.14276 · PP-OCRv6 arXiv 2606.13108 · Agent-S2 arXiv 2504.00906 · PASTE arXiv 2603.18897 · Apple Screen Recognition arXiv 2101.04893.
 **Platform:** at-spi2-core#14 (geometry) · OSWorld issues #241/#185/#105/#263 (AT-SPI perf) · Newton (GNOME a11y blog 2024-06, LWN 971541) · GTK 4.18 AccessKit · COSMIC Epoch 2/3 roadmap (System76 blog 2026-02-04) · Talon Linux exit (OSnews 145162) · libei (who-t 2026-07).
 **Hardware:** nottobii · tobiifree · PSVR2Toolkit (BnuuySolutions) · EyeTrackVR docs + Hu 2025 accuracy eval (huyang.life) · TUM WearableEyeTracker arXiv 2604.24331 · Pupil DIY docs · Beyond 2e (store.bigscreenvr.com blog; vronlinux wiki) · Galaxy XR / XR_ANDROID_eye_tracking (developer.android.com) · XREAL Aura (roadtovr) · AdHawk→Google (Bloomberg 2025-03-11) · AVP measured accuracy arXiv 2406.00255.
+**ET5 calibration research (2026-08-27):** nottobii `device.rs` init sequence · tobiifree issue #3 (opcode map, blob framing, wedge warning) and ChrisVeigl `update-deamon-calibflow` · Talon `talon_plugins/eye_mouse.py` · Tobii Help Center (ET5 calibration, test and recalibrate) · Tobii Pro SDK calibration concepts · patents [patent reference removed] · [patent reference removed] · [patent reference removed] · [patent reference removed] · [patent reference removed] · [patent reference removed] · [patent reference removed] · [patent reference removed] · [patent reference removed] · [patent reference removed] · [patent reference removed] (Google) · [patent reference removed] (Apple) · Springer 978-3-030-98404-5_36 (ET5 accuracy).
 **Daily-driver accounts:** Josh Comeau hands-free coding · wolfmanstout talon-gaze-ocr + handsfreecoding.org · Talon wiki (Control Mouse gen2, Tobii setup).

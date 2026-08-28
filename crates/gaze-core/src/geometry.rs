@@ -463,15 +463,22 @@ mod tests {
 
     /// The real desk, so the round-trips are asserted against the numbers the rest of the
     /// prototype actually runs on rather than a tidy synthetic layout.
+    /// A frozen snapshot of the 2026-08-25 desk config. The live `config/desk.toml`
+    /// tracks the physical desk and changes with every remount or re-measure, so the
+    /// geometry assertions pin the coherent snapshot in `config/desk-fixture.toml`
+    /// instead; the live file gets a parse-only smoke test.
+    const FIXTURE_TOML: &str = include_str!("../../../config/desk-fixture.toml");
+
+    /// The live config, which must always parse even as its values drift.
     const DESK_TOML: &str = include_str!("../../../config/desk.toml");
 
     /// Round-trip tolerance from PLAN.md. The map is analytic in both directions, so this
     /// is really a check that no branch of the cylinder inverse picks the wrong root.
     const ROUND_TRIP_PX: f64 = 0.01;
 
-    /// Loads the desk config, panicking with the parse error if it has drifted.
+    /// Loads the frozen fixture config, panicking if the parser has drifted.
     fn desk() -> DesktopGeometry {
-        DesktopGeometry::from_toml(DESK_TOML).expect("config/desk.toml must parse")
+        DesktopGeometry::from_toml(FIXTURE_TOML).expect("fixture config must parse")
     }
 
     /// A flat test panel facing +Z at `z_mm`, one metre square, mapped to a 1000x1000
@@ -495,7 +502,14 @@ mod tests {
     }
 
     #[test]
-    fn desk_config_parses_with_expected_outputs() {
+    fn live_desk_config_parses() {
+        let g = DesktopGeometry::from_toml(DESK_TOML).expect("config/desk.toml must parse");
+
+        assert!(!g.outputs.is_empty());
+    }
+
+    #[test]
+    fn fixture_config_parses_with_expected_outputs() {
         let g = desk();
 
         assert_eq!(g.outputs.len(), 3);

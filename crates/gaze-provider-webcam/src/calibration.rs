@@ -604,14 +604,23 @@ mod tests {
     use crate::angle::AngleCorrection;
     use crate::fit::{AngleDegree, AnglePoly, PolyDegree};
 
-    const DESK_TOML: &str = include_str!("../../../config/desk.toml");
+    /// The frozen 2026-08-25 desk snapshot these assertions were written against;
+    /// the live `config/desk.toml` drifts with the physical desk.
+    const FIXTURE_TOML: &str = include_str!("../../../config/desk-fixture.toml");
 
     fn desk() -> DesktopGeometry {
-        DesktopGeometry::from_toml(DESK_TOML).unwrap()
+        DesktopGeometry::from_toml(FIXTURE_TOML).unwrap()
     }
 
     fn cam() -> CameraPose {
-        CameraPose::from_desk_toml(DESK_TOML).unwrap()
+        CameraPose::from_desk_toml(FIXTURE_TOML).unwrap()
+    }
+
+    #[test]
+    fn live_desk_config_parses_a_camera_pose() {
+        let live = include_str!("../../../config/desk.toml");
+
+        CameraPose::from_desk_toml(live).expect("config/desk.toml camera block must parse");
     }
 
     /// A calibration whose only content is a per-output shift of half the panel, so the

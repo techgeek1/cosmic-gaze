@@ -341,15 +341,16 @@ impl CalibrationSweep {
         };
 
         let state = OverlayState {
-            gaze      : None,
-            highlight : Some(Rect {
+            gaze       : None,
+            highlight  : Some(Rect {
                 x : target.px.x - TARGET_PX * 0.5,
                 y : target.px.y - TARGET_PX * 0.5,
                 w : TARGET_PX,
                 h : TARGET_PX,
             }),
-            truth     : Some(target.px),
-            label     : Some(format!("look here {}/{}", index + 1, total)),
+            truth      : Some(target.px),
+            label      : Some(format!("look here {}/{}", index + 1, total)),
+            background : None,
         };
 
         // A dead overlay thread is not a reason to abandon the sweep: the terminal still
@@ -1707,14 +1708,16 @@ mod tests {
     use crate::camera::gaze_dir_from_yaw_pitch_deg;
     use crate::fit::{AngleDegree, AnglePoly};
 
-    const DESK_TOML: &str = include_str!("../../../config/desk.toml");
+    /// The frozen 2026-08-25 desk snapshot these assertions were written against;
+    /// the live `config/desk.toml` drifts with the physical desk.
+    const FIXTURE_TOML: &str = include_str!("../../../config/desk-fixture.toml");
 
     fn desk() -> DesktopGeometry {
-        DesktopGeometry::from_toml(DESK_TOML).unwrap()
+        DesktopGeometry::from_toml(FIXTURE_TOML).unwrap()
     }
 
     fn cam() -> CameraPose {
-        CameraPose::from_desk_toml(DESK_TOML).unwrap()
+        CameraPose::from_desk_toml(FIXTURE_TOML).unwrap()
     }
 
     /// Builds an observation for `target` whose reported gaze is the true gaze put through

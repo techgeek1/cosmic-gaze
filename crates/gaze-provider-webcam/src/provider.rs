@@ -658,15 +658,17 @@ mod tests {
     use super::*;
     use crate::protocol::{SidecarGaze, SidecarMessage};
 
-    const DESK_TOML: &str = include_str!("../../../config/desk.toml");
+    /// The frozen 2026-08-25 desk snapshot these assertions were written against;
+    /// the live `config/desk.toml` drifts with the physical desk.
+    const FIXTURE_TOML: &str = include_str!("../../../config/desk-fixture.toml");
 
     /// Point on the LG used as the thing the fake stream looks at.
     const LOOK_AT: GlobalPx = GlobalPx { x: 4479.0, y: 800.0 };
 
     fn desk() -> (DesktopGeometry, CameraPose) {
         (
-            DesktopGeometry::from_toml(DESK_TOML).unwrap(),
-            CameraPose::from_desk_toml(DESK_TOML).unwrap(),
+            DesktopGeometry::from_toml(FIXTURE_TOML).unwrap(),
+            CameraPose::from_desk_toml(FIXTURE_TOML).unwrap(),
         )
     }
 

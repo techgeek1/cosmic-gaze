@@ -11,3 +11,8 @@ __pycache__/
 # Personal: desk-specific calibration and raw gaze readings (regenerate with gaze-webcam-cli calibrate).
 /config/calibration*.toml
 /config/calibration*.jsonl
+/config/calibration*
+# Recording sessions: personal gaze data, keyed to one device blob.
+/config/sessions/
+# Local experiments and captures; not part of the tree.
+/scratchpad/

@@ -182,7 +182,7 @@ pub fn scene(state: &OverlayState, map: &OutputMapping) -> Vec<Item> {
 }
 
 /// Renders one output's worth of overlay content into a standalone pixmap, transparent
-/// everywhere nothing is drawn.
+/// everywhere nothing is drawn (or filled with the state's background, when it has one).
 ///
 /// This is the same drawing path the compositor gets, minus the `wl_shm` plumbing and the
 /// byte order fixup, so it is the cheap way to check what the overlay would put on a
@@ -191,7 +191,9 @@ pub fn scene(state: &OverlayState, map: &OutputMapping) -> Vec<Item> {
 pub fn render(state: &OverlayState, map: &OutputMapping) -> Option<Pixmap> {
     let (w, h)     = map.buffer_size();
     let mut pixmap = Pixmap::new(w, h)?;
+    let whole      = PixelBox { x: 0, y: 0, w: w as i32, h: h as i32 };
 
+    clear(&mut pixmap.as_mut(), whole, state.background);
     draw(&mut pixmap.as_mut(), &scene(state, map));
 
     Some(pixmap)
@@ -202,17 +204,27 @@ pub fn bounds(items: &[Item]) -> Option<PixelBox> {
     items.iter().map(item_bounds).reduce(|a, b| a.union(b))
 }
 
-/// Clears `area` to fully transparent. A plain memset per row beats going through
-/// tiny-skia's blender for what is always an axis aligned opaque-to-nothing fill.
-pub fn clear(pixmap: &mut PixmapMut, area: PixelBox) {
-    let stride = pixmap.width() as usize * 4;
-    let data   = pixmap.data_mut();
+/// Clears `area` to `fill`, or to fully transparent when there is no background. A plain
+/// memset per row beats going through tiny-skia's blender for what is always an axis
+/// aligned solid fill.
+///
+/// The bytes go down in tiny-skia's premultiplied RGBA order, so a caller that is filling
+/// a `wl_shm` buffer still has to run [`rgba_to_argb`] over the same area afterwards.
+pub fn clear(pixmap: &mut PixmapMut, area: PixelBox, fill: Option<[u8; 4]>) {
+    let Some(color) = fill else {
+        let stride = pixmap.width() as usize * 4;
+        let data   = pixmap.data_mut();
 
-    for row in area.y..area.y + area.h {
-        let start = row as usize * stride + area.x as usize * 4;
+        for row in area.y..area.y + area.h {
+            let start = row as usize * stride + area.x as usize * 4;
 
-        data[start..start + area.w as usize * 4].fill(0);
-    }
+            data[start..start + area.w as usize * 4].fill(0);
+        }
+
+        return;
+    };
+
+    fill_solid(pixmap, area, premultiply(color));
 }
 
 /// Draws every item into the pixmap. The caller must have cleared at least the union of
@@ -580,6 +592,32 @@ mod tests {
         let (w, h) = map.buffer_size();
 
         assert!(bounds(&items).expect("items exist").clip_to(w, h).is_empty());
+    }
+
+    #[test]
+    fn a_background_covers_every_pixel_under_the_markers() {
+        let map   = hidpi();
+        let state = OverlayState {
+            gaze       : Some(GlobalPx { x: 1986.0, y: 1900.0 }),
+            background : Some([255, 255, 255, 255]),
+            ..OverlayState::default()
+        };
+
+        let pixmap = render(&state, &map).expect("a rendered surface");
+
+        // Every pixel is opaque: the corners are bare background, the centre is the ring
+        // drawn over it. A transparent pixel anywhere would be a hole onto the desktop,
+        // which is exactly what a recording session must not have.
+        assert!(pixmap.data().chunks_exact(4).all(|px| px[3] == 255));
+
+        // A far corner is the background colour and nothing else.
+        assert_eq!(&pixmap.data()[0..4], &[255, 255, 255, 255]);
+
+        // Without a background the same state leaves that corner transparent.
+        let bare = render(&OverlayState { background: None, ..state }, &map)
+            .expect("a rendered surface");
+
+        assert_eq!(&bare.data()[0..4], &[0, 0, 0, 0]);
     }
 
     #[test]

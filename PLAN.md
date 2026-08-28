@@ -1,7 +1,9 @@
 # Phase 0 build plan: does gaze + vision snapping work at all?
 
 **Status 2026-08-26: complete. Verdict and numbers in DESIGN.md §10b. Next phase: fine channel
-(Daydream controller daemon + refine modes in gaze-proto), then online recalibration.**
+(Daydream controller daemon + refine modes in gaze-proto), then online recalibration.
+ET5 provider rebuild (host-owned device state, state-conditioned model, click flywheel):
+`PLAN-ET5.md`.**
 
 Goal: a number. First-commit snap-correct rate on a real mixed desktop at sigma = 0.7
 degrees (ET5-class) and 1.5 degrees, using detector boxes only (no a11y), driven by a
