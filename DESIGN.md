@@ -541,6 +541,21 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   toml 0.9), silently returned 0, so **every `calibrate` so far declared the trained plane in
   the desk frame, without the 13° mount pitch**. Fixed; changes session zero's residual only
   3.68 → 3.75° rms, but the next retrain declares a different plane than all previous ones.
+- 2026-08-28 11:56, **first successful retrain with the fixed ceremony** (seeded from the
+  16:12 blob, vote-only gate, 9 targets at 5/50/95% of a 600×340 mm area × black/white).
+  14 of 18 slots accepted; committed body sha256 `70289bb2…` (654498 B), persisted across the
+  reconnect check, `blob-info` retrieve twice identical. Firmware's own table (against the
+  875×370 plane): 12 of 14 points at 0.4–3.2° (right eye ≤1° on most, left eye ~1° worse
+  everywhere) — versus the 16:12 model's 0.3–4.7° ring and 5–24° lean dots. **Top-left
+  target failed identically on both passes**: left eye invalid, right eye 9–11° off, and the
+  right-eye reading is the same both times (uv ≈ 0.08, −0.1), i.e. a systematic
+  extrapolation error, not a transient — consistent with the firmware discarding samples
+  where one eye is invalid, so those two slots taught the model nothing. Health pass (grey
+  3×3, live gaze, 20 samples each): centre column 0.36 / 0.23 / 1.41°, right column
+  2.13 / 0.38 / 3.50°, left column **8.29° (7 valid samples of 20)** / 1.52 / 1.00°. In use:
+  "feels a lot better". Open: why the left eye drops out at the top-left (glint/lid
+  geometry? map validity over a `record` session), and whether the four missing slots
+  (centre and three mid-edges on the second background) were skipped or dropped.
 
 ## 11. Open questions
 
