@@ -95,8 +95,11 @@ own limit (~0.7° inside the cone), with drift that corrects itself from ordinar
   start with Talon's 600×340 mm bottom-centred on the tracker axis and record what was used.
 - Gaze-gated point acceptance: add a point only after the device's reported gaze has been
   the nearest to that target for ≥ N frames (Talon uses 60 of the last 120).
-- Two passes on black and white overlay backgrounds so the firmware model sees both pupil
-  extremes.
+- A second pass on a white overlay background so the firmware model sees both pupil
+  extremes — corners only, thirteen points in all. **The device's point store is a FIFO
+  of 14 points (or ~640 KiB; the 2026-08-28 11:56 run fed 18 and kept the newest 14 at
+  ~46.6 KB each, 862 bytes under 640 KiB).** The ceremony reads the trailer back and
+  reports what the device kept.
 - `--suggest`: query 0x442 and log what the device asks for (exploratory; do not depend on it).
 - Save the blob and its hash; start a fresh history keyed to the hash. The plane stays the
   measured one from `desk.toml`.

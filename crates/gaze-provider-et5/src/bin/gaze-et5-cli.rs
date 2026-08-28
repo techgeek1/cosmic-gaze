@@ -1099,6 +1099,17 @@ fn calibrate(args: CalibrateArgs) -> Result<()> {
     println!("{} of {} points accepted over {} applied rounds",
              outcome.accepted, outcome.results.len(), outcome.applied);
 
+    match outcome.kept {
+        Some(kept) if kept < outcome.accepted => {
+            println!("WARNING: the device kept only {kept} of them; the oldest {} were \
+                      evicted (store cap {} points / {} bytes, this blob {} bytes)",
+                     outcome.accepted - kept, retrain::DEVICE_POINT_CAP,
+                     retrain::DEVICE_BLOB_CAP_BYTES, outcome.blob.len());
+        }
+        Some(kept) => println!("the device kept all {kept}"),
+        None       => println!("WARNING: no result trailer on the committed blob"),
+    }
+
     for result in &outcome.results {
         let point = &plan.points[result.index];
 

@@ -25,11 +25,13 @@
 //! 3. **Seed the session.** `cal_start`, `cal_clear`, then upload the blob the host
 //!    already holds. See "The session order" below: this is the step whose absence
 //!    cost the 2026-08-28 01:24 run sixteen of its eighteen points.
-//! 4. **Six rounds, `cal_points_apply` after each.** Centre, then the four mid-edges,
-//!    then the four corners — on black, then the same three on white. Two backgrounds
-//!    because a pupil-radius term in the firmware fit is only identifiable if it has
-//!    seen both extremes (Tobii [patent reference removed]), and the eye needs seconds to adapt
-//!    after each flip.
+//! 4. **Four rounds, `cal_points_apply` after each.** Centre, then the four mid-edges,
+//!    then the four corners on black, then the four corners again on white: thirteen
+//!    points. Two backgrounds because a pupil-radius term in the firmware fit is only
+//!    identifiable if it has seen both extremes (Tobii [patent reference removed]), and the eye
+//!    needs seconds to adapt after each flip. Thirteen rather than eighteen because
+//!    the device keeps only its newest [`DEVICE_POINT_CAP`] points; see "The point
+//!    cap" below.
 //! 5. **Gaze-gated acceptance.** A point is only added once the device's own reported
 //!    gaze has named it as the nearest of the round's targets for most of the last
 //!    window. That is Talon's whole gate, and deliberately not an accuracy test; see
@@ -73,6 +75,21 @@
 //! continuous frames — because a device that is plainly seeing the user but not
 //! reporting a direction can still be taught. Nothing times out; a point that will not
 //! settle nags until the operator takes it (Enter), skips it (`s`), or aborts (`q`).
+//!
+//! # The point cap
+//!
+//! The device's calibration store is a FIFO. The 2026-08-28 11:56 run fed eighteen
+//! points (nine on black, the same nine on white) and the committed blob's result
+//! trailer held the last fourteen in insertion order, the oldest four — black centre
+//! and three black mid-edges — gone without any error reply. That blob was 654,498
+//! bytes at roughly 46.6 KB per point, 862 bytes under 640 KiB, so the limit may be
+//! the store's size rather than a point count; the two are indistinguishable so far
+//! and both say fifteen never fits and fourteen is marginal. The schedule therefore
+//! stops at thirteen, ordered so the points that would be evicted first are the ones
+//! the health passes rate strongest (the centre column), and [`run_retrain`] reads
+//! the trailer back and reports how many points the device actually kept. Talon's
+//! nine and Tobii's own five/seven/nine-point ceremonies never approach the cap,
+//! which is presumably why nobody documents it.
 //!
 //! # The 2026-08-28 01:24 failure
 //!
@@ -144,6 +161,16 @@ pub const DWELL_S: f64 = 1.5;
 /// 2026-08-28 01:24 run committed a two-point model over a good one, and a partial
 /// retrain is worse than no retrain because it destroys what it replaces.
 pub const MIN_POINTS: usize = 9;
+
+/// The most calibration points the device retains, newest first; older ones are
+/// evicted silently. Measured on 2026-08-28: eighteen fed, the last fourteen read
+/// back. See "The point cap" in the module docs — the limit may really be
+/// [`DEVICE_BLOB_CAP_BYTES`], which the same run came within 862 bytes of.
+pub const DEVICE_POINT_CAP: usize = 14;
+
+/// The calibration store size the observed cap lines up with: 640 KiB, at about
+/// 46.6 KB of blob per point.
+pub const DEVICE_BLOB_CAP_BYTES: usize = 640 * 1024;
 
 /// How often the per-point status line is printed while waiting, seconds.
 const STATUS_S: f64 = 1.0;
@@ -429,7 +456,7 @@ pub struct RetrainPlan {
     pub train_uv : (f64, f64, f64, f64),
     /// The nine targets, row-major from the top-left of the training rectangle.
     pub points   : Vec<TrainPoint>,
-    /// The six rounds.
+    /// The four rounds.
     pub rounds   : Vec<Round>,
     /// Acceptance tolerance in panel uv, per axis, from `accept_deg`. `None` when no
     /// radius was asked for, which is the default gate.
@@ -562,7 +589,7 @@ fn nearest(targets: &[[f64; 2]], sample: [f64; 2], aspect: f64) -> Option<usize>
 // --- Planning ---
 
 /// Plans the ceremony for a display: the plane, the training rectangle, the nine
-/// targets, and the six rounds.
+/// targets, and the four rounds.
 ///
 /// Fails only when the display is missing from the desk config or disabled.
 pub fn plan(geometry: &DesktopGeometry, config: &RetrainConfig)
@@ -696,40 +723,27 @@ fn grid_points(out: &OutputGeometry, uv: (f64, f64, f64, f64)) -> Vec<TrainPoint
     points
 }
 
-/// The six rounds: Talon's three schedules on black, then the same three on white.
+/// The four rounds: Talon's three schedules on black, then the corners again on
+/// white — thirteen points, one under [`DEVICE_POINT_CAP`].
 ///
 /// Small rounds with a commit after each are what Talon does and what the firmware's
 /// own fit expects: `cal_points_apply` folds the points collected since the last
 /// apply into the model, so a bad point poisons one round rather than the ceremony,
 /// and the later rounds are collected through an already-improving model.
+///
+/// Only the corners repeat on white because the cap allows four more points and the
+/// corners are where every health pass so far has been weakest. The order also puts
+/// the centre first, so if the store is a byte budget and a heavy run overflows by
+/// one, the point the device evicts is the one the model finds easiest.
 fn rounds() -> Vec<Round> {
-    let centre = vec![4];
     // Bottom, left, right, top — Talon's order, which keeps consecutive targets far
     // apart so a lingering fixation cannot satisfy the next point.
-    let edges  = vec![7, 3, 5, 1];
-    let corner = vec![0, 8, 6, 2];
-
-    let mut rounds = Vec::with_capacity(6);
-
-    for background in [Background::Black, Background::White] {
-        rounds.push(Round {
-            name       : "centre",
-            background : background,
-            points     : centre.clone(),
-        });
-        rounds.push(Round {
-            name       : "mid-edges",
-            background : background,
-            points     : edges.clone(),
-        });
-        rounds.push(Round {
-            name       : "corners",
-            background : background,
-            points     : corner.clone(),
-        });
-    }
-
-    rounds
+    vec![
+        Round { name: "centre",    background: Background::Black, points: vec![4] },
+        Round { name: "mid-edges", background: Background::Black, points: vec![7, 3, 5, 1] },
+        Round { name: "corners",   background: Background::Black, points: vec![0, 8, 6, 2] },
+        Round { name: "corners",   background: Background::White, points: vec![0, 8, 6, 2] },
+    ]
 }
 
 /// The acceptance radius in panel uv, per axis, from an angle at the nominal eye.
@@ -855,6 +869,9 @@ pub struct RetrainOutcome {
     /// only if the firmware stopped writing one. Normalised against the plane
     /// declared for the ceremony, which is `RetrainPlan::area`.
     pub result      : Option<CalibrationResult>,
+    /// Points the device actually retained, read off the result trailer; fewer than
+    /// `accepted` means the store evicted the oldest (see "The point cap").
+    pub kept        : Option<usize>,
     /// Every target, in ceremony order.
     pub results     : Vec<PointResult>,
     /// Every round, in ceremony order.
@@ -1000,9 +1017,32 @@ pub fn run_retrain(
     info!("retrain committed: {accepted}/{} points over {applied} applied rounds, \
            {} byte blob", results.len(), blob.len());
 
+    // The device's store is a FIFO (see "The point cap"): what it kept is in the
+    // trailer, and a shortfall is the only sign that anything was evicted.
+    let result = decode_trailer(&blob).map(|(_, table)| table);
+    let kept   = result.as_ref().map(|table| table.targets.len());
+
+    match kept {
+        Some(kept) if kept < accepted => {
+            warn!("the device kept {kept} of the {accepted} accepted points; the oldest \
+                   {} were evicted (cap {DEVICE_POINT_CAP} points or \
+                   {DEVICE_BLOB_CAP_BYTES} bytes; this blob is {} bytes)",
+                  accepted - kept, blob.len());
+        }
+        Some(kept) => {
+            info!("the device kept all {kept} accepted points ({} of {} bytes)",
+                  blob.len(), DEVICE_BLOB_CAP_BYTES);
+        }
+        None => {
+            warn!("the committed blob carries no result trailer, so how many points \
+                   the device kept is unknown");
+        }
+    }
+
     Ok(RetrainOutcome {
         body_sha256 : body_sha256_hex(&blob),
-        result      : decode_trailer(&blob).map(|(_, table)| table),
+        result      : result,
+        kept        : kept,
         blob        : blob,
         results     : results,
         rounds      : summaries,
@@ -1756,36 +1796,49 @@ mod tests {
     }
 
     #[test]
-    fn the_schedule_is_eighteen_points_in_six_rounds() {
+    fn the_schedule_is_thirteen_points_in_four_rounds() {
         let geometry = desk();
         let plan     = plan(&geometry, &config()).expect("plan");
 
         assert_eq!(plan.points.len(), 9);
-        assert_eq!(plan.rounds.len(), 6);
-        assert_eq!(plan.rounds.iter().map(|r| r.points.len()).sum::<usize>(), 18);
+        assert_eq!(plan.rounds.len(), 4);
+        assert_eq!(plan.rounds.iter().map(|r| r.points.len()).sum::<usize>(), 13);
 
-        // Centre first, then the mid-edges, then the corners, on each background.
+        // Centre first, then the mid-edges, then the corners, then the corners again.
         assert_eq!(plan.rounds[0].points, vec![4]);
         assert_eq!(plan.rounds[1].points, vec![7, 3, 5, 1]);
         assert_eq!(plan.rounds[2].points, vec![0, 8, 6, 2]);
+        assert_eq!(plan.rounds[3].points, vec![0, 8, 6, 2]);
 
         for round in &plan.rounds[..3] {
             assert_eq!(round.background, Background::Black);
         }
 
-        for round in &plan.rounds[3..] {
-            assert_eq!(round.background, Background::White);
-        }
+        assert_eq!(plan.rounds[3].background, Background::White);
 
-        // Every point is used exactly twice over the ceremony.
+        // Every point is used at least once; the corners twice.
         for index in 0..9 {
             let uses = plan.rounds.iter()
                 .flat_map(|r| r.points.iter())
                 .filter(|i| **i == index)
                 .count();
+            let want = if [0, 2, 6, 8].contains(&index) { 2 } else { 1 };
 
-            assert_eq!(uses, 2, "point {index} appears {uses} times");
+            assert_eq!(uses, want, "point {index} appears {uses} times");
         }
+    }
+
+    #[test]
+    fn the_schedule_stays_under_the_device_point_cap() {
+        // The device evicts the oldest points past the cap without a word (2026-08-28
+        // 11:56: eighteen fed, fourteen kept), and the cap may be a byte budget the
+        // fourteenth point only just fit, so the schedule leaves one point of margin.
+        let geometry = desk();
+        let plan     = plan(&geometry, &config()).expect("plan");
+        let total    = plan.rounds.iter().map(|r| r.points.len()).sum::<usize>();
+
+        assert!(total < DEVICE_POINT_CAP, "{total} points is not under the cap");
+        assert!(total >= MIN_POINTS);
     }
 
     #[test]

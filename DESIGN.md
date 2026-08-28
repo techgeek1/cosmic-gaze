@@ -554,8 +554,16 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   3×3, live gaze, 20 samples each): centre column 0.36 / 0.23 / 1.41°, right column
   2.13 / 0.38 / 3.50°, left column **8.29° (7 valid samples of 20)** / 1.52 / 1.00°. In use:
   "feels a lot better". Open: why the left eye drops out at the top-left (glint/lid
-  geometry? map validity over a `record` session), and whether the four missing slots
-  (centre and three mid-edges on the second background) were skipped or dropped.
+  geometry? map validity over a `record` session). The four missing slots were not
+  skipped: the trailer lists black TM·TL·BR·BL·TR, then white C·BM·ML·MR, then white
+  TM·TL·BR·BL·TR — exactly the newest 14 of the 18 in insertion order. **The device's
+  calibration store is a FIFO capped at 14 points, or at ~640 KiB** (this blob is
+  654,498 B at ~46.6 KB per point, 862 bytes under; the two limits cannot yet be told
+  apart, and the 16:12 run's 13-of-14 is inconclusive because its lean centre may have
+  been skipped). Consequence: the double-background schedule silently threw away the
+  black centre and mid-edges. Ceremony now runs 13 points (black centre / mid-edges /
+  corners, white corners) and reports how many the device kept. Talon's 9 and Tobii's
+  5/7/9 never reach the cap, which is why nobody mentions it.
 
 ## 11. Open questions
 
