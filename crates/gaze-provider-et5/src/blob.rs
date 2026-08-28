@@ -54,18 +54,30 @@ impl std::fmt::Display for BlobReport {
 /// `SizeAndPrefix` is the fallback for a firmware that re-serialises the model (float
 /// noise, a timestamp, a scratch region) and so returns different bytes for the same
 /// model.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlobCheck {
-    /// Byte-identical, the strongest statement available.
-    // A0 result pending: this is the default because the strict check is the one
-    // worth having, not because retrieve is known to be deterministic. If
-    // `blob-info` shows two retrieves differing, the default moves to
-    // `SizeAndPrefix` with the prefix length that run reports.
-    #[default]
+    /// Byte-identical, the strongest statement available. Not what the firmware does:
+    /// measured 2026-08-28, an upload round-trips its first 604428 of 604948 bytes
+    /// exactly and the last 520 come back different (the per-point calibration result
+    /// table, see the module docs), and uploading the read-back form hands the original
+    /// trailer back again. Kept for tests and for firmware that behaves.
     Exact,
     /// Same length, and the first `prefix_len` bytes identical. A shorter blob is
     /// compared over all of it.
     SizeAndPrefix { prefix_len: usize },
+    /// Same length, and everything but the last `trailer_max` bytes identical: the
+    /// body of the blob is the model, the trailer is device-managed. The default.
+    Body { trailer_max: usize },
+}
+
+/// Upper bound on the device-managed trailer, bytes. Measured at 520 for 13 unique
+/// calibration targets (40 bytes per target); 2048 leaves room for a 50-target model.
+pub const TRAILER_MAX_BYTES: usize = 2048;
+
+impl Default for BlobCheck {
+    fn default() -> Self {
+        Self::Body { trailer_max: TRAILER_MAX_BYTES }
+    }
 }
 
 impl BlobCheck {
@@ -80,6 +92,15 @@ impl BlobCheck {
                 }
 
                 let n = (*prefix_len).min(expected.len());
+
+                expected[..n] == actual[..n]
+            }
+            Self::Body { trailer_max }         => {
+                if expected.len() != actual.len() {
+                    return false;
+                }
+
+                let n = expected.len().saturating_sub(*trailer_max);
 
                 expected[..n] == actual[..n]
             }
@@ -158,6 +179,17 @@ mod tests {
         assert!(exact.agrees(b"abcd", b"abcd"));
         assert!(!exact.agrees(b"abcd", b"abXd"));
         assert!(!exact.agrees(b"abcd", b"abc"));
+    }
+
+    #[test]
+    fn body_check_ignores_only_the_trailer() {
+        let check = BlobCheck::Body { trailer_max: 2 };
+
+        assert!(check.agrees(b"abcdef", b"abcdXY"));
+        assert!(!check.agrees(b"abcdef", b"abcXef"));
+        assert!(!check.agrees(b"abcdef", b"abcdefg"));
+        // A blob shorter than the trailer bound is all trailer: only the length counts.
+        assert!(check.agrees(b"a", b"b"));
     }
 
     #[test]

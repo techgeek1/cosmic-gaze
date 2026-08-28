@@ -498,6 +498,14 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   mechanism behind every "regressed after sitting off" episode, and the reason the Windows
   driver and Talon re-upload on every connect. Host-owned blob confirmed as the fix; the
   provider now uploads at connect, so a power cycle costs nothing once the file exists.
+- 2026-08-28, **the blob is not round-trip stable, but its body is.** Pushing the 16:12 file
+  (604948 B) read back the same length with the first 604428 bytes identical and the last 520
+  different; pushing that read-back form handed the *original* bytes back. The trailer decodes
+  as little-endian f32 pairs — the retrain's ring and lean-dot targets (0.5/0.5, 0.7/0.5,
+  0.3/0.5, 0.35, 0.65…) each followed by a measured point and a `1` flag word per eye: Tobii's
+  per-point calibration-result table, 13 unique targets × 40 bytes, device-managed and
+  apparently double-buffered. Verification now compares the body only (`BlobCheck::Body`);
+  the trailer is worth decoding as a free per-point health report.
 - 2026-08-28, session zero (the 16:24 readings imported as `config/sessions/1787873083-d32f6c4b.jsonl`,
   1462 rows after saccade gating, no outlier gates). Firmware-only residual of the filtered
   ray, in-sample, no split: **3.75° rms** overall (p50 2.12, p90 5.69); stops 2.48°, glides

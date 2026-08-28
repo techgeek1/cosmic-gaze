@@ -643,7 +643,7 @@ mod tests {
                 bl_mm : [-300.0, -140.0, 0.0],
             }),
             double_upload : false,
-            check         : BlobCheck::Exact,
+            check         : BlobCheck::default(),
         }
     }
 

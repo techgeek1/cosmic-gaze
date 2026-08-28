@@ -760,7 +760,7 @@ fn blob_push(file: &std::path::Path, double: bool, calibration: &std::path::Path
         blob          : Some(blob),
         area          : Some(area),
         double_upload : double,
-        check         : BlobCheck::Exact,
+        check         : BlobCheck::default(),
     });
 
     match result {
