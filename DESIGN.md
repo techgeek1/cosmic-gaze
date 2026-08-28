@@ -564,6 +564,21 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   black centre and mid-edges. Ceremony now runs 13 points (black centre / mid-edges /
   corners, white corners) and reports how many the device kept. Talon's 9 and Tobii's
   5/7/9 never reach the cap, which is why nobody mentions it.
+- 2026-08-28, decision: **passive labels from mouse clicks** (`gaze-clicks`, PLAN-ET5 B4).
+  People look at what they click, so every deliberate click on a recognised text or
+  control element is a labelled gaze sample — hundreds a day, no ceremony, and it does not
+  need gaze pointing to be usable first, which is the chicken-and-egg the click flywheel
+  (Phase E) otherwise has. Every piece already existed: pointer position from the
+  compositor's cursor-capture session (`gaze-capture::CursorTracker`), buttons read-only
+  off the input-remapper clone over evdev without a grab, the recognition layer
+  (`gaze-capture` + `gaze-detect`) on a crop around the click, and the `record` session
+  format. Rules: pre-click frame only (a post-click capture shows menus closing and pages
+  navigating), drags and clicks on nothing rejected, the smallest containing element's
+  kind/box/text stored so the export can weight by target size, gaze window
+  −1.2 s..+0.4 s, and the firmware's own offset at each click reported live as the daily
+  drift number. Where the eye actually is relative to the click point (it leads by
+  100–300 ms and sometimes leaves early) is left to the export, which keeps the whole
+  window.
 
 ## 11. Open questions
 
