@@ -579,6 +579,15 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   drift number. Where the eye actually is relative to the click point (it leads by
   100–300 ms and sometimes leaves early) is left to the export, which keeps the whole
   window.
+- 2026-08-28, `gaze-clicks` recognition: **crops lose wide flat widgets.** Driving the
+  collector's own path at the centres of widgets from a full-frame detection of DP-2
+  (Discord + browser): 512 px crop agreed 15/30, 640 px crop (tile scale 1) 18/30, whole
+  frame 30/30. Misses were Discord channel rows (~290×40) and the URL bar, which in a
+  crop come back as their inner OCR text or nothing; small square widgets survive. Not a
+  scale effect — the widget model needs the surrounding layout. Recognition moved to the
+  whole output frame (~250–400 ms, off the click's critical path) with capture and
+  detection on separate threads so a double-click's second capture is never queued
+  behind the first click's detection.
 
 ## 11. Open questions
 
