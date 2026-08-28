@@ -22,36 +22,81 @@
 //! 2. **Pick a training area.** Not the whole panel: Talon trains on 600x340 mm
 //!    bottom-centred on the tracker, which is roughly the envelope where the glints
 //!    stay on the cornea. Points sit at 5%, 50% and 95% of that rectangle.
-//! 3. **Six rounds, `cal_points_apply` after each.** Centre, then the four mid-edges,
+//! 3. **Seed the session.** `cal_start`, `cal_clear`, then upload the blob the host
+//!    already holds. See "The session order" below: this is the step whose absence
+//!    cost the 2026-08-28 01:24 run sixteen of its eighteen points.
+//! 4. **Six rounds, `cal_points_apply` after each.** Centre, then the four mid-edges,
 //!    then the four corners — on black, then the same three on white. Two backgrounds
 //!    because a pupil-radius term in the firmware fit is only identifiable if it has
 //!    seen both extremes (Tobii [patent reference removed]), and the eye needs seconds to adapt
 //!    after each flip.
-//! 4. **Gaze-gated acceptance.** A point is only added once the device's own reported
-//!    gaze has been nearest to it for most of the last window *and* the median of
-//!    those samples lands within a few degrees of it. Feeding a point the user was not
-//!    actually looking at is worse than not feeding it at all; [`gate_verdict`] is the
-//!    whole decision as a pure function, so it can be tested without a device.
-//! 5. **Commit, then measure.** `cal_stop` and `cal_retrieve` bank the blob, then a
+//! 5. **Gaze-gated acceptance.** A point is only added once the device's own reported
+//!    gaze has named it as the nearest of the round's targets for most of the last
+//!    window. That is Talon's whole gate, and deliberately not an accuracy test; see
+//!    "The gate" below. [`gate_verdict`] is the decision as a pure function, so it can
+//!    be tested without a device.
+//! 6. **Commit, then measure.** `cal_stop` and `cal_retrieve` bank the blob, then a
 //!    3x3 health grid reads the firmware's own gaze back against known targets and the
 //!    numbers travel with the blob in the calibration file. Nothing is fitted.
 //!
 //! Nothing here fits a correction field, a head gain, or a pose: those were the old
 //! `calibrate`'s client-side stages, and they are replaced by the session recordings
 //! of `crate::record` and the model of Phase C/D.
+//!
+//! # The session order
+//!
+//! `cal_start` -> `cal_clear` -> `cal_apply(seed)` -> rounds -> `cal_stop` +
+//! `cal_retrieve`. The seed upload is nottobii's captured Windows order, and it exists
+//! because every gate here reads the device's *own* gaze: after `cal_clear` the
+//! firmware has no eye model to report one from, so a ceremony that gates on gaze and
+//! does not seed is asking the device a question it cannot answer until the first
+//! apply lands. The seed is the blob the run is about to overwrite, so the rounds are
+//! collected through a working model and the new one replaces it wholesale at the end.
+//! [`resolve_seed`] picks it; `--no-seed` is the experiment that leaves it out.
+//!
+//! # The gate
+//!
+//! Talon accepts a point when more than 60 of the last 120 gaze samples (also capped
+//! at 2 s) had this target as their *nearest*, and nothing else: no absolute accuracy
+//! test, no timeout. That is the right shape, because during a retrain the model being
+//! measured is the one being replaced, so "the reported gaze is within 3 degrees of
+//! the target" is a statement about the old model rather than about where the user is
+//! looking. A round with a single target therefore accepts on any 60 frames that carry
+//! a gaze point at all, exactly as Talon does. The ellipse test is still available as
+//! `--accept-deg` for a deliberate experiment, off by default.
+//!
+//! Two things Talon does not have, because this ceremony is unattended in a way its
+//! is not. First, frames without a gaze point are counted and reported rather than
+//! silently failing to vote: a starving gate and a wandering user look identical from
+//! the outside otherwise. Second, when *no* frame has carried a gaze point for
+//! `gaze_timeout_s`, the point falls back to a dwell — both eyes tracked for 1.5 s of
+//! continuous frames — because a device that is plainly seeing the user but not
+//! reporting a direction can still be taught. Nothing times out; a point that will not
+//! settle nags until the operator takes it (Enter), skips it (`s`), or aborts (`q`).
+//!
+//! # The 2026-08-28 01:24 failure
+//!
+//! The first real run accepted 2 of 18 points (the centre of round 1 and one mid-edge)
+//! and skipped the other 16 on a 15 s timeout; the firmware then fitted a two-point
+//! model over the top of a good one and the health pass read 2 to 40 degrees. Three
+//! things had to be true at once: the gate demanded reported gaze within 3 degrees of
+//! the target from a device that had just been cleared, a point that never tripped the
+//! gate was silently skipped, and a ceremony that accepted almost nothing still
+//! committed. All three are fixed here, and [`RetrainConfig::min_points`] is the last
+//! line: a ceremony that accepted fewer points than that writes nothing at all.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, TryRecvError};
 use glam::DVec3;
 use tracing::{info, warn};
 use gaze_core::{DesktopGeometry, GlobalPx, OutputGeometry};
 use gaze_overlay::{OverlayHandle, OverlayState};
 
-use crate::blob::{CalibrationResult, body_sha256_hex, decode_trailer};
+use crate::blob::{CalibrationResult, body, body_sha256_hex, decode_trailer};
 use crate::calibration::HealthStop;
-use crate::device::Device;
+use crate::device::{Device, DeviceError};
 use crate::gaze::Et5Frame;
 use crate::record::{BLACK, WHITE};
 use crate::sweep::{
@@ -83,12 +128,25 @@ pub const GATE_MIN_HITS: usize = 60;
 /// whatever the frame count says, so a dropout cannot leave stale samples voting.
 pub const GATE_WINDOW_S: f64 = 2.0;
 
-/// Default acceptance radius, degrees of visual angle from the nominal eye.
-pub const ACCEPT_DEG: f64 = 3.0;
-
-/// Default per-point patience, seconds. A point that has not tripped the gate by then
-/// is skipped with a warning rather than blocking the ceremony.
+/// Default nag interval, seconds. A point that has not tripped the gate by then says
+/// so and keeps waiting; nothing is ever skipped without the operator asking.
 pub const POINT_TIMEOUT_S: f64 = 15.0;
+
+/// Default patience for the *first gaze point of all*, seconds. Past this with the
+/// device reporting no direction whatsoever, the point falls back to a dwell.
+pub const GAZE_TIMEOUT_S: f64 = 5.0;
+
+/// Continuous both-eyes-tracked time that carries a point under the dwell fallback,
+/// seconds. Long enough that it cannot be satisfied on the way to the target.
+pub const DWELL_S: f64 = 1.5;
+
+/// Default floor on accepted points. Below this the ceremony writes nothing: the
+/// 2026-08-28 01:24 run committed a two-point model over a good one, and a partial
+/// retrain is worse than no retrain because it destroys what it replaces.
+pub const MIN_POINTS: usize = 9;
+
+/// How often the per-point status line is printed while waiting, seconds.
+const STATUS_S: f64 = 1.0;
 
 /// Pupil adaptation wait after a background change, seconds. Same value and reasoning
 /// as `crate::record`: sized for dilation, which is the slow direction.
@@ -101,6 +159,15 @@ const TICK: Duration = Duration::from_millis(8);
 /// Settling time after the device takes a plane declaration, before its 2D output is
 /// trusted to be on the new plane.
 const PLANE_SETTLE: Duration = Duration::from_millis(200);
+
+/// Settling time after the seed blob goes up, before the first target is shown. The
+/// upload is 600 KB and the firmware has to load the model behind it.
+const SEED_SETTLE: Duration = Duration::from_millis(500);
+
+/// Pause between closing the tracker and reopening it for the persistence check.
+/// Deliberately longer than a re-enumeration takes, so a reboot in progress fails the
+/// open instead of racing it.
+const RECONNECT_SETTLE: Duration = Duration::from_millis(1000);
 
 /// Health-check dwell per stop, seconds.
 const HEALTH_DWELL_S: f64 = 1.0;
@@ -139,10 +206,23 @@ pub struct RetrainConfig {
     /// Train over the whole panel instead of the rectangle. The firmware is poor
     /// outside its envelope, so this is an experiment, not a better default.
     pub area_full         : bool,
-    /// Acceptance radius, degrees.
-    pub accept_deg        : f64,
-    /// Per-point patience, seconds.
+    /// Optional acceptance radius, degrees. `None` is the shipped gate: Talon's
+    /// nearest-target vote with no absolute accuracy test at all. Setting it puts an
+    /// ellipse of this radius around the target on top of the vote, which only makes
+    /// sense when the device is already reporting a trustworthy gaze.
+    pub accept_deg        : Option<f64>,
+    /// Nag interval, seconds. Not a timeout: when it elapses the ceremony says which
+    /// point it is still waiting on and keeps waiting.
     pub point_timeout_s   : f64,
+    /// How long a point waits for the device to report any gaze at all before the
+    /// dwell fallback arms, seconds.
+    pub gaze_timeout_s    : f64,
+    /// The first round that ends in a `cal_points_apply`. 1 applies after every round
+    /// (Talon); a larger number holds the earlier rounds' points until it, so the
+    /// first fit the firmware runs has more than one point in it.
+    pub apply_from_round  : usize,
+    /// Accepted points below which the ceremony refuses to commit anything.
+    pub min_points        : usize,
     /// Ask the device what point it would like after each round and log the answer.
     /// Exploratory: nothing depends on the reply.
     pub suggest           : bool,
@@ -156,11 +236,130 @@ impl Default for RetrainConfig {
             area_w_mm         : AREA_W_MM,
             area_h_mm         : AREA_H_MM,
             area_full         : false,
-            accept_deg        : ACCEPT_DEG,
+            accept_deg        : None,
             point_timeout_s   : POINT_TIMEOUT_S,
+            gaze_timeout_s    : GAZE_TIMEOUT_S,
+            apply_from_round  : 1,
+            min_points        : MIN_POINTS,
             suggest           : false,
         }
     }
+}
+
+// --- Seed ---
+
+/// The blob uploaded into the fresh session after `cal_clear`, so the rounds are
+/// collected through a working eye model rather than through a cleared one.
+#[derive(Clone)]
+pub struct Seed {
+    /// Where it was read from, for the log.
+    pub path   : PathBuf,
+    /// The blob itself, exactly as `cal_apply` wants it.
+    pub blob   : Vec<u8>,
+    /// Points in its result trailer. A blob with a trailer is a trained model of this
+    /// device; one without is a factory default or someone else's file.
+    pub points : usize,
+}
+
+/// Deliberately not the derived one: the blob is 600 KB and nobody wants it in a log
+/// line.
+impl std::fmt::Debug for Seed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Seed")
+            .field("path"  , &self.path)
+            .field("bytes" , &self.blob.len())
+            .field("points", &self.points)
+            .finish()
+    }
+}
+
+/// What [`resolve_seed`] decided, with the sentence explaining it. The reason is
+/// printed by `--dry-run` and logged by the real run, because "was the session seeded"
+/// is the first question to ask of a ceremony that went wrong.
+#[derive(Clone, Debug)]
+pub struct SeedChoice {
+    /// The blob to upload, if any.
+    pub seed : Option<Seed>,
+    /// One line saying which file was used, or why none was.
+    pub why  : String,
+}
+
+/// Picks the blob that seeds the calibration session.
+///
+/// `no_seed` wins outright. Otherwise an explicit `--seed` file is used and any
+/// problem with it is an error, since silently ignoring the file the operator named is
+/// how a run ends up unseeded without anyone noticing. With neither, the blob backup
+/// this run is about to overwrite is used when it exists and decodes with a result
+/// trailer, and skipped with a reason when it does not.
+///
+/// Reads the file; the caller does this before opening the device so a bad path costs
+/// nothing.
+pub fn resolve_seed(explicit: Option<&Path>, blob: &Path, no_seed: bool)
+    -> Result<SeedChoice, SweepError>
+{
+    if no_seed {
+        return Ok(SeedChoice {
+            seed : None,
+            why  : "--no-seed: the session runs on a cleared model".into(),
+        });
+    }
+
+    // An explicit file is a request, not a preference: report what went wrong with it.
+    if let Some(path) = explicit {
+        let bytes = std::fs::read(path)
+            .map_err(|e| SweepError::Seed(format!("reading {}: {e}", path.display())))?;
+        let Some((_, table)) = decode_trailer(&bytes) else {
+            return Err(SweepError::Seed(format!(
+                "{} has no result trailer, so it is not a trained model of this device",
+                path.display())));
+        };
+
+        return Ok(SeedChoice {
+            why  : format!("seeding from {} ({} bytes, {} trailer points)",
+                           path.display(), bytes.len(), table.targets.len()),
+            seed : Some(Seed {
+                path   : path.to_path_buf(),
+                blob   : bytes,
+                points : table.targets.len(),
+            }),
+        });
+    }
+
+    if !blob.exists() {
+        return Ok(SeedChoice {
+            seed : None,
+            why  : format!("no seed: {} does not exist yet", blob.display()),
+        });
+    }
+
+    let bytes = {
+        match std::fs::read(blob) {
+            Ok(bytes) => bytes,
+            Err(e)    => {
+                return Ok(SeedChoice {
+                    seed : None,
+                    why  : format!("no seed: {} could not be read ({e})", blob.display()),
+                });
+            }
+        }
+    };
+
+    let Some((_, table)) = decode_trailer(&bytes) else {
+        return Ok(SeedChoice {
+            seed : None,
+            why  : format!("no seed: {} has no result trailer", blob.display()),
+        });
+    };
+
+    Ok(SeedChoice {
+        why  : format!("seeding from the current backup {} ({} bytes, {} trailer \
+                        points)", blob.display(), bytes.len(), table.targets.len()),
+        seed : Some(Seed {
+            path   : blob.to_path_buf(),
+            blob   : bytes,
+            points : table.targets.len(),
+        }),
+    })
 }
 
 // --- Background ---
@@ -232,8 +431,9 @@ pub struct RetrainPlan {
     pub points   : Vec<TrainPoint>,
     /// The six rounds.
     pub rounds   : Vec<Round>,
-    /// Acceptance tolerance in panel uv, per axis, from `accept_deg`.
-    pub tol_uv   : (f64, f64),
+    /// Acceptance tolerance in panel uv, per axis, from `accept_deg`. `None` when no
+    /// radius was asked for, which is the default gate.
+    pub tol_uv   : Option<(f64, f64)>,
 }
 
 // --- Gate ---
@@ -246,10 +446,9 @@ pub struct Gate {
     pub window   : usize,
     /// How many of them must name the target.
     pub min_hits : usize,
-    /// Acceptance radius across the panel, uv.
-    pub tol_u    : f64,
-    /// Acceptance radius down the panel, uv.
-    pub tol_v    : f64,
+    /// Optional acceptance radius across and down the panel, uv. `None` is Talon's
+    /// gate: the vote alone decides and the median is reported but not tested.
+    pub tol_uv   : Option<(f64, f64)>,
     /// Panel width divided by height, so "nearest target" is decided in millimetres
     /// rather than in uv, where a horizontal unit is not a vertical one.
     pub aspect   : f64,
@@ -269,12 +468,21 @@ pub struct Verdict {
 /// Decides whether `targets[index]` may be fed to the device, given the trailing
 /// window of the firmware's own reported gaze.
 ///
-/// Two conditions, both of them Talon's in spirit: the target has to have been the
-/// user's nearest for most of the window (which rejects "on the way there" and "just
-/// left"), and the median of those samples has to be close to it (which rejects a
-/// steady fixation on something else nearby, the failure a hit count alone cannot
-/// see). The median rather than the mean because a blink recovery or a single
-/// dropout frame is a wild value, not a small one.
+/// The condition is Talon's, and only Talon's by default: the target has to have been
+/// the nearest of *this round's* targets for at least `min_hits` of the window, which
+/// rejects "on the way there" and "just left" without ever asking the device to be
+/// accurate. It cannot be, during a retrain: the model reporting the gaze is the one
+/// being replaced. A round with a single target is therefore carried by any
+/// `min_hits` frames that reported a gaze at all, which is exactly what Talon does and
+/// what makes the first round possible on a freshly cleared device.
+///
+/// `gate.tol_uv` adds an ellipse around the target on top of the vote. It is off by
+/// default and exists for a deliberate experiment; a non-positive radius accepts
+/// nothing, since it means the caller has no scale for this panel.
+///
+/// The median (rather than the mean) of the voting samples is always reported, because
+/// it says where the old model thought the user was looking and a blink recovery or a
+/// dropout frame is a wild value rather than a small one.
 ///
 /// Samples must already be in panel uv and valid; invalid frames are the caller's to
 /// drop, since "no reading" is not the same as "a reading elsewhere" and must not be
@@ -313,19 +521,26 @@ pub fn gate_verdict(
 
     let centre = [median(&mut us), median(&mut vs)];
 
-    // A non-positive tolerance would either divide by zero or accept everything; it
-    // means the caller has no scale for this panel, so nothing is accepted.
-    let accepted = hits >= gate.min_hits
-        && gate.tol_u > 0.0
-        && gate.tol_v > 0.0
-        && {
-            let du = (centre[0] - target[0]) / gate.tol_u;
-            let dv = (centre[1] - target[1]) / gate.tol_v;
+    // The vote is the whole gate unless a radius was asked for. A non-positive one
+    // would either divide by zero or accept everything, and means the caller has no
+    // scale for this panel, so it accepts nothing instead.
+    let within = {
+        match gate.tol_uv {
+            None                    => true,
+            Some((tol_u, tol_v))    => {
+                let du = (centre[0] - target[0]) / tol_u;
+                let dv = (centre[1] - target[1]) / tol_v;
 
-            du * du + dv * dv <= 1.0
-        };
+                tol_u > 0.0 && tol_v > 0.0 && du * du + dv * dv <= 1.0
+            }
+        }
+    };
 
-    Verdict { hits: hits, median: Some(centre), accepted: accepted }
+    Verdict {
+        hits     : hits,
+        median   : Some(centre),
+        accepted : hits >= gate.min_hits && within,
+    }
 }
 
 /// Index of the target nearest `sample`, comparing distances in millimetres via
@@ -518,30 +733,113 @@ fn rounds() -> Vec<Round> {
 }
 
 /// The acceptance radius in panel uv, per axis, from an angle at the nominal eye.
-fn accept_tolerance_uv(geometry: &DesktopGeometry, out: &OutputGeometry, accept_deg: f64)
-    -> (f64, f64)
+/// `None` in, `None` out: no radius asked for is the default gate.
+fn accept_tolerance_uv(
+    geometry   : &DesktopGeometry,
+    out        : &OutputGeometry,
+    accept_deg : Option<f64>,
+)
+    -> Option<(f64, f64)>
 {
-    let (h, v) = geometry.px_per_deg(geometry.eye(), out.uv_to_px(0.5, 0.5))
+    let accept_deg = accept_deg?;
+    let (h, v)     = geometry.px_per_deg(geometry.eye(), out.uv_to_px(0.5, 0.5))
         .unwrap_or((FALLBACK_PX_PER_DEG, FALLBACK_PX_PER_DEG));
 
-    (accept_deg * h / out.logical_w, accept_deg * v / out.logical_h)
+    Some((accept_deg * h / out.logical_w, accept_deg * v / out.logical_h))
 }
 
 // --- Outcome ---
+
+/// Which rule decided a target. Kept as one enum rather than a pile of booleans so
+/// the ceremony summary can count the four cases without any of them overlapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointOutcome {
+    /// The nearest-target vote carried it. The ordinary case.
+    Gate,
+    /// The device reported no gaze at all, so both eyes tracked for [`DWELL_S`]
+    /// carried it instead.
+    Dwell,
+    /// The operator pressed Enter.
+    Forced,
+    /// The operator pressed `s`. The only way a point is not added.
+    Skipped,
+}
+
+// --- PointOutcome ---
+
+impl PointOutcome {
+    /// Whether `cal_add_point` was sent for the target.
+    pub fn accepted(&self) -> bool {
+        !matches!(self, Self::Skipped)
+    }
+
+    /// The word used in the per-point table and the logs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Gate    => "added",
+            Self::Dwell   => "dwell",
+            Self::Forced  => "forced",
+            Self::Skipped => "SKIPPED",
+        }
+    }
+}
 
 /// What happened at one target.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointResult {
     /// Index into [`RetrainPlan::points`].
-    pub index    : usize,
-    /// Whether `cal_add_point` was sent for it.
-    pub accepted : bool,
+    pub index   : usize,
+    /// Which rule decided it.
+    pub outcome : PointOutcome,
     /// Window samples naming this target when the decision was taken.
-    pub hits     : usize,
+    pub hits    : usize,
     /// How long the target was shown, seconds.
-    pub wait_s   : f64,
-    /// True when the operator overrode the gate with Enter.
-    pub forced   : bool,
+    pub wait_s  : f64,
+    /// Gaze frames seen while the target was up.
+    pub frames  : usize,
+    /// How many of them carried a usable gaze point. A gate that starves does so here,
+    /// and it is the difference between "the user looked away" and "the device stopped
+    /// answering".
+    pub gaze    : usize,
+    /// How many of them had both eyes tracked.
+    pub eyes    : usize,
+}
+
+// --- PointResult ---
+
+impl PointResult {
+    /// Whether the target was fed to the device.
+    pub fn accepted(&self) -> bool {
+        self.outcome.accepted()
+    }
+}
+
+/// How one round went, for the ceremony summary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoundSummary {
+    /// Round name, matching [`Round::name`].
+    pub name       : &'static str,
+    /// The background it ran on.
+    pub background : Background,
+    /// Targets the vote carried.
+    pub gate       : usize,
+    /// Targets the dwell fallback carried.
+    pub dwell      : usize,
+    /// Targets the operator forced in.
+    pub forced     : usize,
+    /// Targets the operator skipped.
+    pub skipped    : usize,
+    /// Whether the round ended in a `cal_points_apply`.
+    pub applied    : bool,
+}
+
+// --- RoundSummary ---
+
+impl RoundSummary {
+    /// Targets fed to the device in this round, however they were decided.
+    pub fn accepted(&self) -> usize {
+        self.gate + self.dwell + self.forced
+    }
 }
 
 /// A completed retrain.
@@ -559,6 +857,12 @@ pub struct RetrainOutcome {
     pub result      : Option<CalibrationResult>,
     /// Every target, in ceremony order.
     pub results     : Vec<PointResult>,
+    /// Every round, in ceremony order.
+    pub rounds      : Vec<RoundSummary>,
+    /// The tracker's `(bus, address)` when the ceremony opened it, so a
+    /// re-enumeration during the ceremony is visible against the address the
+    /// persistence check reads back.
+    pub usb_before  : (u8, u8),
     /// Targets actually fed to the device.
     pub accepted    : usize,
     /// Rounds that ended in a `cal_points_apply`.
@@ -572,25 +876,32 @@ pub struct RetrainOutcome {
 
 /// Runs the whole ceremony and returns the committed blob.
 ///
-/// Declares the plane, opens one calibration session, walks the six rounds, and
-/// closes with `cal_stop` + `cal_retrieve`. `q` at any point aborts: the session is
-/// closed and the error propagates, so the caller writes nothing — an aborted retrain
-/// leaves the device holding whatever the applied rounds taught it, which is why the
-/// caller must not treat a partial ceremony as a success.
+/// Declares the plane, opens one calibration session in the order documented at the
+/// top of this module (`cal_start`, `cal_clear`, `cal_apply(seed)`), walks the six
+/// rounds, and closes with `cal_stop` + `cal_retrieve`.
+///
+/// Three ways this ends without a blob. `q` aborts; a ceremony that accepted fewer
+/// than `config.min_points` targets refuses to commit; and the tracker leaving the USB
+/// bus is reported as [`SweepError::TrackerLost`], because on this device that is a
+/// firmware reboot and a reboot resets the eye model to the factory blob. The first
+/// two close the session on the way out. In every case the caller writes nothing, and
+/// in none of them is the device as it was: it holds whatever the applied rounds
+/// taught it, or the factory model. That is why the caller must also run
+/// [`verify_persistence`] before it writes anything.
 pub fn run_retrain(
     device   : &mut Device,
     overlay  : &OverlayHandle,
     keys     : Option<&Receiver<SweepKey>>,
     config   : &RetrainConfig,
     plan     : &RetrainPlan,
+    seed     : Option<&Seed>,
 )
     -> Result<RetrainOutcome, SweepError>
 {
     let gate = Gate {
         window   : GATE_WINDOW,
         min_hits : GATE_MIN_HITS,
-        tol_u    : plan.tol_uv.0,
-        tol_v    : plan.tol_uv.1,
+        tol_uv   : plan.tol_uv,
         aspect   : aspect_of(plan),
     };
 
@@ -600,29 +911,46 @@ pub fn run_retrain(
           plan.area.tr_mm[0], plan.area.tr_mm[1], plan.area.tr_mm[2],
           plan.area.bl_mm[0], plan.area.bl_mm[1], plan.area.bl_mm[2]);
 
-    device.set_display_area_corners(plan.area).map_err(SweepError::Device)?;
+    let usb_before = device.usb_address();
+    info!("tracker on bus {}.{} at the start of the ceremony",
+          usb_before.0, usb_before.1);
+
+    device.set_display_area_corners(plan.area).map_err(device_error)?;
     std::thread::sleep(PLANE_SETTLE);
 
-    device.cal_begin().map_err(SweepError::Device)?;
+    device.cal_begin().map_err(device_error)?;
+
+    // Straight after the clear, before a single point is collected: the rounds are
+    // gated on the device's own gaze and a cleared model does not report one.
+    match seed {
+        Some(seed) => {
+            device.cal_seed(&seed.blob).map_err(device_error)?;
+            info!("seeded the session with {} ({} bytes, {} trailer points)",
+                  seed.path.display(), seed.blob.len(), seed.points);
+            std::thread::sleep(SEED_SETTLE);
+        }
+        None       => warn!("no seed blob: the rounds run on a cleared model, so the \
+                             device may report no gaze until the first apply"),
+    }
 
     let frames_rx = device.gaze_stream();
 
     let mut results     = Vec::new();
+    let mut summaries   = Vec::new();
     let mut suggestions = Vec::new();
-    let mut applied     = 0usize;
     let mut background  = None;
+    let mut pending     = 0usize;
 
     let total_rounds = plan.rounds.len();
 
     for (number, round) in plan.rounds.iter().enumerate() {
         let result = run_round(device, overlay, keys, config, plan, &gate, &frames_rx,
                                round, number + 1, total_rounds, &mut background,
-                               &mut results, &mut suggestions);
+                               &mut pending, &mut results, &mut suggestions);
 
         match result {
-            Ok(true)  => applied += 1,
-            Ok(false) => {}
-            Err(e)    => {
+            Ok(summary) => summaries.push(summary),
+            Err(e)      => {
                 // Close the session whatever went wrong: a device left in calibration
                 // mode streams as if nothing happened and quietly discards points.
                 if let Err(stop) = device.cal_stop() {
@@ -637,17 +965,34 @@ pub fn run_retrain(
         }
     }
 
-    let accepted = results.iter().filter(|r| r.accepted).count();
+    let accepted = results.iter().filter(|r| r.accepted()).count();
+    let applied  = summaries.iter().filter(|s| s.applied).count();
 
-    if accepted == 0 {
-        let _ = device.cal_stop();
+    log_summary(&summaries);
+
+    // A model fitted from a handful of points is not a worse model, it is a broken
+    // one, and committing it destroys the one it replaced.
+    let needed = config.min_points.max(1);
+
+    if accepted < needed {
+        if let Err(stop) = device.cal_stop() {
+            warn!("could not close the calibration session after the refusal: {stop}");
+        }
+
         set_overlay_background(None);
         let _ = overlay.set(OverlayState::default());
 
-        return Err(SweepError::NothingFitted);
+        return Err(SweepError::TooFewPoints { accepted: accepted, needed: needed });
     }
 
-    let blob = device.cal_end().map_err(SweepError::Device)?;
+    // `cal_end` fits nothing, so anything still unapplied would be collected and then
+    // thrown away. Only reachable with `apply_from_round` past the last round.
+    if pending > 0 {
+        device.cal_points_apply().map_err(device_error)?;
+        info!("final apply ({pending} points held past the last round)");
+    }
+
+    let blob = device.cal_end().map_err(device_error)?;
 
     set_overlay_background(None);
     let _ = overlay.set(OverlayState::default());
@@ -660,17 +1005,36 @@ pub fn run_retrain(
         result      : decode_trailer(&blob).map(|(_, table)| table),
         blob        : blob,
         results     : results,
+        rounds      : summaries,
+        usb_before  : usb_before,
         accepted    : accepted,
         applied     : applied,
         suggestions : suggestions,
     })
 }
 
-/// Runs one round. Returns whether it ended in a `cal_points_apply`.
+/// Logs the per-round tally. Runs before the commit decision, so a ceremony that
+/// refuses to commit still says what it saw.
+fn log_summary(summaries: &[RoundSummary]) {
+    for (number, summary) in summaries.iter().enumerate() {
+        info!("round {}/{} {} ({}): {} accepted ({} gate, {} dwell, {} forced), \
+               {} skipped, {}",
+              number + 1, summaries.len(), summary.name, summary.background.name(),
+              summary.accepted(), summary.gate, summary.dwell, summary.forced,
+              summary.skipped,
+              if summary.applied { "applied" } else { "not applied" });
+    }
+}
+
+/// Runs one round and reports how it went.
 ///
 /// The gate compares against every target of the round, including ones already added
 /// or skipped: a target that has had its turn still competes for "nearest", which can
 /// only make a later point harder to accept, never easier.
+///
+/// `pending` counts points added since the last apply and spans rounds, so deferring
+/// the first apply with `apply_from_round` holds the earlier points rather than
+/// losing them.
 #[allow(clippy::too_many_arguments)]
 fn run_round(
     device      : &mut Device,
@@ -684,10 +1048,11 @@ fn run_round(
     number      : usize,
     total       : usize,
     background  : &mut Option<Background>,
+    pending     : &mut usize,
     results     : &mut Vec<PointResult>,
     suggestions : &mut Vec<String>,
 )
-    -> Result<bool, SweepError>
+    -> Result<RoundSummary, SweepError>
 {
     // The pupil is still moving for seconds after a flip; a round collected during
     // that would be labelled with an illumination the eye had not reached.
@@ -711,7 +1076,15 @@ fn run_round(
         .map(|i| [plan.points[*i].u, plan.points[*i].v])
         .collect();
 
-    let mut added = 0usize;
+    let mut summary = RoundSummary {
+        name       : round.name,
+        background : round.background,
+        gate       : 0,
+        dwell      : 0,
+        forced     : 0,
+        skipped    : 0,
+        applied    : false,
+    };
 
     for (position, index) in round.points.iter().copied().enumerate() {
         let point = plan.points[index];
@@ -722,46 +1095,76 @@ fn run_round(
         show_target(overlay, point.px, &label)?;
 
         let result = run_point(overlay, keys, config, gate, frames_rx, &targets,
-                               position, index, point.px, &label)?;
+                               position, index, point.px, point.label, &label)?;
 
-        if result.accepted {
-            device.cal_add_point(point.u, point.v, 3).map_err(SweepError::Device)?;
-            added += 1;
+        match result.outcome {
+            PointOutcome::Gate    => summary.gate    += 1,
+            PointOutcome::Dwell   => summary.dwell   += 1,
+            PointOutcome::Forced  => summary.forced  += 1,
+            PointOutcome::Skipped => summary.skipped += 1,
+        }
 
-            info!("round {number} {}: added {} at uv ({:.3}, {:.3}) after {:.1}s \
-                   ({} hits{})",
-                  round.name, point.label, point.u, point.v, result.wait_s,
-                  result.hits, if result.forced { ", forced" } else { "" });
+        if result.accepted() {
+            device.cal_add_point(point.u, point.v, 3).map_err(device_error)?;
+            *pending += 1;
+
+            info!("round {number} {}: {} {} at uv ({:.3}, {:.3}) after {:.1}s \
+                   ({} hits, {}/{} frames with gaze)",
+                  round.name, result.outcome.label(), point.label, point.u, point.v,
+                  result.wait_s, result.hits, result.gaze, result.frames);
         }
         else {
             warn!("round {number} {}: skipped {} at uv ({:.3}, {:.3}) after {:.1}s \
-                   ({} hits of {} needed)",
+                   ({} hits of {} needed, {}/{} frames with gaze)",
                   round.name, point.label, point.u, point.v, result.wait_s,
-                  result.hits, gate.min_hits);
+                  result.hits, gate.min_hits, result.gaze, result.frames);
         }
 
         results.push(result);
     }
 
-    if added == 0 {
-        warn!("round {number} added no points; nothing to apply");
+    // Fold the collected points into the on-device model before the next round is
+    // collected. `apply_from_round` can hold the first fit back; the points wait in
+    // the device until then rather than being lost.
+    if *pending == 0 {
+        warn!("round {number} has nothing unapplied; skipping the apply");
 
-        return Ok(false);
+        return Ok(summary);
     }
 
-    // Fold this round into the on-device model before the next one is collected.
-    device.cal_points_apply().map_err(SweepError::Device)?;
-    info!("round {number}/{total} applied ({added} points)");
+    if number < config.apply_from_round {
+        info!("round {number}/{total} not applied (--apply-from-round {}); \
+               {} points held", config.apply_from_round, *pending);
+
+        return Ok(summary);
+    }
+
+    device.cal_points_apply().map_err(device_error)?;
+    info!("round {number}/{total} applied ({} points)", *pending);
+
+    *pending        = 0;
+    summary.applied = true;
 
     if config.suggest {
         suggestions.push(suggestion_line(device, number));
     }
 
-    Ok(true)
+    Ok(summary)
 }
 
-/// Shows one target until the gate accepts it, the operator forces or skips it, or
-/// the patience runs out.
+/// Shows one target until the gate accepts it, the dwell fallback carries it, or the
+/// operator forces or skips it. Nothing here times out.
+///
+/// The two things this does beyond running the gate are both about the failure mode
+/// the 2026-08-28 01:24 run hit, where the gate starved on a device that was reporting
+/// no gaze and every point was silently dropped after fifteen seconds. Frames are
+/// counted three ways (seen, carrying a gaze point, both eyes tracked) and the tally
+/// is printed once a second, and a target that has seen no gaze at all for
+/// `gaze_timeout_s` arms the dwell: both eyes tracked for [`DWELL_S`] of continuous
+/// frames adds it. Once armed the dwell stays armed, since a device that lost its
+/// answer for five seconds has not proved anything by finding it again.
+///
+/// `name` is the target's short name for the nag line; `label` is the overlay caption.
 #[allow(clippy::too_many_arguments)]
 fn run_point(
     overlay   : &OverlayHandle,
@@ -773,6 +1176,7 @@ fn run_point(
     position  : usize,
     index     : usize,
     px        : GlobalPx,
+    name      : &str,
     label     : &str,
 )
     -> Result<PointResult, SweepError>
@@ -780,24 +1184,26 @@ fn run_point(
     let start = Instant::now();
 
     // Anything queued from the previous target describes the previous target.
-    while frames_rx.try_recv().is_ok() {}
+    while next_frame(frames_rx)?.is_some() {}
 
     let mut times  : Vec<f64>      = Vec::new();
     let mut samples: Vec<[f64; 2]> = Vec::new();
-    let mut forced = false;
+    let mut tally                  = Tally::default();
+
+    let mut dwell_since : Option<f64> = None;
+    let mut dwell_armed = false;
+    let mut forced      = false;
+    let mut next_status = STATUS_S;
+    let mut next_nag    = config.point_timeout_s;
 
     loop {
+        let now = start.elapsed().as_secs_f64();
+
         if let Some(keys) = keys {
             match keys.try_recv() {
                 Ok(SweepKey::Quit)    => return Err(SweepError::Aborted),
                 Ok(SweepKey::Skip)    => {
-                    return Ok(PointResult {
-                        index    : index,
-                        accepted : false,
-                        hits     : 0,
-                        wait_s   : start.elapsed().as_secs_f64(),
-                        forced   : false,
-                    });
+                    return Ok(tally.result(index, PointOutcome::Skipped, 0, now));
                 }
                 // The operator can see the dot and the user; when the gate will not
                 // trip but the fixation is plainly good, Enter takes the point.
@@ -806,10 +1212,21 @@ fn run_point(
             }
         }
 
-        let now = start.elapsed().as_secs_f64();
+        // One pass over everything that arrived since the last tick, counting what the
+        // device did and did not report.
+        while let Some(frame) = next_frame(frames_rx)? {
+            tally.frames += 1;
 
-        while let Ok(frame) = frames_rx.try_recv() {
+            if frame.left_valid() && frame.right_valid() {
+                tally.eyes += 1;
+                dwell_since.get_or_insert(now);
+            }
+            else {
+                dwell_since = None;
+            }
+
             if let Some(uv) = valid_uv(&frame) {
+                tally.gaze += 1;
                 times.push(now);
                 samples.push(uv);
             }
@@ -825,32 +1242,91 @@ fn run_point(
 
         let verdict = gate_verdict(&samples, targets, position, gate);
 
-        if verdict.accepted || forced {
-            return Ok(PointResult {
-                index    : index,
-                accepted : true,
-                hits     : verdict.hits,
-                wait_s   : now,
-                forced   : forced,
-            });
+        if forced {
+            return Ok(tally.result(index, PointOutcome::Forced, verdict.hits, now));
         }
 
-        if now >= config.point_timeout_s {
-            return Ok(PointResult {
-                index    : index,
-                accepted : false,
-                hits     : verdict.hits,
-                wait_s   : now,
-                forced   : false,
-            });
+        if verdict.accepted {
+            return Ok(tally.result(index, PointOutcome::Gate, verdict.hits, now));
+        }
+
+        // The device has answered nothing for long enough that waiting on the gate is
+        // waiting on something that is not coming.
+        if !dwell_armed && tally.gaze == 0 && now >= config.gaze_timeout_s {
+            dwell_armed = true;
+
+            warn!("no gaze reported in {now:.1}s at this target ({}/{} frames had both \
+                   eyes): falling back to a {DWELL_S:.1}s dwell",
+                  tally.eyes, tally.frames);
+        }
+
+        if dwell_armed && dwell_since.is_some_and(|t| now - t >= DWELL_S) {
+            return Ok(tally.result(index, PointOutcome::Dwell, verdict.hits, now));
+        }
+
+        // A gate that starves and a user who is looking elsewhere are the same picture
+        // from outside; the three counts are what tells them apart.
+        if now >= next_status {
+            next_status = now + STATUS_S;
+
+            info!("hits {}/{}, gaze {}/{} frames, eyes ok {}/{}",
+                  verdict.hits, gate.min_hits, tally.gaze, tally.frames, tally.eyes,
+                  tally.frames);
+        }
+
+        // Never a skip: patience elapsing is a prompt to the operator, not a decision.
+        if now >= next_nag {
+            next_nag = now + config.point_timeout_s;
+
+            warn!("still waiting on {name}: Enter adds it now, s skips, q aborts");
         }
 
         // Keep the caption alive with the gate's own progress: a user who cannot tell
         // whether the tracker sees them has no way to fix their posture.
-        let live = format!("{label} [{}/{}]", verdict.hits, gate.min_hits);
+        let live = {
+            match dwell_armed {
+                true  => format!("{label} [no gaze — hold still, {}/{} eyes]",
+                                 tally.eyes, tally.frames),
+                false => format!("{label} [{}/{}]", verdict.hits, gate.min_hits),
+            }
+        };
+
         show_target(overlay, px, &live)?;
 
         std::thread::sleep(TICK);
+    }
+}
+
+/// Gaze frames seen at one target, split by what the device actually reported. The
+/// split is the diagnostic the 2026-08-28 01:24 run did not have: `frames` without
+/// `gaze` is a device that sees a face and will not say where it is looking.
+#[derive(Clone, Copy, Debug, Default)]
+struct Tally {
+    /// Frames seen at all.
+    frames : usize,
+    /// Of those, the ones carrying a usable gaze point (`valid_uv`). A clamped or
+    /// sentinel reading is not usable and does not count here.
+    gaze   : usize,
+    /// Of those, the ones with both eyes tracked.
+    eyes   : usize,
+}
+
+// --- Tally ---
+
+impl Tally {
+    /// Closes out a target with this tally behind it.
+    fn result(&self, index: usize, outcome: PointOutcome, hits: usize, wait_s: f64)
+        -> PointResult
+    {
+        PointResult {
+            index   : index,
+            outcome : outcome,
+            hits    : hits,
+            wait_s  : wait_s,
+            frames  : self.frames,
+            gaze    : self.gaze,
+            eyes    : self.eyes,
+        }
     }
 }
 
@@ -933,7 +1409,7 @@ pub fn run_health(
 
             show_target(overlay, px, &label)?;
 
-            while frames_rx.try_recv().is_ok() {}
+            while next_frame(&frames_rx)?.is_some() {}
 
             let (mut us, mut vs) = (Vec::new(), Vec::new());
             let start = Instant::now();
@@ -949,7 +1425,7 @@ pub fn run_health(
 
                 let t = start.elapsed().as_secs_f64();
 
-                while let Ok(frame) = frames_rx.try_recv() {
+                while let Some(frame) = next_frame(&frames_rx)? {
                     if let Some(uv) = valid_uv(&frame)
                         && t >= HEALTH_DWELL_S - HEALTH_MEDIAN_S
                     {
@@ -1004,6 +1480,91 @@ pub fn health_summary(stops: &[HealthStop]) -> Option<(f64, f64)> {
     Some((rms, median(&mut errors)))
 }
 
+// --- Persistence check ---
+
+/// What the post-ceremony reconnect saw.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Persistence {
+    /// The tracker's `(bus, address)` when the ceremony opened it.
+    pub before        : (u8, u8),
+    /// Its `(bus, address)` after the reconnect. A different pair is a
+    /// re-enumeration: the firmware rebooted at some point in between.
+    pub after         : (u8, u8),
+    /// Body SHA-256 of the blob the reopened device handed back. Equal to the
+    /// committed one, or this is an error rather than a value.
+    pub body_sha256   : String,
+    /// Length of the retrieved blob, bytes.
+    pub retrieved_len : usize,
+}
+
+// --- Persistence ---
+
+impl Persistence {
+    /// Whether the tracker came back on a different bus address than it left on.
+    pub fn re_enumerated(&self) -> bool {
+        self.before != self.after
+    }
+}
+
+/// Closes nothing and opens the tracker again, then checks it still holds the model
+/// the ceremony just committed.
+///
+/// The caller must have dropped its own [`Device`] first; the interface is claimed
+/// exclusively, so a second open fails while the first is alive.
+///
+/// This exists because of the 2026-08-28 01:24 run: the tracker re-enumerated on the
+/// bus at 01:24:55 as the ceremony finished, and an ET5 reboot resets the eye model to
+/// the 1478-byte factory blob. The run wrote a calibration file describing a model the
+/// device no longer had. A blob that has not survived a close and a reopen is not
+/// committed, whatever `cal_retrieve` said while the session was still warm, so
+/// nothing is written until this passes.
+pub fn verify_persistence(committed: &[u8], before: (u8, u8))
+    -> Result<Persistence, SweepError>
+{
+    // Long enough that a reboot in progress fails the open rather than racing it.
+    std::thread::sleep(RECONNECT_SETTLE);
+
+    let mut device = Device::connect().map_err(device_error)?;
+    let after      = device.usb_address();
+    let retrieved  = device.cal_retrieve().map_err(device_error);
+
+    device.close();
+    drop(device);
+
+    let retrieved = retrieved?;
+
+    // Worth saying out loud even when the model survived: it means the firmware
+    // rebooted at some point and the next one may not be so lucky.
+    if after != before {
+        warn!("the tracker re-enumerated during the ceremony: bus {}.{} -> bus {}.{}. \
+               The firmware rebooted, which resets the on-device eye model.",
+              before.0, before.1, after.0, after.1);
+    }
+
+    let want = body_sha256_hex(committed);
+    let got  = body_sha256_hex(&retrieved);
+
+    if want != got {
+        return Err(SweepError::ModelNotKept {
+            committed_sha256 : want,
+            actual_sha256    : got,
+            committed_len    : body(committed).len(),
+            actual_len       : body(&retrieved).len(),
+        });
+    }
+
+    info!("the tracker still holds the committed model after a reconnect \
+           ({} bytes, body {}); bus {}.{} -> bus {}.{}",
+          retrieved.len(), &got[..16], before.0, before.1, after.0, after.1);
+
+    Ok(Persistence {
+        before        : before,
+        after         : after,
+        body_sha256   : got,
+        retrieved_len : retrieved.len(),
+    })
+}
+
 // --- Files ---
 
 /// Moves `path` aside as `<path>.prev-<unix>` before it is overwritten, returning
@@ -1046,6 +1607,34 @@ fn aspect_of(plan: &RetrainPlan) -> f64 {
     if h <= 0.0 { 1.0 } else { tl.distance(tr) / h }
 }
 
+/// Turns a device error into the ceremony's, separating out the one failure that is
+/// not the ceremony's fault.
+///
+/// A transport error means the tracker left the bus. On this device that is a firmware
+/// reboot, and a reboot resets the eye model to the factory blob, so everything the
+/// ceremony has done up to that point is gone: it must abort and write nothing rather
+/// than retry into a device that is no longer the one it was talking to.
+fn device_error(e: DeviceError) -> SweepError {
+    match e {
+        DeviceError::Transport(e) => SweepError::TrackerLost(e.to_string()),
+        e                         => SweepError::Device(e),
+    }
+}
+
+/// Pulls one gaze frame if there is one.
+///
+/// `Err` only when the reader thread has dropped its sender, which it does when the
+/// USB transport fails under it. That is the same reboot [`device_error`] names, seen
+/// from the stream side instead of from a request.
+fn next_frame(frames_rx: &Receiver<Et5Frame>) -> Result<Option<Et5Frame>, SweepError> {
+    match frames_rx.try_recv() {
+        Ok(frame)                       => Ok(Some(frame)),
+        Err(TryRecvError::Empty)        => Ok(None),
+        Err(TryRecvError::Disconnected) => Err(SweepError::TrackerLost(
+            "the gaze stream ended: the reader thread lost the USB transport".into())),
+    }
+}
+
 /// The firmware's combined 2D gaze as panel uv, when it is a real reading.
 ///
 /// The device reports (-1, -1) for "no combined gaze" and clamps to the plane bounds
@@ -1065,7 +1654,7 @@ fn wait(duration_s: f64, frames_rx: &Receiver<Et5Frame>, keys: Option<&Receiver<
     let start = Instant::now();
 
     while start.elapsed().as_secs_f64() < duration_s {
-        while frames_rx.try_recv().is_ok() {}
+        while next_frame(frames_rx)?.is_some() {}
 
         if let Some(keys) = keys {
             match keys.try_recv() {
@@ -1099,15 +1688,20 @@ mod tests {
         RetrainConfig { tracker_pitch_deg: 13.0, ..RetrainConfig::default() }
     }
 
-    /// A gate with generous tolerances, for the tests that are about hit counting.
-    fn loose_gate() -> Gate {
+    /// The shipped gate: Talon's vote and no ellipse at all.
+    fn talon_gate() -> Gate {
         Gate {
             window   : 120,
             min_hits : 60,
-            tol_u    : 0.05,
-            tol_v    : 0.05,
+            tol_uv   : None,
             aspect   : 1.0,
         }
+    }
+
+    /// The opt-in gate with a generous radius, for the tests that are about the
+    /// ellipse rather than the vote.
+    fn loose_gate() -> Gate {
+        Gate { tol_uv: Some((0.05, 0.05)), ..talon_gate() }
     }
 
     #[test]
@@ -1275,20 +1869,108 @@ mod tests {
     #[test]
     fn a_degenerate_tolerance_accepts_nothing() {
         let targets = [[0.2, 0.2]];
-        let gate    = Gate { tol_u: 0.0, ..loose_gate() };
+        let gate    = Gate { tol_uv: Some((0.0, 0.05)), ..loose_gate() };
 
         assert!(!gate_verdict(&[[0.2, 0.2]; 120], &targets, 0, &gate).accepted);
     }
 
     #[test]
-    fn the_acceptance_radius_is_a_real_angle() {
+    fn a_one_target_round_accepts_on_frames_alone() {
+        // Round 1 is the centre point on a device that has just been cleared: with one
+        // target every frame names it, wherever it landed, so the vote is Talon's
+        // "did the user look at the screen for two thirds of a second". This is the
+        // case the 2026-08-28 01:24 gate could not pass on sixteen of eighteen points.
+        let targets = [[0.5, 0.5]];
+        let samples: Vec<[f64; 2]> = (0..60)
+            .map(|i| [0.05 + i as f64 * 0.01, 0.9 - i as f64 * 0.01])
+            .collect();
+
+        let verdict = gate_verdict(&samples, &targets, 0, &talon_gate());
+
+        assert_eq!(verdict.hits, 60);
+        assert!(verdict.accepted, "{verdict:?}");
+
+        // One frame short is still one frame short.
+        assert!(!gate_verdict(&samples[..59], &targets, 0, &talon_gate()).accepted);
+    }
+
+    #[test]
+    fn without_a_tolerance_a_distant_vote_is_accepted() {
+        // The same samples the median test rejects under a radius: with no ellipse the
+        // nearest-target vote carries them, which is the point of the default gate.
+        // A tenth of the panel is far more than ten degrees of visual angle here.
+        let targets = [[0.2, 0.2], [0.8, 0.8]];
+        let samples = vec![[0.35, 0.35]; 120];
+
+        assert!(!gate_verdict(&samples, &targets, 0, &loose_gate()).accepted);
+
+        let verdict = gate_verdict(&samples, &targets, 0, &talon_gate());
+
+        assert!(verdict.accepted);
+        assert_eq!(verdict.median, Some([0.35, 0.35]));
+    }
+
+    #[test]
+    fn the_gate_has_no_radius_unless_one_is_asked_for() {
         let geometry = desk();
-        let plan     = plan(&geometry, &config()).expect("plan");
+
+        assert_eq!(plan(&geometry, &config()).expect("plan").tol_uv, None);
+
+        let plan = plan(&geometry, &RetrainConfig {
+            accept_deg : Some(3.0),
+            ..config()
+        }).expect("plan");
 
         // Three degrees on a 3840 px wide, 880 mm panel at ~690 mm: a few percent of
         // the panel, not a pixel and not half a screen.
-        assert!(plan.tol_uv.0 > 0.01 && plan.tol_uv.0 < 0.15, "{:?}", plan.tol_uv);
-        assert!(plan.tol_uv.1 > 0.02 && plan.tol_uv.1 < 0.40, "{:?}", plan.tol_uv);
+        let (tol_u, tol_v) = plan.tol_uv.expect("a radius was asked for");
+
+        assert!(tol_u > 0.01 && tol_u < 0.15, "{tol_u}");
+        assert!(tol_v > 0.02 && tol_v < 0.40, "{tol_v}");
+    }
+
+    #[test]
+    fn the_seed_defaults_to_the_blob_it_is_about_to_overwrite() {
+        let dir = std::env::temp_dir().join("gaze-et5-retrain-seed-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let blob    = dir.join("calibration-et5.bin");
+        let trained = std::fs::read("tests/fixtures/blob-tail-committed.bin")
+            .expect("a real blob tail with a result trailer");
+
+        // Nothing to seed from is a reason, not a failure.
+        std::fs::remove_file(&blob).ok();
+        let choice = resolve_seed(None, &blob, false).expect("resolve");
+        assert!(choice.seed.is_none());
+        assert!(choice.why.contains("does not exist"), "{}", choice.why);
+
+        // A file with no result trailer is not one of this device's models.
+        std::fs::write(&blob, vec![0x5au8; 4096]).expect("write");
+        let choice = resolve_seed(None, &blob, false).expect("resolve");
+        assert!(choice.seed.is_none());
+        assert!(choice.why.contains("no result trailer"), "{}", choice.why);
+
+        // The ordinary case: the backup this run is about to replace.
+        std::fs::write(&blob, &trained).expect("write");
+        let seed = resolve_seed(None, &blob, false).expect("resolve")
+            .seed.expect("the trained blob seeds");
+        assert_eq!(seed.blob, trained);
+        assert!(seed.points > 0);
+
+        // --no-seed wins over anything on disk.
+        let choice = resolve_seed(None, &blob, true).expect("resolve");
+        assert!(choice.seed.is_none());
+        assert!(choice.why.contains("--no-seed"), "{}", choice.why);
+
+        // An explicit file that cannot be used is an error, never a silent skip.
+        let missing = dir.join("nope.bin");
+        assert!(resolve_seed(Some(&missing), &blob, false).is_err());
+
+        let untrained = dir.join("untrained.bin");
+        std::fs::write(&untrained, vec![0x5au8; 4096]).expect("write");
+        assert!(resolve_seed(Some(&untrained), &blob, false).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

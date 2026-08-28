@@ -30,9 +30,11 @@
 //!
 //! The calibration ops are realm guarded; each entry point re-runs the unlock, which
 //! the device accepts repeatedly. `cal_begin` opens a session (without it the device
-//! acks and silently discards every added point), `cal_add_point` collects raw samples
-//! at a fixation target, `cal_finish` fits and commits the on-device eye model and
-//! returns the opaque blob for backup.
+//! acks and silently discards every added point), `cal_seed` uploads the host's
+//! existing blob into the fresh session so the points that follow are collected
+//! through a working model, `cal_add_point` collects raw samples at a fixation target,
+//! `cal_finish` fits and commits the on-device eye model and returns the opaque blob
+//! for backup.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -260,6 +262,13 @@ impl Device {
         Ok(())
     }
 
+    /// The tracker's `(bus number, device address)`. See
+    /// [`Transport::usb_address`]: a change across a reconnect is a re-enumeration,
+    /// which means the firmware rebooted and dropped its eye model.
+    pub fn usb_address(&self) -> (u8, u8) {
+        self.transport.usb_address()
+    }
+
     /// Opens a calibration session: realm unlock, cal_start, then cal_clear to drop
     /// stale points. Eye detection activates in this mode even on an unprovisioned
     /// device.
@@ -271,6 +280,21 @@ impl Device {
         if let Err(e) = self.request(ttp::cal_clear, REQUEST_TIMEOUT) {
             debug!("cal_clear rejected (harmless with no prior points): {e}");
         }
+
+        Ok(())
+    }
+
+    /// Uploads a blob into an already-open calibration session, straight after
+    /// `cal_begin`, so the points that follow are collected through a working eye
+    /// model instead of a cleared one.
+    ///
+    /// This is nottobii's captured Windows order (start, clear, upload, rounds), and
+    /// the retrain ceremony gates every point on the device's own reported gaze, which
+    /// a cleared model does not produce. Unlike [`Device::cal_apply`] this opens and
+    /// closes no realm: `cal_begin` has already unlocked, and closing the realm here
+    /// would drop the privilege the rest of the session's ops run under.
+    pub fn cal_seed(&mut self, blob: &[u8]) -> Result<(), DeviceError> {
+        self.request(|seq| ttp::cal_apply(seq, blob), CAL_BLOB_TIMEOUT)?;
 
         Ok(())
     }

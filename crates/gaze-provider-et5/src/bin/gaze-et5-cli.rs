@@ -30,7 +30,7 @@ use gaze_provider_et5::gaze::combined_ray;
 use gaze_provider_et5::provider::Et5Provider;
 use gaze_provider_et5::record::{self, RecordConfig};
 use gaze_provider_et5::retrain::{self, RetrainConfig};
-use gaze_provider_et5::sweep::{self, SweepConfig};
+use gaze_provider_et5::sweep::{self, SweepConfig, SweepError};
 use gaze_provider_et5::ttp::{DisplayArea, DisplayRect};
 use gaze_provider_synthetic::GazeProvider;
 use gaze_snap::FilterStack;
@@ -159,9 +159,11 @@ enum Command {
 
     /// Retrain the on-device eye model: six gaze-gated rounds (centre, mid-edges,
     /// corners) on black and then white over a 600x340 mm training area, with
-    /// `cal_points_apply` after each round, followed by a 3x3 health check. Writes
-    /// the device's model and is meant to be run once per mount. Keys: Enter forces
-    /// the current point in, `s` skips it, `q` aborts without committing.
+    /// `cal_points_apply` after each round, followed by a 3x3 health check. The
+    /// session is seeded with the blob it is about to replace, so the rounds are
+    /// collected through a working model. Writes the device's model and is meant to
+    /// be run once per mount. Keys: Enter forces the current point in, `s` skips it,
+    /// `q` aborts without committing.
     Calibrate {
         /// Where the client-side calibration is written.
         #[arg(long, default_value = DEFAULT_CALIBRATION_PATH)]
@@ -170,6 +172,16 @@ enum Command {
         /// Where the fresh on-device blob backup is written.
         #[arg(long, default_value = DEFAULT_BLOB_PATH)]
         blob : PathBuf,
+
+        /// Blob uploaded into the fresh session after cal_clear, so the acceptance
+        /// gate has a working model to read gaze from. Defaults to `--blob` when it
+        /// exists and decodes with a result trailer.
+        #[arg(long)]
+        seed : Option<PathBuf>,
+
+        /// Collect the rounds on a cleared model, with no seed upload at all.
+        #[arg(long, conflicts_with = "seed")]
+        no_seed : bool,
 
         /// Connector the tracker is physically mounted on, whose plane is declared.
         #[arg(long, default_value = "DP-1")]
@@ -183,21 +195,42 @@ enum Command {
         #[arg(long, conflicts_with = "area")]
         area_full : bool,
 
-        /// Acceptance radius, degrees of visual angle.
-        #[arg(long, default_value_t = retrain::ACCEPT_DEG)]
-        accept_deg : f64,
+        /// Additionally require the median reported gaze to sit within this many
+        /// degrees of the target. Off by default: during a retrain the model
+        /// reporting the gaze is the one being replaced, so absolute accuracy is not
+        /// a thing to gate on. 3 is the value the 2026-08-28 01:24 run used.
+        #[arg(long)]
+        accept_deg : Option<f64>,
 
-        /// How long one point is offered before it is skipped, seconds.
+        /// How long a point waits before it says so, seconds. Not a timeout: nothing
+        /// is ever skipped without `s`.
         #[arg(long, default_value_t = retrain::POINT_TIMEOUT_S)]
         point_timeout_s : f64,
+
+        /// How long a point waits for the device to report any gaze at all before
+        /// falling back to a dwell (both eyes tracked for 1.5 s), seconds.
+        #[arg(long, default_value_t = retrain::GAZE_TIMEOUT_S)]
+        gaze_timeout_s : f64,
+
+        /// First round that ends in a cal_points_apply. 1 applies after every round,
+        /// as Talon does. Raise it to 2 to test the hypothesis that a one-point apply
+        /// is what leaves the device reporting no live gaze: rounds before it hold
+        /// their points until the first apply instead of losing them.
+        #[arg(long, default_value_t = 1)]
+        apply_from_round : usize,
+
+        /// Accepted points below which the ceremony commits nothing and keeps the
+        /// previous blob and calibration.
+        #[arg(long, default_value_t = retrain::MIN_POINTS)]
+        min_points : usize,
 
         /// After each round, ask the device what point it would like next and log
         /// the raw reply. Exploratory; nothing depends on it.
         #[arg(long)]
         suggest : bool,
 
-        /// Print the plane, the training area, the points and the round schedule,
-        /// then exit. Touches neither the device nor the compositor.
+        /// Print the plane, the training area, the points, the seed decision and the
+        /// round schedule, then exit. Touches neither the device nor the compositor.
         #[arg(long)]
         dry_run : bool,
     },
@@ -373,15 +406,35 @@ fn main() -> Result<()> {
         Command::Calibrate {
             out,
             blob,
+            seed,
+            no_seed,
             device_output,
             area,
             area_full,
             accept_deg,
             point_timeout_s,
+            gaze_timeout_s,
+            apply_from_round,
+            min_points,
             suggest,
             dry_run,
-        } => calibrate(&cli.config, &out, &blob, device_output, &area, area_full,
-                       accept_deg, point_timeout_s, suggest, dry_run),
+        } => calibrate(CalibrateArgs {
+            config           : cli.config.clone(),
+            out              : out,
+            blob             : blob,
+            seed             : seed,
+            no_seed          : no_seed,
+            device_output    : device_output,
+            area             : area,
+            area_full        : area_full,
+            accept_deg       : accept_deg,
+            point_timeout_s  : point_timeout_s,
+            gaze_timeout_s   : gaze_timeout_s,
+            apply_from_round : apply_from_round,
+            min_points       : min_points,
+            suggest          : suggest,
+            dry_run          : dry_run,
+        }),
         Command::Refit { readings, out }    => refit_cmd(&cli.config, &readings, &out),
         Command::Collect { minutes, calibration, blob, history } => {
             collect_cmd(&cli.config, minutes, &calibration, &blob, &history)
@@ -914,41 +967,71 @@ fn blob_push(file: &std::path::Path, double: bool, calibration: &std::path::Path
     Ok(())
 }
 
+/// Everything one `calibrate` invocation needs. A struct rather than fourteen
+/// positional arguments, which is where a wrong flag hides.
+struct CalibrateArgs {
+    /// Desk geometry file.
+    config           : PathBuf,
+    /// Where the client-side calibration is written.
+    out              : PathBuf,
+    /// Where the fresh on-device blob backup is written.
+    blob             : PathBuf,
+    /// Explicit seed blob, if the operator named one.
+    seed             : Option<PathBuf>,
+    /// Run with no seed at all.
+    no_seed          : bool,
+    /// Connector the tracker is mounted on.
+    device_output    : String,
+    /// Training area as `WxH` millimetres.
+    area             : String,
+    /// Train over the whole panel.
+    area_full        : bool,
+    /// Optional acceptance radius, degrees.
+    accept_deg       : Option<f64>,
+    /// Nag interval, seconds.
+    point_timeout_s  : f64,
+    /// Patience for the first gaze point, seconds.
+    gaze_timeout_s   : f64,
+    /// First round that applies.
+    apply_from_round : usize,
+    /// Accepted points below which nothing is written.
+    min_points       : usize,
+    /// Query the point suggestion after each round.
+    suggest          : bool,
+    /// Print the plan and exit.
+    dry_run          : bool,
+}
+
 /// Runs the retrain ceremony, or prints its schedule under `--dry-run`.
-#[allow(clippy::too_many_arguments)]
-fn calibrate(
-    config          : &std::path::Path,
-    out             : &std::path::Path,
-    blob_path       : &std::path::Path,
-    device_output   : String,
-    area            : &str,
-    area_full       : bool,
-    accept_deg      : f64,
-    point_timeout_s : f64,
-    suggest         : bool,
-    dry_run         : bool,
-)
-    -> Result<()>
-{
+fn calibrate(args: CalibrateArgs) -> Result<()> {
+    let CalibrateArgs { config, out, blob: blob_path, .. } = &args;
+
     let geometry = load_geometry(config)?;
-    let (w_mm, h_mm) = parse_area(area)?;
+    let (w_mm, h_mm) = parse_area(&args.area)?;
 
     let retrain_config = RetrainConfig {
-        display           : device_output,
+        display           : args.device_output.clone(),
         tracker_pitch_deg : load_tracker_pitch(config),
         area_w_mm         : w_mm,
         area_h_mm         : h_mm,
-        area_full         : area_full,
-        accept_deg        : accept_deg,
-        point_timeout_s   : point_timeout_s,
-        suggest           : suggest,
+        area_full         : args.area_full,
+        accept_deg        : args.accept_deg,
+        point_timeout_s   : args.point_timeout_s,
+        gaze_timeout_s    : args.gaze_timeout_s,
+        apply_from_round  : args.apply_from_round,
+        min_points        : args.min_points,
+        suggest           : args.suggest,
     };
 
     let plan = retrain::plan(&geometry, &retrain_config)?;
 
-    print_plan(&retrain_config, &plan);
+    // Resolved before the device is opened, so a bad --seed costs nothing and the dry
+    // run can report the same decision the real run would take.
+    let seed = retrain::resolve_seed(args.seed.as_deref(), blob_path, args.no_seed)?;
 
-    if dry_run {
+    print_plan(&retrain_config, &plan, &seed);
+
+    if args.dry_run {
         println!("dry run: no device touched, nothing written");
 
         return Ok(());
@@ -977,7 +1060,7 @@ fn calibrate(
               point in, s skips it, q aborts (nothing is written).");
 
     let outcome = retrain::run_retrain(&mut device, &overlay, Some(&keys),
-                                       &retrain_config, &plan);
+                                       &retrain_config, &plan, seed.seed.as_ref());
 
     let outcome = {
         match outcome {
@@ -985,6 +1068,28 @@ fn calibrate(
             Err(e)      => {
                 overlay.stop();
                 let _ = join.join();
+
+                // The refusal and the reboot are the design working, not a crash: say
+                // what is still on disk, because "nothing was written" is the point.
+                match e {
+                    SweepError::TooFewPoints { .. } => {
+                        eprintln!("{e}. {} and {} are untouched; the device holds \
+                                   whatever the applied rounds taught it, so re-run \
+                                   the ceremony (or push the old blob back with \
+                                   `blob-push {}`).",
+                                  blob_path.display(), out.display(),
+                                  blob_path.display());
+                    }
+                    SweepError::TrackerLost(_)      => {
+                        eprintln!("{e}. The model this ceremony was building is lost \
+                                   and the device is back on its factory blob; run \
+                                   the ceremony again. Nothing was written, so {} is \
+                                   still the previous model and the next connect \
+                                   pushes it back to the device.",
+                                  blob_path.display());
+                    }
+                    _                               => {}
+                }
 
                 return Err(e.into());
             }
@@ -997,33 +1102,32 @@ fn calibrate(
     for result in &outcome.results {
         let point = &plan.points[result.index];
 
-        println!("  {:<14} uv ({:.3}, {:.3}) {} after {:.1}s ({} hits{})",
-                 point.label, point.u, point.v,
-                 if result.accepted { "added  " } else { "SKIPPED" },
-                 result.wait_s, result.hits,
-                 if result.forced { ", forced" } else { "" });
+        println!("  {:<14} uv ({:.3}, {:.3}) {:<7} after {:.1}s ({} hits, gaze \
+                  {}/{} frames, eyes ok {}/{})",
+                 point.label, point.u, point.v, result.outcome.label(),
+                 result.wait_s, result.hits, result.gaze, result.frames, result.eyes,
+                 result.frames);
+    }
+
+    println!("ceremony summary:");
+
+    for (number, round) in outcome.rounds.iter().enumerate() {
+        println!("  round {}/{} {:<9} ({:<5}) {} accepted ({} gate, {} dwell, {} \
+                  forced), {} skipped, {}",
+                 number + 1, outcome.rounds.len(), round.name, round.background.name(),
+                 round.accepted(), round.gate, round.dwell, round.forced,
+                 round.skipped,
+                 if round.applied { "applied" } else { "not applied" });
     }
 
     for line in &outcome.suggestions {
         println!("  point suggestion {line}");
     }
 
-    // The blob first: it is the only artefact that cannot be recreated without the
-    // user sitting down again.
-    let lag_s = Et5Calibration::load(out).map(|c| c.lag_s).unwrap_or(retrain::DEFAULT_LAG_S);
-
-    if let Some(kept) = retrain::keep_previous(blob_path)? {
-        println!("previous blob kept at {}", kept.display());
-    }
-
-    std::fs::write(blob_path, &outcome.blob)
-        .with_context(|| format!("writing {}", blob_path.display()))?;
-
     let report = BlobReport::of(&outcome.blob);
-    println!("device blob backed up to {} ({report})", blob_path.display());
 
     // The health check reads the model that was just committed. A failure here loses
-    // numbers, not the retrain, so it never stops the file being written.
+    // numbers, not the retrain, so it never stops the files being written.
     println!("health check: nine stops, a second each, eyes on the dot");
 
     let health = {
@@ -1054,6 +1158,53 @@ fn calibrate(
                                       {} stops", health.len()),
         None             => println!("health: no stops measured"),
     }
+
+    // Nothing is written until the tracker has been closed, reopened, and asked for
+    // its model again. The 2026-08-28 01:24 run re-enumerated as it finished and was
+    // holding the factory blob afterwards, so the files it wrote described a model
+    // that no longer existed.
+    device.close();
+    drop(device);
+
+    println!("persistence check: reopening the tracker and reading its model back");
+
+    let persistence = {
+        match retrain::verify_persistence(&outcome.blob, outcome.usb_before) {
+            Ok(persistence) => persistence,
+            Err(e)          => {
+                eprintln!("{e}. Nothing was written: {} and {} still describe the \
+                           previous model, which the next connect pushes back to the \
+                           device. Re-run the ceremony.",
+                          blob_path.display(), out.display());
+
+                return Err(e.into());
+            }
+        }
+    };
+
+    println!("usb: bus {}.{} before, bus {}.{} after{}",
+             persistence.before.0, persistence.before.1,
+             persistence.after.0, persistence.after.1,
+             if persistence.re_enumerated() {
+                 " — RE-ENUMERATED, the firmware rebooted during the ceremony"
+             }
+             else {
+                 ""
+             });
+    println!("the tracker still holds the committed model ({} bytes)",
+             persistence.retrieved_len);
+
+    // The blob first: it is the only artefact that cannot be recreated without the
+    // user sitting down again.
+    let lag_s = Et5Calibration::load(out).map(|c| c.lag_s).unwrap_or(retrain::DEFAULT_LAG_S);
+
+    if let Some(kept) = retrain::keep_previous(blob_path)? {
+        println!("previous blob kept at {}", kept.display());
+    }
+
+    std::fs::write(blob_path, &outcome.blob)
+        .with_context(|| format!("writing {}", blob_path.display()))?;
+    println!("device blob backed up to {} ({report})", blob_path.display());
 
     let out_geometry = geometry.outputs.iter()
         .find(|o| o.name == retrain_config.display)
@@ -1101,8 +1252,13 @@ fn calibrate(
     Ok(())
 }
 
-/// Prints the plane, the training area, every point and the round schedule.
-fn print_plan(config: &RetrainConfig, plan: &retrain::RetrainPlan) {
+/// Prints the plane, the training area, the seed decision, every point and the round
+/// schedule.
+fn print_plan(
+    config : &RetrainConfig,
+    plan   : &retrain::RetrainPlan,
+    seed   : &retrain::SeedChoice,
+) {
     let (u_lo, u_hi, v_lo, v_hi) = plan.train_uv;
 
     println!("display {} — plane declared to the device (sensor frame, {}{:.1} deg \
@@ -1127,10 +1283,30 @@ fn print_plan(config: &RetrainConfig, plan: &retrain::RetrainPlan) {
                  config.area_w_mm, config.area_h_mm);
     }
 
-    println!("acceptance: {:.1} deg (uv {:.4} x {:.4}), {} of the last {} frames, \
-              {:.0}s per point",
-             config.accept_deg, plan.tol_uv.0, plan.tol_uv.1, retrain::GATE_MIN_HITS,
-             retrain::GATE_WINDOW, config.point_timeout_s);
+    println!("session order: cal_start, cal_clear, {}, rounds, cal_stop + cal_retrieve",
+             if seed.seed.is_some() { "cal_apply(seed)" } else { "no seed" });
+    println!("seed: {}", seed.why);
+
+    match plan.tol_uv {
+        None               => {
+            println!("acceptance: nearest-target vote only ({} of the last {} frames \
+                      within {:.0}s), no accuracy radius",
+                     retrain::GATE_MIN_HITS, retrain::GATE_WINDOW,
+                     retrain::GATE_WINDOW_S);
+        }
+        Some((tol_u, tol_v)) => {
+            println!("acceptance: {} of the last {} frames within {:.0}s, and the \
+                      median within {:.1} deg (uv {tol_u:.4} x {tol_v:.4})",
+                     retrain::GATE_MIN_HITS, retrain::GATE_WINDOW,
+                     retrain::GATE_WINDOW_S, config.accept_deg.unwrap_or_default());
+        }
+    }
+
+    println!("patience: nag every {:.0}s (nothing is skipped without `s`), dwell \
+              fallback after {:.0}s with no gaze at all",
+             config.point_timeout_s, config.gaze_timeout_s);
+    println!("commit: at least {} accepted points, else nothing is written",
+             config.min_points.max(1));
 
     for (i, point) in plan.points.iter().enumerate() {
         println!("  point {i}: {:<14} uv ({:.3}, {:.3}) px ({:>6.0}, {:>6.0})",
@@ -1143,8 +1319,14 @@ fn print_plan(config: &RetrainConfig, plan: &retrain::RetrainPlan) {
             .collect::<Vec<_>>()
             .join(", ");
 
-        println!("  round {}/{}: {} on {} — {names}, then cal_points_apply",
-                 i + 1, plan.rounds.len(), round.name, round.background.name());
+        println!("  round {}/{}: {} on {} — {names}{}",
+                 i + 1, plan.rounds.len(), round.name, round.background.name(),
+                 if i + 1 >= config.apply_from_round {
+                     ", then cal_points_apply"
+                 }
+                 else {
+                     ", points held (--apply-from-round)"
+                 });
     }
 }
 

@@ -92,6 +92,19 @@ impl Transport {
         Ok(Self { handle: handle })
     }
 
+    /// The tracker's position on the bus, `(bus number, device address)`.
+    ///
+    /// libusb hands out a new address every time a device enumerates, so this pair
+    /// changing across a reconnect is proof the firmware rebooted rather than the host
+    /// merely reopening the handle. That distinction matters because an ET5 reboot
+    /// resets the on-device eye model to the factory blob, silently discarding a
+    /// retrain that had just finished.
+    pub fn usb_address(&self) -> (u8, u8) {
+        let device = self.handle.device();
+
+        (device.bus_number(), device.address())
+    }
+
     /// Sends one already-enveloped frame, splitting it across transfers when it exceeds
     /// the device's 8 KB transfer size.
     ///

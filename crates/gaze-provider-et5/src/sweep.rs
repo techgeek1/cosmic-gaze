@@ -2708,6 +2708,33 @@ pub enum SweepError {
     Pose(String, #[source] crate::pose::PoseError),
     #[error("no display produced a usable fit")]
     NothingFitted,
+    #[error("the retrain accepted only {accepted} of the points it needed ({needed}); \
+             nothing was written")]
+    TooFewPoints {
+        /// Targets that were fed to the device.
+        accepted : usize,
+        /// The floor the ceremony refused below.
+        needed   : usize,
+    },
+    #[error("calibration seed: {0}")]
+    Seed(String),
+    #[error("the tracker dropped off the bus mid-ceremony ({0}); on this device that \
+             is a firmware reboot, which resets the eye model to the factory blob")]
+    TrackerLost(String),
+    #[error("the tracker did not keep the model across a reconnect: committed a \
+             {committed_len} byte body (sha256 {committed_sha256}), read back a \
+             {actual_len} byte body (sha256 {actual_sha256}) after reopening")]
+    ModelNotKept {
+        /// Body hash of what the ceremony committed.
+        committed_sha256 : String,
+        /// Body hash of what the reopened device handed back.
+        actual_sha256    : String,
+        /// Body length committed, bytes.
+        committed_len    : usize,
+        /// Body length read back, bytes. Around 1478 is the factory blob, which is
+        /// what a rebooted device holds.
+        actual_len       : usize,
+    },
     #[error("could not read the readings file: {0}")]
     Readings(String),
 }

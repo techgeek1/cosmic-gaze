@@ -123,20 +123,56 @@ nottobii keeps one session across its whole init; nothing observed here needs th
   area bottom-aligned to the panel and centred on the tracker (`--area WxH`,
   `--area-full`), and runs six rounds of Talon's schedule — centre, four mid-edges,
   four corners — on a black background and then a white one, with a 4 s pupil
-  adaptation wait at each flip and `cal_points_apply` after every round. A point is
-  only fed to the device once the firmware's own gaze has named it for 60 of the last
-  120 frames *and* the median of those frames is within `--accept-deg` (default 3°)
-  of it; `--point-timeout-s` (default 15) skips a point that will not settle, Enter
-  forces one in, `s` skips it, `q` aborts and commits nothing. After `cal_stop` +
-  `cal_retrieve` it saves the blob, runs a 3x3 health check on neutral grey (1 s per
-  stop, the firmware's gaze against the target in degrees) and writes the numbers, the
-  plane, the blob's body hash and the blob's decoded result table (`device_result`)
-  into `config/calibration-et5.toml`. The previous blob and
-  calibration are moved aside as `*.prev-<unix>`, never overwritten. `--suggest`
-  additionally queries `CALIBRATE_GET_POINT_SUGGESTION` (0x442) after each round and
-  logs the raw reply; nothing depends on it. `--dry-run` prints the plane, the area,
-  the nine points and the round schedule without touching the device or the
-  compositor. Needs a live compositor and a seated user.
+  adaptation wait at each flip and `cal_points_apply` after every round. After
+  `cal_stop` + `cal_retrieve` it runs a 3x3 health check on neutral grey (1 s per
+  stop, the firmware's gaze against the target in degrees), then reopens the device to
+  check the model survived, and only then writes the blob and the numbers, the plane,
+  the blob's body hash and the blob's decoded result table (`device_result`) into
+  `config/calibration-et5.toml`. The previous blob and calibration are moved aside as
+  `*.prev-<unix>`, never overwritten. `--suggest` additionally queries
+  `CALIBRATE_GET_POINT_SUGGESTION` (0x442) after each round and logs the raw reply;
+  nothing depends on it. `--dry-run` prints the plane, the area, the seed decision, the
+  nine points and the round schedule without touching the device or the compositor.
+  Needs a live compositor and a seated user.
+
+  **The session is seeded.** `cal_start`, `cal_clear`, then `cal_apply` of the blob the
+  run is about to replace (nottobii's captured Windows order), because every gate here
+  reads the device's *own* gaze and a cleared model does not report one. The seed
+  defaults to `--blob` when that file exists and decodes with a result trailer, is
+  overridden by `--seed FILE` (a file that cannot be used is an error, never a silent
+  skip), and is dropped by `--no-seed`. Which was used is printed by `--dry-run` and
+  logged by the real run.
+
+  **The gate is Talon's.** A point is fed to the device once the firmware's own gaze
+  has named it as the nearest of the round's targets for 60 of the last 120 frames
+  (capped at 2 s) — no accuracy test, because during a retrain the model reporting the
+  gaze is the one being replaced. A round with one target therefore accepts on any 60
+  frames that carry a gaze point at all. `--accept-deg` adds the old ellipse back on
+  top of the vote for a deliberate experiment; it is off by default.
+
+  **Nothing is skipped and nothing starves silently.** Each point reports frames seen,
+  frames carrying a gaze point and frames with both eyes tracked, once a second. If no
+  frame has carried a gaze point at all after `--gaze-timeout-s` (default 5), the point
+  falls back to a **dwell**: both eyes tracked for 1.5 s of continuous frames adds it,
+  logged as `dwell`. `--point-timeout-s` (default 15) is a nag interval, not a timeout:
+  it says which point it is waiting on and keeps waiting. Enter forces one in, `s`
+  skips it (the only way a point is not added), `q` aborts and commits nothing.
+  `--apply-from-round N` (default 1) defers the first `cal_points_apply` past the
+  one-point round without losing its points, for testing whether a one-point fit is
+  what leaves the device reporting no live gaze.
+
+  **It refuses to commit a bad ceremony.** Fewer than `--min-points` (default 9)
+  accepted and the session is closed, nothing is written, and the previous blob and
+  calibration stay exactly where they were. Same for a tracker that leaves the USB bus
+  mid-ceremony (a firmware reboot, which resets the model to the factory blob) and for
+  a model that does not survive the post-ceremony reconnect: the check drops the
+  device, waits a second, reopens blob-less, `cal_retrieve`s and requires the body hash
+  to match what was committed. The USB bus address is printed either side of that
+  reconnect, so a re-enumeration is visible in the log even when the model survived.
+  This is the 2026-08-28 01:24 failure: the ceremony accepted 2 of 18 points on a
+  starved 3° gate, committed the two-point model over a good one, and the tracker
+  re-enumerated as it finished, so the file it wrote described a model the device no
+  longer had.
 
   **Retrain once.** The firmware model is a feature extractor, not the thing that
   improves: every session file and every host-side fit is keyed to the blob's hash, so
@@ -169,8 +205,10 @@ Unit tests cover the wire protocol against captured reference vectors, the gaze
 decoder, the pose solver (synthetic flat and curved panels, exact and noisy rays),
 the pose-from-points solve and ray-bundle triangulation (outlier and degeneracy
 cases included), the correction field fits, the head-gain regression, the
-retrain's plan (plane pitch, training rectangle, round schedule) and its acceptance
-gate as a pure function, the point-suggestion decoder, the
+retrain's plan (plane pitch, training rectangle, round schedule), its acceptance
+gate as a pure function (the nearest-target vote with and without a radius, and a
+one-target round accepting on frames alone) and its seed resolution against a real
+blob, the point-suggestion decoder, the
 provider's edge-pinning and dropout-hold behaviour, the connect sequence ordering
 (`device::connect_sequence` for every combination of blob, plane and double upload),
 the blob hashing and diff helpers, the trailer decoder against the last 1 KB of two
@@ -178,6 +216,9 @@ real blobs (`tests/fixtures/blob-tail-*.bin`: the same model committed under the
 trained plane and read back under the virtual one, identical bodies and 13 points
 either side), and the sweep's lag/saccade/interpolation helpers.
 The `info`/`dump` paths and `blob-info` were exercised against the real device, and
-`calibrate --dry-run` against the real desk config. `blob-push`, `blob-watch`,
-`calibrate`, `record` and `view` write device state or need the user seated and a
-compositor; run them manually as above.
+`calibrate --dry-run` against the real desk config (with a seed, with `--no-seed`,
+with `--accept-deg`/`--apply-from-round`, and against an unusable `--seed` file).
+`blob-push`, `blob-watch`, `calibrate`, `record` and `view` write device state or need
+the user seated and a compositor; run them manually as above. The retrain's device
+sequence, its dwell fallback, the min-points refusal and the post-ceremony persistence
+check have not been run against hardware.

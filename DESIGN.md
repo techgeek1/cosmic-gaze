@@ -517,6 +517,17 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   lean posture (the head-generalisation failure in the firmware's own numbers) or those
   points were mislabelled going in; either way the old ceremony fed the on-device model
   four points it could not reconcile. The new `calibrate` has no lean dots.
+- 2026-08-28 01:24, first run of the new `calibrate`: **2 of 18 points accepted** — the gate
+  required the firmware's reported gaze within 3° of the target, and after `cal_clear` (or
+  the one-point apply of round 1) the live gaze is absent or garbage, so 16 points timed out
+  and were skipped; a two-point model was committed (90 KB blob, health 2–40°). Kernel log:
+  the tracker **re-enumerated at 01:24:55–57** as the ceremony ended, no plug touched — a
+  firmware reboot, which resets the model to the 1478-byte factory blob. Fixes in flight:
+  Talon's vote-only gate, seed the session with the previous blob (nottobii's captured
+  order), dwell fallback when no gaze arrives, no auto-skip, refuse to commit under nine
+  points, abort on re-enumeration, and a reconnect-and-compare persistence check before any
+  file is written. Also seen in the log: the EyeChip exposes a UVC 1.10 video interface
+  (`uvcvideo 1-6:1.1`) — the Windows Hello IR camera; raw eye images may be reachable.
 - 2026-08-28, session zero (the 16:24 readings imported as `config/sessions/1787873083-d32f6c4b.jsonl`,
   1462 rows after saccade gating, no outlier gates). Firmware-only residual of the filtered
   ray, in-sample, no split: **3.75° rms** overall (p50 2.12, p90 5.69); stops 2.48°, glides
