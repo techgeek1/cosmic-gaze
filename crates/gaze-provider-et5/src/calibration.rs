@@ -3,7 +3,9 @@
 //! estimate and enough metadata to judge staleness.
 //!
 //! The on-device eye model is not in this file; it lives in the tracker's flash (and
-//! its opaque blob is backed up separately). This file is everything client side:
+//! its blob is backed up separately, named here by the hash of its body). What the
+//! firmware itself reported about that model's calibration does travel here, decoded
+//! off the blob's trailer into `device_result`. The rest is everything client side:
 //! where the panels actually are relative to the tracker, and the residual 2D warp
 //! left after the device model and the pose mapping have done their part.
 //!
@@ -19,6 +21,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use gaze_core::{DesktopGeometry, GlobalPx, OutputGeometry};
 
+use crate::blob::CalibrationResult;
 use crate::field::FieldMap;
 use crate::ttp::{DisplayArea, DisplayRect};
 
@@ -224,13 +227,24 @@ pub struct Et5Calibration {
     /// run time for the trained mapping (rather than the raw ray model) to apply.
     #[serde(default)]
     pub device_area        : Option<DisplayArea>,
-    /// SHA-256 (lowercase hex) of the on-device model blob these fits were measured
-    /// against, from the backup taken when the model was trained. Every client-side
-    /// fit is keyed to one firmware eye model: a retrain orphans the lot. The
-    /// provider uploads that same blob on every connect and verifies it, so this is
-    /// identity, not a health check.
+    /// SHA-256 (lowercase hex) of the *body* of the on-device model blob these fits
+    /// were measured against, from the backup taken when the model was trained
+    /// (`blob::body_sha256_hex`). Every client-side fit is keyed to one firmware eye
+    /// model: a retrain orphans the lot. The provider uploads that same blob on every
+    /// connect and verifies it, so this is identity, not a health check.
+    ///
+    /// The body rather than the whole blob because the blob's result trailer is
+    /// re-normalised against whatever plane is declared at read time, so the
+    /// whole-blob hash names a retrieval rather than a model.
     #[serde(default)]
     pub device_blob_sha256 : Option<String>,
+    /// The firmware's own report on the calibration it committed, decoded from that
+    /// blob's trailer: where each target was and where each eye was measured. Written
+    /// at retrain time, when the trained plane was declared, so the coordinates are
+    /// panel uv of `device_area`. Nothing consumes it at run time; it is the free
+    /// per-point health report that travels with the model.
+    #[serde(default)]
+    pub device_result      : Option<CalibrationResult>,
     /// Per-display results.
     pub outputs            : Vec<OutputCalibration>,
     /// Post-retrain health check: the firmware's own gaze against a grid of known
@@ -348,6 +362,7 @@ pub enum CalibrationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blob::{CalibrationResult, EyeResult, PointResult};
     use crate::field::{FieldMap, FieldRow, fit_best};
 
     fn panel() -> OutputGeometry {
@@ -397,7 +412,16 @@ mod tests {
             lag_s              : 0.12,
             device_output      : None,
             device_area        : None,
-            device_blob_sha256 : Some(crate::blob::sha256_hex(b"a blob")),
+            device_blob_sha256 : Some(crate::blob::body_sha256_hex(b"a blob")),
+            // A table plus an array of tables plus scalars after both: the ordering
+            // TOML cannot express if the serialiser emits the struct in field order.
+            device_result      : Some(CalibrationResult {
+                targets : vec![PointResult {
+                    target : [0.5, 0.5],
+                    left   : EyeResult { position: [0.504, 0.498], valid: true  },
+                    right  : EyeResult { position: [0.511, 0.491], valid: false },
+                }],
+            }),
             outputs            : vec![OutputCalibration {
                 name           : "DP-9".into(),
                 pose           : OutputPose {
@@ -442,6 +466,15 @@ mod tests {
         cal.save(&path).expect("save");
         let loaded = Et5Calibration::load(&path).expect("load");
         assert_eq!(loaded, cal);
+
+        // A file written before the result table existed still loads.
+        let older = dir.join("no-result.toml");
+        std::fs::write(&older, format!(
+            "format = {CALIBRATION_FORMAT}\ncreated_unix_s = 0.0\nlag_s = 0.0\n\
+             outputs = []\nhealth = []\n",
+        )).unwrap();
+
+        assert_eq!(Et5Calibration::load(&older).expect("older").device_result, None);
     }
 
     #[test]
@@ -467,6 +500,7 @@ mod tests {
             device_output      : None,
             device_area        : None,
             device_blob_sha256 : None,
+            device_result      : None,
             outputs            : vec![OutputCalibration {
                 name           : "DP-9".into(),
                 pose           : OutputPose {
@@ -567,6 +601,7 @@ mod tests {
             device_output      : None,
             device_area        : None,
             device_blob_sha256 : None,
+            device_result      : None,
             outputs            : vec![OutputCalibration {
                 name           : "DP-9".into(),
                 pose           : OutputPose {

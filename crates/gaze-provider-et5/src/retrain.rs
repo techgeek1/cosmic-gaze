@@ -49,6 +49,7 @@ use tracing::{info, warn};
 use gaze_core::{DesktopGeometry, GlobalPx, OutputGeometry};
 use gaze_overlay::{OverlayHandle, OverlayState};
 
+use crate::blob::{CalibrationResult, body_sha256_hex, decode_trailer};
 use crate::calibration::HealthStop;
 use crate::device::Device;
 use crate::gaze::Et5Frame;
@@ -548,6 +549,14 @@ pub struct PointResult {
 pub struct RetrainOutcome {
     /// The freshly committed on-device model.
     pub blob        : Vec<u8>,
+    /// SHA-256 of that blob's body, which is the model's identity everywhere: the
+    /// calibration file, session files, the history key. The whole-blob hash is not,
+    /// because the result trailer is re-normalised on every retrieve (see `blob`).
+    pub body_sha256 : String,
+    /// The firmware's own per-point report, decoded off the blob's trailer. `None`
+    /// only if the firmware stopped writing one. Normalised against the plane
+    /// declared for the ceremony, which is `RetrainPlan::area`.
+    pub result      : Option<CalibrationResult>,
     /// Every target, in ceremony order.
     pub results     : Vec<PointResult>,
     /// Targets actually fed to the device.
@@ -647,6 +656,8 @@ pub fn run_retrain(
            {} byte blob", results.len(), blob.len());
 
     Ok(RetrainOutcome {
+        body_sha256 : body_sha256_hex(&blob),
+        result      : decode_trailer(&blob).map(|(_, table)| table),
         blob        : blob,
         results     : results,
         accepted    : accepted,

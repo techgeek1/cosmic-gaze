@@ -200,10 +200,13 @@ pub struct SessionMeta {
     pub session_id        : String,
     /// Unix time the session started.
     pub created_unix_s    : f64,
-    /// SHA-256 of the on-device blob retrieved before the first target was shown. All
-    /// client-side data is keyed to this: a retrain orphans the session.
+    /// SHA-256 of the *body* of the on-device blob retrieved before the first target
+    /// was shown. All client-side data is keyed to this: a retrain orphans the
+    /// session. The body rather than the whole blob because the blob's result trailer
+    /// is re-normalised against the declared plane on every retrieve, so the
+    /// whole-blob hash would differ between two sessions on one unchanged model.
     pub blob_sha256       : String,
-    /// Size of that blob, bytes.
+    /// Size of that whole blob, trailer included, bytes.
     pub blob_bytes        : usize,
     /// Connector name the session ran on.
     pub display           : String,
@@ -226,9 +229,9 @@ pub struct SessionMeta {
 pub struct SessionEnd {
     /// Always `"meta_end"`.
     pub kind         : String,
-    /// The blob retrieved again after the last target. Differing from the meta line's
-    /// means the firmware mutated its own model mid-session and the rows are not all
-    /// describing the same feature extractor.
+    /// Body hash of the blob retrieved again after the last target. Differing from
+    /// the meta line's means the firmware mutated its own model mid-session and the
+    /// rows are not all describing the same feature extractor.
     pub blob_sha256  : String,
     /// Total frames recorded.
     pub frames       : usize,
@@ -401,7 +404,7 @@ pub fn run_record(
         format            : SESSION_FORMAT,
         session_id        : session_id.clone(),
         created_unix_s    : created,
-        blob_sha256       : blob_start.sha256.clone(),
+        blob_sha256       : blob_start.body_sha256.clone(),
         blob_bytes        : blob_start.len,
         display           : out.name.clone(),
         display_area      : area,
@@ -413,7 +416,7 @@ pub fn run_record(
 
     let end = SessionEnd {
         kind         : "meta_end".into(),
-        blob_sha256  : blob_end.sha256.clone(),
+        blob_sha256  : blob_end.body_sha256.clone(),
         frames       : frames,
         valid_frames : valid,
     };
@@ -524,7 +527,7 @@ pub fn import_readings(
         format            : SESSION_FORMAT,
         session_id        : session_id.clone(),
         created_unix_s    : created,
-        blob_sha256       : report.sha256.clone(),
+        blob_sha256       : report.body_sha256.clone(),
         blob_bytes        : report.len,
         display           : display,
         display_area      : area,
@@ -536,7 +539,7 @@ pub fn import_readings(
 
     let end = SessionEnd {
         kind         : "meta_end".into(),
-        blob_sha256  : report.sha256.clone(),
+        blob_sha256  : report.body_sha256.clone(),
         frames       : frames,
         valid_frames : valid,
     };

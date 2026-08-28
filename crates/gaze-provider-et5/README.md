@@ -34,6 +34,37 @@ layouts and test vectors only.
   and reconnects on a backoff with the same blob and plane, re-verifying the upload.
   Manual recovery is `blob-push <blob backup>`.
 
+## The blob: a model body and a result trailer
+
+A blob is two things end to end, and only the first is the model:
+
+- The **body**, everything up to the trailer (604428 of 604948 bytes on this unit).
+  This is the opaque firmware eye model. It round-trips an upload byte for byte, and
+  **its SHA-256 is the blob's identity**: `blob::body_sha256_hex`, which is what
+  `calibration-et5.toml`'s `device_blob_sha256`, a session file's `blob_sha256`, the
+  `session_id` prefix and the history key all hold. The whole-blob hash names a
+  *retrieval*, not a model, and is only printed as a diagnostic.
+- The **trailer**, the firmware's own per-point calibration result table: 40 bytes per
+  unique calibration target (13 of them here, 520 bytes), little-endian
+  `target_u, target_v, left_u, left_v : f32`, `left_valid : u64`, then the same two
+  fields for the right eye. `blob::decode_trailer` finds it by scanning backwards
+  while the records validate, so the body/trailer split is measured rather than
+  guessed at a size bound. Which per-eye slot is the left eye is a guess (Tobii's own
+  result tables are left-then-right); nothing depends on it.
+
+The trailer is a **view** of device state, not state. Retrieving a blob re-expresses
+the table in whatever display area is declared *at read time*: the same blob read
+under the trained 875 x 370 mm plane and under the oversized virtual plane differs in
+every record by exactly the affine map between the two planes. That is the whole of
+the "a blob does not round-trip but its body does" result in `DESIGN.md` §10c —
+nothing is double-buffered and nothing mutates. So bodies get compared and trailers
+get printed, and a table is only comparable number-for-number with another read under
+the same plane.
+
+The table is a free per-point health report on the model that was committed, which is
+why the decoded form of the committed blob is stored in the calibration file as
+`device_result` and `blob-info` prints it as rows.
+
 ## Connect sequence
 
 `Device::connect_with(ConnectOptions)` performs, in this order (nottobii's
@@ -47,10 +78,10 @@ unit test asserts it):
 The blob goes up *before* the plane is declared and eye-enable/unpause come after it,
 which is what the references do and what earlier failed restores got wrong.
 Verification happens before the subscribe so the ~600 KB inbound transfer reassembles
-with no gaze notifications interleaved. Comparison is `BlobCheck::Exact` by default
-(`blob-info` on this unit, 2026-08-27: two consecutive retrieves are byte-identical,
-604948 bytes, sha256 `d32f6c4b...`); `BlobCheck::SizeAndPrefix` exists for a unit
-where retrieve turns out not to be deterministic.
+with no gaze notifications interleaved. Comparison is `BlobCheck::Body` by default:
+the model bodies byte for byte, plus the same number of points in both result tables
+(see below for why the trailer cannot be compared). `BlobCheck::Exact` and
+`BlobCheck::SizeAndPrefix` remain for firmware that round-trips its blob unchanged.
 
 `Device::connect()` is `connect_with(ConnectOptions::default())`: no upload, the
 device's stored plane left alone. That is what the read-only diagnostics use.
@@ -68,13 +99,18 @@ nottobii keeps one session across its whole init; nothing observed here needs th
 - `set-display-area` — declare the display plane (defaults: the 237x148 mm small
   panel with the tracker centred on its top edge).
 - `cal-backup FILE` — download the on-device calibration blob to a file.
-- `blob-info [--file F]` — retrieve the blob twice and report both sizes and SHA-256
-  hashes, whether the two reads are byte-identical (is retrieve deterministic?), and,
-  with `--file`, the same for a saved blob plus the first offset at which it and the
-  device disagree. Read-only on the device, safe to run unattended.
+- `blob-info [--file F] [--calibration F]` — retrieve the blob twice and report, for
+  each, the length and hash of its model body and the decoded result table: target uv,
+  each eye's measured uv and validity flag, and the per-eye error in degrees at a
+  nominal 650 mm when the plane the numbers are normalised against is known (the
+  device's currently declared area for the live retrieves, `--calibration`'s
+  `device_area` for `--file`). Then whether the two reads agree, and whether the saved
+  blob and the device hold the same *model*. Read-only, safe to run unattended.
 - `blob-watch --minutes N` — retrieve, stream for N minutes with a status line every
-  10 s, retrieve again, report the diff: does the firmware mutate its model during
-  ordinary use? Read-only.
+  10 s, retrieve again, print the result table at both ends and report whether the
+  **body** changed: does the firmware mutate its model during ordinary use? A trailer
+  that moved with the body intact is reported separately, since that is not a changed
+  model. Read-only.
 - `blob-push FILE [--double] [--calibration F]` — upload a blob through the
   connect-time path above and verify it. `--double` sends it twice, as the Windows
   driver does. SIGINT is held off for the duration; **a process killed mid-upload
@@ -93,8 +129,9 @@ nottobii keeps one session across its whole init; nothing observed here needs th
   of it; `--point-timeout-s` (default 15) skips a point that will not settle, Enter
   forces one in, `s` skips it, `q` aborts and commits nothing. After `cal_stop` +
   `cal_retrieve` it saves the blob, runs a 3x3 health check on neutral grey (1 s per
-  stop, the firmware's gaze against the target in degrees) and writes both the
-  numbers and the plane into `config/calibration-et5.toml`. The previous blob and
+  stop, the firmware's gaze against the target in degrees) and writes the numbers, the
+  plane, the blob's body hash and the blob's decoded result table (`device_result`)
+  into `config/calibration-et5.toml`. The previous blob and
   calibration are moved aside as `*.prev-<unix>`, never overwritten. `--suggest`
   additionally queries `CALIBRATE_GET_POINT_SUGGESTION` (0x442) after each round and
   logs the raw reply; nothing depends on it. `--dry-run` prints the plane, the area,
@@ -115,8 +152,8 @@ nottobii keeps one session across its whole init; nothing observed here needs th
   no longer runs. `--help` points at `record`. The pass archive under
   `config/calibration-et5-history/` is also orphaned twice over: its files were keyed
   by a `DefaultHasher` digest (`blob_key` now uses the first 16 hex characters of the
-  blob's SHA-256, matching `device_blob_sha256`), and they describe an eye model that
-  no longer exists.
+  blob *body*'s SHA-256, matching `device_blob_sha256`), and they describe an eye
+  model that no longer exists.
 - `view` — live gaze marker on every display through `gaze-overlay`.
 
 `gaze-proto --provider et5` runs the full snap/click prototype on this provider;
@@ -136,7 +173,10 @@ retrain's plan (plane pitch, training rectangle, round schedule) and its accepta
 gate as a pure function, the point-suggestion decoder, the
 provider's edge-pinning and dropout-hold behaviour, the connect sequence ordering
 (`device::connect_sequence` for every combination of blob, plane and double upload),
-the blob hashing and diff helpers, and the sweep's lag/saccade/interpolation helpers.
+the blob hashing and diff helpers, the trailer decoder against the last 1 KB of two
+real blobs (`tests/fixtures/blob-tail-*.bin`: the same model committed under the
+trained plane and read back under the virtual one, identical bodies and 13 points
+either side), and the sweep's lag/saccade/interpolation helpers.
 The `info`/`dump` paths and `blob-info` were exercised against the real device, and
 `calibrate --dry-run` against the real desk config. `blob-push`, `blob-watch`,
 `calibrate`, `record` and `view` write device state or need the user seated and a

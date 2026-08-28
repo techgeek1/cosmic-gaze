@@ -431,10 +431,12 @@ impl Device {
         let actual   = BlobReport::of(&actual);
 
         Err(DeviceError::BlobMismatch {
-            expected_sha256 : expected.sha256,
-            actual_sha256   : actual.sha256,
-            expected_len    : expected.len,
-            actual_len      : actual.len,
+            expected_len     : expected.body_len,
+            actual_len       : actual.body_len,
+            expected_trailer : expected.trailer_len(),
+            actual_trailer   : actual.trailer_len(),
+            expected_sha256  : expected.body_sha256,
+            actual_sha256    : actual.body_sha256,
         })
     }
 
@@ -597,16 +599,22 @@ pub enum DeviceError {
     Timeout { seq: u32 },
     #[error("malformed response: {0}")]
     BadResponse(&'static str),
+    /// Lengths and hashes are of the model *body*, not the whole blob: the result
+    /// trailer legitimately changes across a round trip (see `blob`), so quoting the
+    /// whole-blob hash here would report a mismatch that is not one.
     #[error(
-        "the tracker did not take the calibration blob: uploaded {expected_len} bytes \
-         (sha256 {expected_sha256}), read back {actual_len} bytes \
-         (sha256 {actual_sha256})"
+        "the tracker did not take the calibration blob: uploaded a {expected_len} byte \
+         body (sha256 {expected_sha256}) with a {expected_trailer} byte result \
+         trailer, read back a {actual_len} byte body (sha256 {actual_sha256}) with a \
+         {actual_trailer} byte trailer"
     )]
     BlobMismatch {
-        expected_sha256 : String,
-        actual_sha256   : String,
-        expected_len    : usize,
-        actual_len      : usize,
+        expected_sha256  : String,
+        actual_sha256    : String,
+        expected_len     : usize,
+        actual_len       : usize,
+        expected_trailer : usize,
+        actual_trailer   : usize,
     },
 }
 

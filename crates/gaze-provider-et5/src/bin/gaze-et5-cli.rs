@@ -16,7 +16,10 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use gaze_core::{DesktopGeometry, Ray};
 use gaze_overlay::{Overlay, OverlayState};
-use gaze_provider_et5::blob::{BlobCheck, BlobReport, first_difference};
+use gaze_provider_et5::blob::{
+    BlobCheck, BlobReport, CalibrationResult, EyeResult, body, body_sha256_hex,
+    decode_trailer, first_difference,
+};
 use gaze_provider_et5::calibration::{
     CALIBRATION_FORMAT, Et5Calibration, OutputCalibration, OutputPose, VIRTUAL_AREA,
 };
@@ -34,8 +37,13 @@ use gaze_snap::FilterStack;
 use signal_hook::consts::SIGINT;
 use signal_hook::flag;
 
-/// Conventional on-device blob backup, whose hash keys the pass history.
+/// Conventional on-device blob backup, whose body hash keys the pass history.
 const DEFAULT_BLOB_PATH: &str = "config/calibration-et5.bin";
+
+/// Viewing distance the result table's normalised errors are turned into degrees
+/// at, millimetres. The eye is not measured here, so this is the desk's nominal
+/// distance and the degrees are indicative, not the health check's numbers.
+const NOMINAL_VIEW_MM: f64 = 650.0;
 
 /// Directory archived passes accumulate in for pooled head-gain fits. Under
 /// `config/calibration*` so the standard gitignore covers it.
@@ -109,13 +117,18 @@ enum Command {
         file : PathBuf,
     },
 
-    /// Retrieve the on-device calibration blob twice and report whether the two
-    /// reads agree (is retrieve deterministic?), optionally against a saved blob.
-    /// Read-only on the device.
+    /// Retrieve the on-device calibration blob twice, report the identity of its
+    /// model body and decode the firmware's per-point calibration result table off
+    /// its trailer, optionally against a saved blob. Read-only on the device.
     BlobInfo {
         /// A saved blob to compare the first retrieve against.
         #[arg(long)]
-        file : Option<PathBuf>,
+        file        : Option<PathBuf>,
+
+        /// Calibration file whose trained plane the saved blob's table is read
+        /// against, so its errors can be quoted in degrees.
+        #[arg(long, default_value = DEFAULT_CALIBRATION_PATH)]
+        calibration : PathBuf,
     },
 
     /// Retrieve the blob, stream for a while, retrieve again, and report the diff:
@@ -350,7 +363,9 @@ fn main() -> Result<()> {
             set_display_area(DisplayRect { w_mm: w, h_mm: h, ox_mm: ox, oy_mm: oy, z_mm: z })
         }
         Command::CalBackup { file }         => cal_backup(&file),
-        Command::BlobInfo { file }          => blob_info(file.as_deref()),
+        Command::BlobInfo { file, calibration } => {
+            blob_info(file.as_deref(), &calibration)
+        }
         Command::BlobWatch { minutes }      => blob_watch(minutes),
         Command::BlobPush { file, double, calibration } => {
             blob_push(&file, double, &calibration)
@@ -618,26 +633,108 @@ fn cal_backup(file: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn blob_info(file: Option<&std::path::Path>) -> Result<()> {
+/// Physical size of a declared display area, millimetres across and down. The result
+/// table is normalised against exactly this, so it is what turns a normalised error
+/// into a distance on the panel.
+fn area_size_mm(area: &DisplayArea) -> (f64, f64) {
+    let span = |a: [f64; 3], b: [f64; 3]| {
+        ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2) + (b[2] - a[2]).powi(2)).sqrt()
+    };
+
+    (span(area.tl_mm, area.tr_mm), span(area.tl_mm, area.bl_mm))
+}
+
+/// Prints the firmware's own per-point calibration result table.
+///
+/// `area` is the display area the table's coordinates are normalised against, which
+/// is the plane that was declared when the blob was *retrieved*, not the one it was
+/// trained under. With it the per-eye errors are also quoted in degrees at
+/// [`NOMINAL_VIEW_MM`]; without it the table is normalised units only, which is still
+/// enough to see which points the firmware fitted badly.
+fn print_result_table(table: &CalibrationResult, area: Option<DisplayArea>) {
+    let size = area.as_ref().map(area_size_mm);
+
+    match size {
+        Some((w, h)) => println!(
+            "  {} points, normalised against the declared {w:.0} x {h:.0} mm plane \
+             (errors in degrees at {NOMINAL_VIEW_MM:.0} mm)",
+            table.targets.len(),
+        ),
+        None         => println!(
+            "  {} points; no declared plane to read them against, so the errors stay \
+             in normalised units",
+            table.targets.len(),
+        ),
+    }
+
+    println!("       target |      left eye     |     right eye     |   err_l   err_r");
+
+    for point in &table.targets {
+        // Degrees only when the plane is known; otherwise the normalised distance.
+        // The two axes scale differently, so the angle is not the uv error times a
+        // constant and has to go through millimetres.
+        let quote = |eye: &EyeResult| {
+            let du = (eye.position[0] - point.target[0]) as f64;
+            let dv = (eye.position[1] - point.target[1]) as f64;
+
+            match size {
+                Some((w, h)) => {
+                    let mm = ((du * w).powi(2) + (dv * h).powi(2)).sqrt();
+
+                    format!("{:6.2}d", (mm / NOMINAL_VIEW_MM).atan().to_degrees())
+                }
+                None         => format!("{:7.4}", point.error(eye)),
+            }
+        };
+
+        println!(
+            "  {:.3} {:.3} | {:.3} {:.3} {} | {:.3} {:.3} {} | {} {}",
+            point.target[0], point.target[1],
+            point.left.position[0] , point.left.position[1] ,
+            if point.left.valid  { "ok" } else { "--" },
+            point.right.position[0], point.right.position[1],
+            if point.right.valid { "ok" } else { "--" },
+            quote(&point.left), quote(&point.right),
+        );
+    }
+}
+
+/// Prints a blob's identity and, when it has one, its decoded result table.
+fn print_blob(label: &str, bytes: &[u8], area: Option<DisplayArea>) {
+    println!("{label}: {}", BlobReport::of(bytes));
+
+    match decode_trailer(bytes) {
+        Some((_, table)) => print_result_table(&table, area),
+        None             => println!(
+            "  no result trailer: this is not a calibrated model of this device \
+             (a factory-default blob has none)",
+        ),
+    }
+}
+
+fn blob_info(file: Option<&std::path::Path>, calibration: &std::path::Path) -> Result<()> {
     let mut device = Device::connect().context("connecting to the ET5")?;
 
+    // The table's coordinates are normalised against whatever plane the device holds
+    // right now, so the plane has to be read before the numbers mean anything. This
+    // connect declares nothing, so it is genuinely whatever was left there.
+    let declared = device.display_area().ok();
+
     // Two back-to-back retrieves with nothing in between: any difference is the
-    // firmware's, not ours. This is the question A1's verification mode hangs on.
+    // firmware's, not ours.
     let first  = device.cal_retrieve().context("first cal_retrieve")?;
     let second = device.cal_retrieve().context("second cal_retrieve")?;
 
-    println!("retrieve 1: {}", BlobReport::of(&first));
+    print_blob("retrieve 1", &first, declared);
     println!("retrieve 2: {}", BlobReport::of(&second));
 
     match first_difference(&first, &second) {
         None         => println!(
-            "identical: cal_retrieve is deterministic on this unit, so the \
-             connect-time check can stay BlobCheck::Exact",
+            "identical: cal_retrieve is deterministic on this unit",
         ),
         Some(offset) => println!(
-            "DIFFERENT: first difference at offset {offset} (common prefix \
-             {offset} bytes) — cal_retrieve is not deterministic, so the \
-             connect-time check needs BlobCheck::SizeAndPrefix",
+            "DIFFERENT: first difference at offset {offset}; the bodies {}",
+            if body(&first) == body(&second) { "still agree" } else { "DISAGREE too" },
         ),
     }
 
@@ -645,17 +742,39 @@ fn blob_info(file: Option<&std::path::Path>) -> Result<()> {
         return Ok(());
     };
 
+    // The saved blob was written straight after a retrain, with the trained plane
+    // declared, so its table is normalised against that plane and not the live one.
+    let trained = Et5Calibration::load(calibration).ok().and_then(|c| c.device_area);
+
+    if trained.is_none() {
+        println!("{} has no trained plane; the saved blob's table stays in \
+                  normalised units", calibration.display());
+    }
+
     let saved = std::fs::read(path)
         .with_context(|| format!("reading {}", path.display()))?;
 
-    println!("{}: {}", path.display(), BlobReport::of(&saved));
+    print_blob(&path.display().to_string(), &saved, trained);
 
-    match first_difference(&saved, &first) {
-        None         => println!("the file matches retrieve 1 byte for byte"),
-        Some(offset) => println!(
-            "the file and retrieve 1 first differ at offset {offset} (common \
-             prefix {offset} bytes)",
-        ),
+    // Identity is the body; the trailer differing across a round trip is expected and
+    // says nothing about the model.
+    if body_sha256_hex(&saved) == body_sha256_hex(&first) {
+        match first_difference(&saved, &first) {
+            None         => println!("the file matches retrieve 1 byte for byte, so \
+                                      the plane declared now is the one the blob was \
+                                      trained under"),
+            Some(offset) => println!("the file and retrieve 1 hold the same model \
+                                      (identical bodies); their trailers differ from \
+                                      offset {offset}, which is the firmware \
+                                      re-normalising the result table against the \
+                                      plane declared at read time"),
+        }
+    }
+    else {
+        let offset = first_difference(&saved, &first).unwrap_or(0);
+
+        println!("DIFFERENT MODELS: the file and retrieve 1 first differ at offset \
+                  {offset}, inside the body");
     }
 
     Ok(())
@@ -664,8 +783,12 @@ fn blob_info(file: Option<&std::path::Path>) -> Result<()> {
 fn blob_watch(minutes: f64) -> Result<()> {
     let mut device = Device::connect().context("connecting to the ET5")?;
 
+    // Everything the table says is in the units of the plane declared right now, and
+    // this connect declares nothing, so read it once and use it for both tables.
+    let declared = device.display_area().ok();
+
     let before = device.cal_retrieve().context("cal_retrieve before the watch")?;
-    println!("before: {}", BlobReport::of(&before));
+    print_blob("before", &before, declared);
 
     // Streaming is what a session does; if the firmware adapts its model during
     // ordinary use, this is where it shows up.
@@ -702,20 +825,28 @@ fn blob_watch(minutes: f64) -> Result<()> {
     // Retrieving while the gaze stream is live is safe: the device serialises the
     // multi-transfer response rather than interleaving notifications into it
     // (measured by `blob-info`, whose retrieves also run under a live stream and come
-    // back byte-exact against the saved blob).
+    // back with the same body as the saved blob).
     let after = device.cal_retrieve().context("cal_retrieve after the watch")?;
-    println!("after:  {}", BlobReport::of(&after));
+    print_blob("after ", &after, declared);
 
-    match first_difference(&before, &after) {
-        None         => println!(
-            "unchanged after {frames} frames: the firmware does not mutate its \
-             eye model during use",
-        ),
-        Some(offset) => println!(
-            "CHANGED after {frames} frames: first difference at offset {offset} \
-             (common prefix {offset} bytes)",
-        ),
+    // The model is the body. A trailer that moved with the plane untouched would be
+    // the firmware rewriting its own result table, which is worth knowing but is not
+    // a changed model.
+    if body(&before) == body(&after) {
+        println!("the model is unchanged after {frames} frames: the firmware does \
+                  not mutate its eye model during use");
+
+        if let Some(offset) = first_difference(&before, &after) {
+            println!("its result trailer did move, from offset {offset}");
+        }
+
+        return Ok(());
     }
+
+    let offset = first_difference(&before, &after).unwrap_or(0);
+
+    println!("CHANGED after {frames} frames: the bodies differ, first difference at \
+              offset {offset}");
 
     Ok(())
 }
@@ -934,7 +1065,8 @@ fn calibrate(
         lag_s              : lag_s,
         device_output      : Some(retrain_config.display.clone()),
         device_area        : Some(plan.area),
-        device_blob_sha256 : Some(report.sha256.clone()),
+        device_blob_sha256 : Some(report.body_sha256.clone()),
+        device_result      : outcome.result.clone(),
         outputs            : vec![OutputCalibration {
             name           : retrain_config.display.clone(),
             // The desk pose as configured: the retrain declares the measured plane
@@ -1016,15 +1148,17 @@ fn print_plan(config: &RetrainConfig, plan: &retrain::RetrainPlan) {
     }
 }
 
-/// Names the on-device model: the first 16 hex characters of its blob's SHA-256, so
-/// the history key and the calibration file's `device_blob_sha256` are the same
-/// identity. (Passes archived before 2026-08-28 were keyed by `DefaultHasher` and do
-/// not match any blob hash; that directory is orphaned.)
+/// Names the on-device model: the first 16 hex characters of the SHA-256 of its
+/// blob's *body*, so the history key and the calibration file's
+/// `device_blob_sha256` are the same identity. The body rather than the whole blob
+/// because the result trailer is re-normalised on every retrieve. (Passes archived
+/// before 2026-08-28 were keyed by `DefaultHasher`, and those from 2026-08-28 by the
+/// whole-blob hash; neither matches. That directory is orphaned either way.)
 fn blob_key(path: &std::path::Path) -> Result<String> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("reading {}", path.display()))?;
 
-    Ok(gaze_provider_et5::blob::sha256_hex(&bytes)[..16].to_string())
+    Ok(body_sha256_hex(&bytes)[..16].to_string())
 }
 
 /// Runs the collect session and archives its pass under the committed model's key.

@@ -15,7 +15,8 @@
 //! - [`transport`]: bulk USB via rusb (endpoints, session open, transfer chunking).
 //! - [`device`]: a connected tracker: handshake, requests, calibration ops, gaze stream.
 //! - [`gaze`]: decoded 0x500 frames (`Et5Frame`).
-//! - [`blob`]: identity of the on-device calibration blob (hash, diff, check policy).
+//! - [`blob`]: identity of the on-device calibration blob (the model body's hash,
+//!   diff, check policy) and the firmware's per-point result table off its trailer.
 //! - [`retrain`]: the ceremony that writes the on-device eye model, once.
 //! - [`record`], [`dataset`]: recording sessions and the rows a model trains on.
 //! - [`triangulate`], [`pose`]: the plane pass geometry (ray-bundle intersection,
@@ -37,7 +38,7 @@ pub mod transport;
 pub mod triangulate;
 pub mod ttp;
 
-pub use blob::{BlobCheck, BlobReport};
+pub use blob::{BlobCheck, BlobReport, CalibrationResult};
 pub use calibration::{Et5Calibration, HealthStop};
 pub use device::{ConnectOptions, Device, DeviceError};
 pub use gaze::Et5Frame;

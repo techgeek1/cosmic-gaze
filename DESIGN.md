@@ -503,9 +503,20 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   different; pushing that read-back form handed the *original* bytes back. The trailer decodes
   as little-endian f32 pairs — the retrain's ring and lean-dot targets (0.5/0.5, 0.7/0.5,
   0.3/0.5, 0.35, 0.65…) each followed by a measured point and a `1` flag word per eye: Tobii's
-  per-point calibration-result table, 13 unique targets × 40 bytes, device-managed and
-  apparently double-buffered. Verification now compares the body only (`BlobCheck::Body`);
-  the trailer is worth decoding as a free per-point health report.
+  per-point calibration-result table, 13 unique targets × 40 bytes (target, per-eye
+  measured position, per-eye validity). Not double-buffered: the table is **re-normalised
+  against whatever display area is declared at read time** (a linear fit of read-back vs
+  committed coordinates recovers the virtual plane's 880×365 mm against the trained plane's
+  875 mm), so trailer bytes are a view of device state and comparing them across a round
+  trip means nothing. Verification compares the body only (`BlobCheck::Body`); identity
+  everywhere is the body hash (`25542046…` for the 16:12 model). `blob-info` decodes the
+  table — it is the firmware's own per-point accuracy report, free on every retrieve.
+- 2026-08-28, that table for the 16:12 model: ring points 0.3–4.7° per eye (worst at the
+  upper-left ring stop, 4.5°; 0.5/0.8 at 2.7–3.6°); **the four lean-dot targets read 5°, 14°,
+  18–21° and 24° per eye and are still flagged valid.** Either the model never fitted the
+  lean posture (the head-generalisation failure in the firmware's own numbers) or those
+  points were mislabelled going in; either way the old ceremony fed the on-device model
+  four points it could not reconcile. The new `calibrate` has no lean dots.
 - 2026-08-28, session zero (the 16:24 readings imported as `config/sessions/1787873083-d32f6c4b.jsonl`,
   1462 rows after saccade gating, no outlier gates). Firmware-only residual of the filtered
   ray, in-sample, no split: **3.75° rms** overall (p50 2.12, p90 5.69); stops 2.48°, glides
