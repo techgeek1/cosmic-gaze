@@ -1,20 +1,25 @@
-//! Cropping a frame around the pointer and picking the element that was clicked.
+//! Picking the element that was clicked, and the window the pupil covariate is
+//! measured over.
 //!
-//! Detection over a whole ultrawide frame costs about 400 ms, which is far too much to
-//! pay on every click. A click only ever lands on something under the pointer, so the
-//! recogniser is handed a square of a few hundred logical pixels around it and told
-//! where that square sits in global coordinates. The boxes come back in the same global
-//! logical pixel space as everything else in the workspace.
+//! Recognition itself runs on the **whole** captured output, not on a crop around the
+//! pointer: a crop loses wide flat widgets because the widget model needs the
+//! surrounding layout to see them at all (the measurement is in [`crate::perceive`]).
+//! The square around the pointer survives only as the window
+//! [`mean_luma`] averages, which is the screen-brightness covariate a passive session
+//! gets in place of a driven background.
+//!
+//! Element choice is [`smallest_containing`] over the full-frame list. Boxes come back
+//! from the detector in global logical pixels, like everything else in the workspace.
 
 use gaze_core::{Element, ElementKind, GlobalPx, Rect};
 
-/// Half-width of the crop taken around the pointer, logical pixels. Wide enough that a
-/// full-width toolbar button or a line of text is whole inside it, small enough that
-/// the detector runs in tens of milliseconds.
-pub const CROP_HALF_PX: f64 = 256.0;
+/// Half-width of the luminance window taken around the pointer, logical pixels. Wide
+/// enough to average over the panel or page the click landed in rather than the widget
+/// itself, which is the light the pupil is actually responding to.
+pub const LUMA_HALF_PX: f64 = 256.0;
 
 /// A square of a captured frame, in the frame's buffer pixels, with the global
-/// coordinates the detector needs to place its boxes.
+/// coordinates that place it on the desktop.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Crop {
     /// Left edge in buffer pixels.
@@ -27,7 +32,7 @@ pub struct Crop {
     pub h      : u32,
     /// The crop's top-left corner in global logical pixels.
     pub origin : GlobalPx,
-    /// Buffer pixels per logical pixel, what `Detector::detect` is handed as `scale`.
+    /// Buffer pixels per logical pixel along x.
     pub scale  : f64,
 }
 
@@ -41,9 +46,7 @@ pub struct Crop {
 ///
 /// The two axes have very slightly different logical-to-buffer ratios (cosmic-comp
 /// rounds the logical size it reports, so on HDMI-A-1 they differ by 0.07%). The crop
-/// is placed with each axis's own ratio and the detector is handed the horizontal one,
-/// which over a 512 px square is worth under half a logical pixel of vertical scale
-/// error.
+/// is placed with each axis's own ratio and `scale` reports the horizontal one.
 pub fn crop_around(
     logical : Rect,
     width   : u32,
@@ -179,6 +182,10 @@ pub fn kind_name(kind: ElementKind) -> &'static str {
 /// inside a panel, and the innermost one is the thing the user was aiming at. Kinds are
 /// filtered before the size comparison rather than after, so an unclassified box
 /// wrapping the whole window cannot swallow a click that landed on a real button.
+///
+/// `elements` is the whole output's list. Feeding it a crop's list instead is what the
+/// first version did, and it systematically preferred a widget's inner OCR text to the
+/// widget: see [`crate::perceive`] for the measurement.
 pub fn smallest_containing(elements: &[Element], p: GlobalPx) -> Option<&Element> {
     elements
         .iter()

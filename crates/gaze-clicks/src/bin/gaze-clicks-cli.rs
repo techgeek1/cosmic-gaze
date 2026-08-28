@@ -84,9 +84,10 @@ enum Command {
         #[arg(long, default_value_t = 1.0)]
         capture_hz  : f64,
 
-        /// Half-width of the recognition crop, logical pixels.
+        /// Half-width of the window the screen luminance is averaged over, logical
+        /// pixels. Recognition runs on the whole captured output.
         #[arg(long, default_value_t = 256.0)]
-        crop_px     : f64,
+        luma_px     : f64,
     },
 
     /// List the evdev nodes a run could read, and mark the one it would pick.
@@ -109,9 +110,10 @@ enum Command {
         #[arg(long)]
         seconds : Option<f64>,
 
-        /// Half-width of the recognition crop, logical pixels.
+        /// Half-width of the window the screen luminance is averaged over, logical
+        /// pixels. Recognition runs on the whole captured output.
         #[arg(long, default_value_t = 256.0)]
-        crop_px : f64,
+        luma_px : f64,
     },
 }
 
@@ -138,7 +140,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Run {
             out, out_dir, mouse, mouse_name, models, desk, calibration, blob,
-            no_tracker, capture_hz, crop_px,
+            no_tracker, capture_hz, luma_px,
         } => run(CollectConfig {
             out         : out,
             out_dir     : out_dir,
@@ -150,11 +152,11 @@ fn main() -> Result<()> {
             blob        : blob,
             no_tracker  : no_tracker,
             capture_hz  : capture_hz,
-            crop_px     : crop_px,
+            luma_px     : luma_px,
         }),
 
         Command::Devices { mouse_name }           => devices(&mouse_name),
-        Command::Probe { models, seconds, crop_px } => probe(models, seconds, crop_px),
+        Command::Probe { models, seconds, luma_px } => probe(models, seconds, luma_px),
     }
 }
 
@@ -195,9 +197,9 @@ fn run(config: CollectConfig) -> Result<()> {
     );
     println!(
         "accepted {} / drag {} / no-element {} / no-gaze {} / stale {} \
-         (late-capture {}, off-desk {}, error {})",
+         (late-capture {}, overrun {}, off-desk {}, error {})",
         t.accepted, t.drag, t.no_element, t.no_gaze, t.stale,
-        t.late_capture, t.off_desk, t.error,
+        t.late_capture, t.overrun, t.off_desk, t.error,
     );
 
     Ok(())
@@ -245,7 +247,7 @@ fn devices(mouse_name: &str) -> Result<()> {
 }
 
 /// Prints what the recogniser sees under the pointer, once a second.
-fn probe(models: PathBuf, seconds: Option<f64>, crop_px: f64) -> Result<()> {
+fn probe(models: PathBuf, seconds: Option<f64>, luma_px: f64) -> Result<()> {
     let t0 = Instant::now();
 
     // The overlay's own marks are on the captured screen, and a stroked box is exactly
@@ -261,7 +263,7 @@ fn probe(models: PathBuf, seconds: Option<f64>, crop_px: f64) -> Result<()> {
         PerceptionConfig {
             models_dir   : models,
             capture_hz   : 1.0,
-            crop_half_px : crop_px,
+            luma_half_px : luma_px,
             t0           : t0,
         },
         press_rx,
@@ -323,7 +325,7 @@ fn probe(models: PathBuf, seconds: Option<f64>, crop_px: f64) -> Result<()> {
                                                 describe(e)),
                                         Some((e.bbox, caption("NEAREST ", e))),
                                     ),
-                                    None => ("nothing in the crop".to_string(), None),
+                                    None => ("nothing on the frame".to_string(), None),
                                 }
                             }
                         }
@@ -335,6 +337,9 @@ fn probe(models: PathBuf, seconds: Option<f64>, crop_px: f64) -> Result<()> {
                 DetectOutcome::Stale     => ("no usable frame".to_string(), None),
                 DetectOutcome::OffFrame  => {
                     ("the pointer left the captured output".to_string(), None)
+                }
+                DetectOutcome::Overrun   => {
+                    ("the detector is still busy with earlier frames".to_string(), None)
                 }
                 DetectOutcome::Failed(e) => (format!("recognition failed: {e}"), None),
             }

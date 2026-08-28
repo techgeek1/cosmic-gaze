@@ -138,12 +138,13 @@ the user to confirm) where the cursor landed.
 
 ### gaze-clicks (DONE; passive gaze labels from ordinary mouse clicks; PLAN-ET5 B4)
 ```rust
-gaze-clicks-cli run [--out PATH] [--mouse PATH] [--mouse-name SUBSTR] [--models DIR] [--desk config/desk.toml] [--calibration config/calibration-et5.toml] [--blob config/calibration-et5.bin] [--no-tracker] [--capture-hz 1] [--crop-px 256]
+gaze-clicks-cli run [--out PATH] [--mouse PATH] [--mouse-name SUBSTR] [--models DIR] [--desk config/desk.toml] [--calibration config/calibration-et5.toml] [--blob config/calibration-et5.bin] [--no-tracker] [--capture-hz 1] [--luma-px 256]
 gaze-clicks-cli devices | probe
 ```
 A background collector: reads the real mouse read-only (never `EVIOCGRAB`), captures the
-output under the pointer **on the press**, recognises a ±256 px crop, and writes the gaze
-frames around the press against the element's box as a `gaze-provider-et5` session file
+output under the pointer **on the press**, recognises the whole frame (a crop loses every
+wide flat widget: 0/12 on identical pixels), and writes the gaze frames around the press
+against the element's box as a `gaze-provider-et5` session file
 (`config/sessions/<unix>-<blobkey>-clicks.jsonl`). Rejects drags, off-desk clicks, stale
 frames, clicks on nothing, and clicks with no gaze over the approach. Holds the tracker
 for the whole run, so `gaze-proto` and `gaze-et5-cli` cannot run alongside it. Its status

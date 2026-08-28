@@ -19,6 +19,16 @@
 //! that capture stalls does a slow rolling frame stand in. See [`frames`] for the
 //! selection rule.
 //!
+//! # Why the whole frame is recognised
+//!
+//! Recognition runs on the entire captured output, not on a crop around the pointer.
+//! A crop is much cheaper and it loses the widgets that matter: cut out of the very
+//! same pixels, a 512 px crop's pick agreed with the full frame **0 times out of 12**
+//! over the twelve largest widgets on a working desktop, coming back with their inner
+//! OCR text instead. The losses are wide flat things (list rows, a URL bar) that the
+//! widget model can only see with their surrounding layout. [`perceive`] carries the
+//! measurement and `examples/recognition_check.rs` reruns it.
+//!
 //! # What it refuses
 //!
 //! A drag, a click on an output the desk config does not describe, a click with no
@@ -30,7 +40,9 @@
 //! # Threads
 //!
 //! - [`mouse`]: the evdev reader. Stamps presses and fires their captures.
-//! - [`perceive`]: pointer, capture and recognition. Owns everything Wayland.
+//! - [`perceive`]: two of them. A capture thread owning everything Wayland, which must
+//!   never block for longer than one screen capture, and a detect thread owning the
+//!   models, which is allowed to take its 250 to 400 ms per frame.
 //! - [`tracker`]: device frames into a ring.
 //! - [`collect`]: the rules and the writing, on the calling thread.
 
@@ -49,7 +61,7 @@ pub mod tracker;
 
 pub use click::{Button, ButtonEvent, MultiCounter, PressKind, classify};
 pub use collect::{CollectConfig, Outcome, Tallies};
-pub use element::{Crop, crop_around, kind_name, mean_luma, smallest_containing};
+pub use element::{Crop, LUMA_HALF_PX, crop_around, kind_name, mean_luma, smallest_containing};
 pub use frames::{FrameChoice, FrameDedup, GazeRing, RollingCache, gaze_fraction, select_frame};
 pub use mouse::{Candidate, MouseReader};
 pub use perceive::{Perception, PerceptionConfig, PointerSample};

@@ -152,16 +152,35 @@ it is the data source E1/E2's flywheel acceptance will eventually run on.
   `capture_output` the moment the press arrives and that frame is used if it lands
   within 150 ms (measured: 20 to 40 ms). A 1 Hz rolling capture is the fallback only,
   never used past 500 ms old or after the release; using it tallies `late-capture`.
-- **Recognition on a crop**, ±256 logical px around the pointer, so a click costs tens of
-  milliseconds rather than the ~400 ms a whole ultrawide frame costs. Smallest accepted
-  box containing the pointer wins (boxes nest; the innermost is what was aimed at).
-  `Unknown` boxes are refused even as containers. `Icon` and `Slider` are accepted and
-  recorded as themselves so the export can filter them.
+- **Recognition on the whole captured output.** Smallest accepted box containing the
+  pointer wins (boxes nest; the innermost is what was aimed at). `Unknown` boxes are
+  refused even as containers. `Icon` and `Slider` are accepted and recorded as
+  themselves so the export can filter them.
+  - A ±256 px crop was tried first, for the ~10x saving over a full frame, and it loses
+    every wide flat widget. Measured on identical pixels (one capture of DP-2, detected
+    whole as the reference, then re-detected as crops around the twelve largest widget
+    centres): the crop's pick agreed **0/12** at both 512 and 640 px, returning the
+    widget's inner OCR text or nothing. Channel rows, member rows, the URL bar, links.
+    Small square widgets survive cropping, which is what made it look like it worked.
+    The widget model needs the surrounding layout; the failure is context, not scale.
+    `crates/gaze-clicks/examples/recognition_check.rs` reruns the measurement.
+  - The ±`--luma-px` window survives only as what `crop_luma` is averaged over.
+- **Two threads, because a full frame is slow.** A whole-frame detection is 250 to
+  400 ms and a press capture has to happen within tens of milliseconds of the press, so
+  perception is split: a **capture thread** owning `Capture` and `CursorTracker` (pointer
+  polling, press and rolling captures, and the frame choice, since the capture times live
+  there), and a **detect thread** owning the `Detector`, fed already-chosen `(request,
+  frame)` pairs. Nothing on the capture thread may block for longer than one capture: the
+  hand-off is a `try_send` onto a queue three deep and a full queue refuses the click
+  (`overrun`) rather than waiting. So a double click's second press is captured while the
+  first is still being recognised. The detector is built on the detect thread, which
+  sidesteps moving an `ort` session between threads.
 - **Rejections, in order:** `drag` (held > 400 ms or moved > 6 px), `off-desk` (an output
-  `desk.toml` does not describe), `stale` (no usable frame), `no-element`, `no-gaze`
-  (under 20% of the frames in `[t_press - 0.6, t_press]` carrying a valid combined gaze).
-  `no-element` is the one that matters: a focus click on empty space says nothing about
-  gaze and is the most common press on a desktop.
+  `desk.toml` does not describe), `stale` (no usable frame), `overrun` (the detector was
+  three frames behind), `no-element`, `no-gaze` (under 20% of the frames in
+  `[t_press - 0.6, t_press]` carrying a valid combined gaze). `no-element` is the one
+  that matters: a focus click on empty space says nothing about gaze and is the most
+  common press on a desktop.
 - **Output** is B1's session format verbatim, one file per on-device eye model:
   `config/sessions/<unix>-<blobkey>-clicks.jsonl`, rotated if the tracker reconnects
   holding a different blob body hash. Per click: a `"stop"` (`phase: "click"`,

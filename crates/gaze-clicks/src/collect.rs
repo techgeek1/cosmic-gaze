@@ -57,8 +57,11 @@ const STATUS_PERIOD_S: u64 = 10;
 /// How many recent accepted clicks the running offset median is taken over.
 const OFFSET_WINDOW: usize = 20;
 
-/// How long a recognition request may take before the click is given up on. A crop
-/// runs in tens of milliseconds; anything near this means the detector is wedged.
+/// How long a recognition request may take before the click is given up on.
+///
+/// A whole-frame detection is 250 to 400 ms on the ultrawide and up to three of them
+/// can be queued ahead of this one, so three seconds is the honest bound; anything
+/// near it means the detector is wedged rather than merely busy.
 const DETECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Note written into the session meta line, so a click session is identifiable at a
@@ -89,8 +92,10 @@ pub struct CollectConfig {
     pub no_tracker  : bool,
     /// Rolling fallback capture rate, hertz.
     pub capture_hz  : f64,
-    /// Half-width of the recognition crop, logical pixels.
-    pub crop_px     : f64,
+    /// Half-width of the window the screen luminance is averaged over, logical pixels.
+    /// Recognition runs on the whole captured output; this is only the pupil
+    /// covariate's window.
+    pub luma_px     : f64,
 }
 
 /// What the rules did to the presses that arrived.
@@ -111,6 +116,10 @@ pub struct Tallies {
     /// Accepted, but recognised from the rolling fallback rather than the press's own
     /// capture. Counted alongside `accepted`, not instead of it.
     pub late_capture : u64,
+    /// Clicked faster than whole-frame recognition runs, so the detector's queue was
+    /// full and this click's frame was dropped rather than made to wait. A steady
+    /// count here means the detector cannot keep up with how the machine is used.
+    pub overrun      : u64,
     /// The recogniser failed outright.
     pub error        : u64,
 }
@@ -200,7 +209,7 @@ pub fn run(config: &CollectConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         PerceptionConfig {
             models_dir   : config.models_dir.clone(),
             capture_hz   : config.capture_hz,
-            crop_half_px : config.crop_px,
+            luma_half_px : config.luma_px,
             t0           : t0,
         },
         press_rx,
@@ -458,6 +467,14 @@ impl Collector<'_> {
                 Ok(None)
             }
 
+            DetectOutcome::Overrun  => {
+                // Refusing the click is the price of the capture thread never waiting
+                // on the detector; see `perceive::dispatch`.
+                self.tallies.overrun += 1;
+
+                Ok(None)
+            }
+
             DetectOutcome::Failed(e) => {
                 self.tallies.error += 1;
                 warn!("recognition failed: {e}");
@@ -640,9 +657,10 @@ impl Collector<'_> {
 
         println!(
             "status: {} accepted / {} drag / {} no-element / {} no-gaze / {} stale \
-             ({} late-capture, {} off-desk, {} error) — median offset {} over the last {}",
+             ({} late-capture, {} overrun, {} off-desk, {} error) — median offset {} \
+             over the last {}",
             t.accepted, t.drag, t.no_element, t.no_gaze, t.stale,
-            t.late_capture, t.off_desk, t.error, median, self.offsets.len(),
+            t.late_capture, t.overrun, t.off_desk, t.error, median, self.offsets.len(),
         );
     }
 

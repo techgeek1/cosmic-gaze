@@ -54,7 +54,7 @@ chosen box outlined with its kind, size and text, and a cross where the pointer 
 read, so the cross should sit under the real cursor and the outline should be the thing
 you would say you are pointing at. When nothing contains the pointer it outlines the
 nearest box labelled `NEAREST` (a systematic coordinate offset would show as every box
-sitting a fixed distance away), and `NOTHING` when the crop had no boxes. The overlay
+sitting a fixed distance away), and `NOTHING` when the frame had no boxes. The overlay
 blanks for 60 ms before each capture so its own outline is never what gets recognised —
 the once-a-second blink is that.
 
@@ -77,10 +77,47 @@ capture, one frame per second by default (`--capture-hz`), is the fallback for a
 capture that stalled, and it is never used if it is more than 500 ms old or was taken
 after the release.
 
-Recognition runs on a crop of ±256 logical pixels around the pointer (`--crop-px`), not
-the whole frame: a whole ultrawide frame costs about 400 ms, a crop tens of milliseconds.
-The smallest accepted box containing the pointer wins, because boxes nest and the
-innermost one is what the user aimed at.
+Recognition then runs on the **whole** captured output. The smallest accepted box
+containing the pointer wins, because boxes nest and the innermost one is what the user
+aimed at.
+
+## Why the whole frame
+
+The first version recognised a ±256 px crop around the pointer, on the reasoning that a
+click only lands on something under the pointer and a crop costs tens of milliseconds
+against a whole ultrawide frame's few hundred. It loses the widgets that matter.
+
+Take one capture of DP-2 (Discord plus a browser), detect it whole as the reference,
+then cut a crop out of **those same pixels** around each of the twelve largest widgets
+and detect each crop: no drift, no timing, the same detector and settings on both sides.
+The crop's pick agreed with the full frame **0 times out of 12**, at 512 px and again at
+640 px. Every one came back as the widget's own inner OCR text, or as nothing.
+
+What is lost is the wide flat widgets: Discord's channel and member rows (~290x45), the
+browser's URL bar (`Input 636x35`), a link. Small square things (server icons, toolbar
+buttons) survive cropping fine, which is why the crop version looked like it worked. The
+failure is not resolution, it is **context** — the widget model needs the surrounding
+layout to tell a list row from a run of text with padding. Symptomatically it is "it's
+just locking onto the text and icons".
+
+Reproduce it with the example:
+
+```sh
+cargo run --bin gaze-capture-cli -- --out shots
+cargo run --bin gaze-detect-cli -- shots/DP-2-0.png --json shots/DP-2.json
+cargo run --release --example recognition_check -- shots/DP-2.json DP-2 0 160
+```
+
+The origin (`0 160` here) is the output's logical top-left from `gaze-capture-cli`'s
+listing. Produce the reference **without** `--origin`: `gaze-detect-cli` bakes whatever
+origin it is given into the boxes, so passing it on both sides offsets every check point
+by the output's position. Expect full agreement, or one or two misses where the screen
+changed between the reference and the check — run it straight after the capture, and
+judge the misses rather than the count. Two captures a second apart already disagree on
+about one widget in thirty on a working desktop.
+
+`--luma-px` (default 256) is now only the window the screen luminance is averaged over
+for `crop_luma`, the pupil covariate. It has no effect on recognition.
 
 ## The rejection rules
 
@@ -93,9 +130,18 @@ In the order they apply:
 | `stale` | no press capture within 150 ms and no rolling frame from the last 500 ms. |
 | `no-element` | a frame, but nothing recognisable under the pointer. **This is the important one**: a click on empty space to focus a window says nothing about where you were looking, and it is the most common press on a desktop. |
 | `no-gaze` | fewer than 20% of the frames in the 600 ms before the press carried a valid combined gaze. A blink over the approach is not a label. |
+| `overrun` | clicked faster than whole-frame recognition runs, so the detector already had three frames queued and this one was dropped rather than made to wait. |
 
 `late-capture` is not a rejection: it counts accepted clicks that fell back to a rolling
 frame, and a rising count means the compositor is struggling.
+
+`overrun` exists because of how the threads are split. A whole-frame detection takes 250
+to 400 ms and a press capture has to happen within tens of milliseconds of the press, so
+the capture thread (pointer, `Capture`, frame choice) never waits on the detect thread
+(the models): it hands a chosen frame over with a non-blocking send onto a queue three
+deep and refuses the click if that queue is full. A double click's second press is
+captured while the first is still being recognised. A steady `overrun` count means the
+detector cannot keep up with how the machine is used; an occasional one is a burst.
 
 `Icon` and `Slider` are accepted but recorded as themselves, so the export can filter
 them out: an icon's centre is not always where the eye goes and a slider is dragged as
@@ -111,7 +157,7 @@ a fact about eyes worth having in the data rather than one to average away.
 Every ten seconds:
 
 ```
-status: 34 accepted / 7 drag / 12 no-element / 3 no-gaze / 1 stale (2 late-capture, 0 off-desk, 0 error) — median offset 0.83 deg over the last 20
+status: 34 accepted / 7 drag / 12 no-element / 3 no-gaze / 1 stale (2 late-capture, 0 overrun, 0 off-desk, 0 error) — median offset 0.83 deg over the last 20
 ```
 
 The **median offset** is the daily "is the model drifting" number. For every accepted
@@ -150,7 +196,7 @@ is only one of the three panels a click can land on.
 
 ## Memory
 
-The perception thread holds up to two rolling frames per visited output plus three press
-captures. On this desk (3840x1600 + 2560x1440 + 1920x1200) that is roughly 170 MB
-resident in the worst case. Frames are dropped as soon as a click has been recognised
-from them.
+The capture thread holds up to two rolling frames per visited output plus three press
+captures, and the detect queue holds up to three more. On this desk (3840x1600 +
+2560x1440 + 1920x1200) that is roughly 250 MB resident in the worst case. Frames are
+dropped as soon as a click has been recognised from them.
