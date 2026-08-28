@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use gaze_clicks::collect::{self, CollectConfig};
-use gaze_clicks::element::smallest_containing;
+use gaze_clicks::element::{Pick, is_accepted, pick};
 use gaze_clicks::mouse;
 use gaze_clicks::perceive::{DetectOutcome, DetectRequest, Perception, PerceptionConfig};
 use gaze_core::{Element, GlobalPx, Rect};
@@ -85,7 +85,7 @@ enum Command {
         capture_hz  : f64,
 
         /// Half-width of the window the screen luminance is averaged over, logical
-        /// pixels. Recognition runs on the whole captured output.
+        /// pixels. Recognition is pointer-local; this is only the pupil covariate.
         #[arg(long, default_value_t = 256.0)]
         luma_px     : f64,
     },
@@ -97,10 +97,10 @@ enum Command {
         mouse_name : String,
     },
 
-    /// Show what the recogniser sees under the pointer, once a second, until
-    /// interrupted: the chosen box is outlined on screen with its kind and text, and a
-    /// cross marks where the pointer was read. Nothing containing the pointer outlines
-    /// the nearest box instead, labelled NEAREST.
+    /// Show what the recogniser sees under the pointer, continuously, until
+    /// interrupted: the chosen box is outlined on screen with its kind, size, score,
+    /// text and the round trip's latency, and a cross marks where the pointer was read.
+    /// Nothing containing the pointer outlines the nearest accepted box instead.
     Probe {
         /// Directory holding the ONNX models.
         #[arg(long, default_value = "models")]
@@ -110,8 +110,12 @@ enum Command {
         #[arg(long)]
         seconds : Option<f64>,
 
+        /// How often to look, hertz.
+        #[arg(long, default_value_t = 1.0 / PROBE_PERIOD.as_secs_f64())]
+        hz      : f64,
+
         /// Half-width of the window the screen luminance is averaged over, logical
-        /// pixels. Recognition runs on the whole captured output.
+        /// pixels. Recognition is pointer-local; this is only the pupil covariate.
         #[arg(long, default_value_t = 256.0)]
         luma_px : f64,
     },
@@ -155,13 +159,17 @@ fn main() -> Result<()> {
             luma_px     : luma_px,
         }),
 
-        Command::Devices { mouse_name }           => devices(&mouse_name),
-        Command::Probe { models, seconds, luma_px } => probe(models, seconds, luma_px),
+        Command::Devices { mouse_name }                 => devices(&mouse_name),
+        Command::Probe { models, seconds, hz, luma_px } => probe(models, seconds, hz, luma_px),
     }
 }
 
-/// How often the probe looks, wall clock.
-const PROBE_PERIOD: Duration = Duration::from_millis(1000);
+/// How often the probe looks, wall clock, unless `--hz` says otherwise.
+///
+/// Pointer-local recognition runs in well under this, so four times a second keeps up and
+/// the outline follows the pointer closely enough to read as live rather than as a series
+/// of stills. The whole-frame version could not have gone faster than about twice this.
+const PROBE_PERIOD: Duration = Duration::from_millis(250);
 
 /// How long the probe leaves the overlay blank before capturing, so the frame it
 /// recognises is the desktop and not its own last outline. Two or three refresh
@@ -196,9 +204,9 @@ fn run(config: CollectConfig) -> Result<()> {
         if outcome.files == 1 { "" } else { "s" },
     );
     println!(
-        "accepted {} / drag {} / no-element {} / no-gaze {} / stale {} \
+        "accepted {} / drag {} / no-element {} / blank {} / no-gaze {} / stale {} \
          (late-capture {}, overrun {}, off-desk {}, error {})",
-        t.accepted, t.drag, t.no_element, t.no_gaze, t.stale,
+        t.accepted, t.drag, t.no_element, t.blank, t.no_gaze, t.stale,
         t.late_capture, t.overrun, t.off_desk, t.error,
     );
 
@@ -246,9 +254,18 @@ fn devices(mouse_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Prints what the recogniser sees under the pointer, once a second.
-fn probe(models: PathBuf, seconds: Option<f64>, luma_px: f64) -> Result<()> {
-    let t0 = Instant::now();
+/// Prints and draws what the recogniser sees under the pointer, continuously.
+///
+/// Everything here goes through the collector's own path: `Perception` builds its
+/// detector from `element::collector_config`, so the score and size gates are the ones a
+/// click gets, and the label comes from `element::pick`, so the flat check is too. What
+/// the probe outlines is what a click at that instant would have been written against.
+///
+/// The reported latency is capture-start to overlay-draw, the whole round trip including
+/// the queue, not just the detector's own milliseconds.
+fn probe(models: PathBuf, seconds: Option<f64>, hz: f64, luma_px: f64) -> Result<()> {
+    let t0     = Instant::now();
+    let period = Duration::from_secs_f64(1.0 / hz.max(0.05)).max(PROBE_BLANK);
 
     // The overlay's own marks are on the captured screen, and a stroked box is exactly
     // what the widget model calls a button. Every tick therefore blanks the overlay,
@@ -277,7 +294,7 @@ fn probe(models: PathBuf, seconds: Option<f64>, luma_px: f64) -> Result<()> {
     let mut id = 0u64;
 
     while deadline.is_none_or(|d| Instant::now() < d) && !stop.load(Ordering::Relaxed) {
-        std::thread::sleep(PROBE_PERIOD - PROBE_BLANK);
+        std::thread::sleep(period - PROBE_BLANK);
 
         overlay.set(OverlayState::default()).context("the overlay thread exited")?;
         std::thread::sleep(PROBE_BLANK);
@@ -287,6 +304,10 @@ fn probe(models: PathBuf, seconds: Option<f64>, luma_px: f64) -> Result<()> {
 
             continue;
         };
+
+        // The latency the caption reports starts here, with the capture request, and
+        // ends when the overlay is asked to draw the answer.
+        let started = Instant::now();
 
         press_tx.send(id).context("the perception thread stopped")?;
 
@@ -309,59 +330,78 @@ fn probe(models: PathBuf, seconds: Option<f64>, luma_px: f64) -> Result<()> {
         let reply = perception.replies().recv_timeout(Duration::from_secs(5))
             .context("the recogniser did not answer")?;
 
-        let (line, shown) = {
+        // `body` is the caption without its latency, `note` the extra detail only
+        // stdout gets, and `highlight` the box drawn on screen.
+        let (body, note, highlight): (String, String, Option<Rect>) = {
             match reply.outcome {
-                DetectOutcome::Found { elements, crop_luma, choice } => {
-                    // The nearest box when nothing contains the pointer: a systematic
-                    // offset between what the recogniser reports and what is on screen
-                    // shows up here as every box sitting a fixed distance away.
-                    let (hit, shown) = {
-                        match smallest_containing(&elements, sample.global) {
-                            Some(e) => (describe(e), Some((e.bbox, caption("", e)))),
-                            None    => {
-                                match nearest(&elements, sample.global) {
-                                    Some(e) => (
-                                        format!("nothing under the pointer; nearest is {}",
-                                                describe(e)),
-                                        Some((e.bbox, caption("NEAREST ", e))),
-                                    ),
-                                    None => ("nothing on the frame".to_string(), None),
-                                }
+                DetectOutcome::Found { elements, crop_luma, pointer_sd, detect_ms, choice } => {
+                    let seen = format!(
+                        "{} boxes, luma {crop_luma:.2}, sd {pointer_sd:.3}, \
+                         detect {detect_ms:.0} ms, {choice:?}",
+                        elements.len(),
+                    );
+
+                    match pick(&elements, sample.global, pointer_sd) {
+                        Pick::Element(e) => (caption(e), format!("{seen} — {}", describe(e)),
+                                             Some(e.bbox)),
+
+                        Pick::Blank      => (
+                            "BLANK".to_string(),
+                            format!("{seen} — a box contains the pointer but the pixels \
+                                     there are flat"),
+                            None,
+                        ),
+
+                        // The nearest box when nothing contains the pointer: a systematic
+                        // offset between what the recogniser reports and what is on
+                        // screen shows up here as every box sitting a fixed distance
+                        // away. The caption still says NOTHING, because that is the
+                        // verdict; the outline is the diagnosis.
+                        Pick::Nothing    => {
+                            match nearest_accepted(&elements, sample.global) {
+                                Some(e) => (
+                                    "NOTHING".to_string(),
+                                    format!("{seen} — nothing under the pointer; nearest \
+                                             is {}", describe(e)),
+                                    Some(e.bbox),
+                                ),
+                                None    => ("NOTHING".to_string(),
+                                            format!("{seen} — nothing on the frame"), None),
                             }
                         }
-                    };
-
-                    (format!("{} boxes, luma {crop_luma:.2}, {choice:?} — {hit}",
-                             elements.len()), shown)
+                    }
                 }
-                DetectOutcome::Stale     => ("no usable frame".to_string(), None),
+
+                DetectOutcome::Stale     => {
+                    ("STALE".to_string(), "no usable frame".to_string(), None)
+                }
                 DetectOutcome::OffFrame  => {
-                    ("the pointer left the captured output".to_string(), None)
+                    ("OFF-FRAME".to_string(),
+                     "the pointer left the captured output".to_string(), None)
                 }
                 DetectOutcome::Overrun   => {
-                    ("the detector is still busy with earlier frames".to_string(), None)
+                    ("OVERRUN".to_string(),
+                     "the detector is still busy with earlier frames".to_string(), None)
                 }
-                DetectOutcome::Failed(e) => (format!("recognition failed: {e}"), None),
+                DetectOutcome::Failed(e) => {
+                    ("FAILED".to_string(), format!("recognition failed: {e}"), None)
+                }
             }
         };
 
-        println!("{} ({:.0}, {:.0}): {}",
-                 sample.output, sample.global.x, sample.global.y, line);
+        let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let label      = format!("{body} {latency_ms:.0} ms");
+
+        println!("{} ({:.0}, {:.0}): {label} [{note}]",
+                 sample.output, sample.global.x, sample.global.y);
 
         // The cross is where the pointer was read, so a coordinate error in the cursor
         // path shows as the cross sitting away from the real cursor.
-        let (highlight, label): (Option<Rect>, Option<String>) = {
-            match shown {
-                Some((bbox, label)) => (Some(bbox), Some(label)),
-                None                => (None, Some("NOTHING".to_string())),
-            }
-        };
-
         overlay.set(OverlayState {
             gaze       : None,
             highlight  : highlight,
             truth      : Some(sample.global),
-            label      : label,
+            label      : Some(label),
             background : None,
         })
         .context("the overlay thread exited")?;
@@ -374,16 +414,16 @@ fn probe(models: PathBuf, seconds: Option<f64>, luma_px: f64) -> Result<()> {
     Ok(())
 }
 
-/// The overlay caption for a box: prefix, kind, size and any text, ASCII only and
-/// short enough to read at a glance.
-fn caption(prefix: &str, e: &Element) -> String {
+/// The overlay caption for a box: kind, size, score and any text, ASCII only and short
+/// enough to read at a glance. The caller appends the latency.
+fn caption(e: &Element) -> String {
     let text = e.text.as_deref()
         .map(|t| t.trim().chars().take(24).collect::<String>())
         .filter(|t| !t.is_empty())
         .map(|t| format!(" \"{t}\""))
         .unwrap_or_default();
 
-    format!("{prefix}{:?} {:.0}x{:.0}{text}", e.kind, e.bbox.w, e.bbox.h)
+    format!("{:?} {:.0}x{:.0} s={:.2}{text}", e.kind, e.bbox.w, e.bbox.h, e.score)
 }
 
 // --- Reporting ---
@@ -397,9 +437,12 @@ fn describe(e: &Element) -> String {
     )
 }
 
-/// The box whose centre is closest to `p`, for when nothing contains it.
-fn nearest(elements: &[Element], p: GlobalPx) -> Option<&Element> {
-    elements.iter().min_by(|a, b| {
+/// The accepted box whose centre is closest to `p`, for when nothing contains it.
+///
+/// Filtered by [`is_accepted`] so the outline is a box a click could have been labelled
+/// with, rather than an unclassified panel that would never have won anyway.
+fn nearest_accepted(elements: &[Element], p: GlobalPx) -> Option<&Element> {
+    elements.iter().filter(|e| is_accepted(e.kind)).min_by(|a, b| {
         let d = |e: &Element| {
             let c = e.bbox.center();
 

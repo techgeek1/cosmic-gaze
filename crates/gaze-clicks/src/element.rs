@@ -1,22 +1,81 @@
-//! Picking the element that was clicked, and the window the pupil covariate is
-//! measured over.
+//! Picking the element that was clicked, the gates it has to clear, and the two
+//! windows measured around the pointer.
 //!
-//! Recognition itself runs on the **whole** captured output, not on a crop around the
-//! pointer: a crop loses wide flat widgets because the widget model needs the
-//! surrounding layout to see them at all (the measurement is in [`crate::perceive`]).
-//! The square around the pointer survives only as the window
-//! [`mean_luma`] averages, which is the screen-brightness covariate a passive session
-//! gets in place of a driven background.
+//! Recognition is pointer-local but not a crop: `Detector::detect_near` runs the widget
+//! tiles of the *full* plan that contain the pointer, so a wide flat list row keeps the
+//! surrounding layout the model needs to see it at all, and runs the text model at
+//! native resolution over a square window, where line-level boxes come back instead of
+//! the paragraph blobs a 3840 px frame shrunk to 1600 produces. [`crate::perceive`]
+//! carries the history of the crop that did fail.
 //!
-//! Element choice is [`smallest_containing`] over the full-frame list. Boxes come back
-//! from the detector in global logical pixels, like everything else in the workspace.
+//! Three gates sit on top of the detector's own output, and they exist because a
+//! collector wants a *click target*, not a snap candidate:
+//!
+//! - [`WIDGET_MIN_SCORE`], the confidence bar, higher than the snap default.
+//! - [`MAX_WIDGET_W_PX`] and [`MAX_WIDGET_H_PX`], the size bar.
+//! - the flat check in [`pick`], which refuses a large box whose pixels under the
+//!   pointer carry no detail.
+//!
+//! Boxes come back from the detector in global logical pixels, like everything else in
+//! the workspace. Both the collector and the probe go through [`pick`], so the thing the
+//! probe draws on screen is the thing a click would have been labelled with.
 
 use gaze_core::{Element, ElementKind, GlobalPx, Rect};
+use gaze_detect::DetectConfig;
 
 /// Half-width of the luminance window taken around the pointer, logical pixels. Wide
 /// enough to average over the panel or page the click landed in rather than the widget
 /// itself, which is the light the pupil is actually responding to.
 pub const LUMA_HALF_PX: f64 = 256.0;
+
+/// The collector's accept bar for a widget box.
+///
+/// `DetectConfig`'s own default is 0.25, tuned for snap *recall*: a snap engine ranks
+/// its candidates and a weak box that turns out to be real is worth having. A collector
+/// writes one label per click and a wrong one is training data pointing at the wrong
+/// place, so it wants precision instead. On the two reference captures every widget box
+/// scoring under 0.5 sat over styled prose (inline-code chips, timestamps, headings)
+/// rather than over a control, and every real control scored above it.
+pub const WIDGET_MIN_SCORE: f32 = 0.5;
+
+/// Widest a widget box may be to count as a click target, frame pixels.
+///
+/// A "control" a third of an ultrawide across is a pane, a paragraph or a whole window,
+/// and the model does emit those. Dropping them before fusion also stops them swallowing
+/// the text lines inside them, which is why the limit lives in the detector rather than
+/// here (see `gaze_detect::drop_oversized`).
+pub const MAX_WIDGET_W_PX: f64 = 1200.0;
+
+/// Tallest a widget box may be to count as a click target, frame pixels. Buttons, rows,
+/// inputs and links are all short; anything taller is a container.
+pub const MAX_WIDGET_H_PX: f64 = 240.0;
+
+/// Side of the native-resolution text window read around the pointer, frame pixels.
+/// 640 costs about 62 ms and returns line-level boxes, median height around 20 px.
+pub const OCR_PX: u32 = 640;
+
+/// Half-width of the flatness window taken around the pointer, logical pixels.
+///
+/// Logical rather than buffer pixels so the window means the same thing on the scale-2
+/// panel as on the unscaled ones, the same convention [`LUMA_HALF_PX`] uses. Small enough
+/// to be about the pixels *under* the pointer rather than about the region around it.
+pub const FLAT_HALF_PX: u32 = 24;
+
+/// Luma standard deviation below which the pixels under the pointer carry no detail.
+///
+/// A window this small over any real control catches an edge, a glyph or a border and
+/// lands well above it; a flat panel body, a blank document or a desktop background sits
+/// at or near zero.
+pub const FLAT_LUMA_SD: f64 = 0.02;
+
+/// Box height in logical pixels above which the flat check applies.
+///
+/// Small boxes skip it deliberately. A confident small button can genuinely be flat where
+/// the pointer landed, because its body is a couple of dozen pixels from its label and
+/// the label is a perfectly good gaze target either way. A *large* flat region under the
+/// pointer says the opposite: whatever the model called a control, the user cannot have
+/// been aiming at a feature of it, because there is no feature within the window.
+pub const FLAT_CHECK_MIN_H_PX: f64 = 60.0;
 
 /// A square of a captured frame, in the frame's buffer pixels, with the global
 /// coordinates that place it on the desktop.
@@ -130,18 +189,57 @@ pub fn mean_luma(rgba: &[u8]) -> f64 {
         return f64::NAN;
     }
 
-    let pixels = rgba.len() / 4;
+    let pixels  = rgba.len() / 4;
     let mut sum = 0.0;
 
     for i in 0..pixels {
-        let p = i * 4;
-
-        sum += 0.2126 * f64::from(rgba[p])
-             + 0.7152 * f64::from(rgba[p + 1])
-             + 0.0722 * f64::from(rgba[p + 2]);
+        sum += luma_at(rgba, i);
     }
 
-    sum / (pixels as f64 * 255.0)
+    sum / pixels as f64
+}
+
+/// Population standard deviation of the per-pixel luminance of an RGBA buffer, in [0, 1].
+///
+/// The same luma as [`mean_luma`], so the two are always talking about the same quantity.
+/// Population rather than sample because the buffer is the whole window, not a draw from
+/// something larger. NaN for an empty buffer, which is what a caller gets when the crop
+/// and the frame disagree.
+///
+/// This is the "is there anything under the pointer" measure. A flat region gives zero
+/// whatever its brightness, so it separates a blank panel from a control without caring
+/// about the theme.
+pub fn luma_sd(rgba: &[u8]) -> f64 {
+    if rgba.len() < 4 {
+        return f64::NAN;
+    }
+
+    let pixels = rgba.len() / 4;
+    let mean   = mean_luma(rgba);
+
+    let mut sum = 0.0;
+
+    for i in 0..pixels {
+        let d = luma_at(rgba, i) - mean;
+
+        sum += d * d;
+    }
+
+    (sum / pixels as f64).sqrt()
+}
+
+/// Relative luminance of pixel `i` of an RGBA buffer, in [0, 1].
+///
+/// Rec. 709 weights over the raw sRGB bytes; see [`mean_luma`] for why they are not
+/// linearised first.
+#[inline]
+fn luma_at(rgba: &[u8], i: usize) -> f64 {
+    let p = i * 4;
+
+    (0.2126 * f64::from(rgba[p])
+        + 0.7152 * f64::from(rgba[p + 1])
+        + 0.0722 * f64::from(rgba[p + 2]))
+        / 255.0
 }
 
 // --- Elements ---
@@ -191,6 +289,62 @@ pub fn smallest_containing(elements: &[Element], p: GlobalPx) -> Option<&Element
         .iter()
         .filter(|e| is_accepted(e.kind) && e.bbox.contains(p))
         .min_by(|a, b| (a.bbox.w * a.bbox.h).total_cmp(&(b.bbox.w * b.bbox.h)))
+}
+
+// --- Picking ---
+
+/// What was under the pointer, once every gate has been applied.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pick<'a> {
+    /// A box worth labelling a click with.
+    Element(&'a Element),
+    /// A box contained the pointer, but the pixels there are flat, so the model claimed
+    /// a control over what is really empty space. Rejected for the same reason
+    /// [`Pick::Nothing`] is: a click on nothing says nothing about where the eye was.
+    Blank,
+    /// No accepted box contains the pointer.
+    Nothing,
+}
+
+/// The element a click at `p` should be labelled with, or why there is none.
+///
+/// `pointer_sd` is [`luma_sd`] over a [`FLAT_HALF_PX`] window around the pointer, taken
+/// from the same frame the elements came from. NaN (no window, or a buffer that did not
+/// match) never triggers [`Pick::Blank`]: an unmeasurable window is not evidence of
+/// flatness.
+///
+/// The flat check only applies to boxes taller than [`FLAT_CHECK_MIN_H_PX`]. See that
+/// constant for why small boxes are exempt.
+///
+/// Both the collector and the probe call this, so the box the probe outlines on screen is
+/// exactly the one a click there would have been written against.
+pub fn pick<'a>(elements: &'a [Element], p: GlobalPx, pointer_sd: f64) -> Pick<'a> {
+    let Some(element) = smallest_containing(elements, p) else {
+        return Pick::Nothing;
+    };
+
+    if element.bbox.h > FLAT_CHECK_MIN_H_PX && pointer_sd < FLAT_LUMA_SD {
+        return Pick::Blank;
+    }
+
+    Pick::Element(element)
+}
+
+// --- Detector settings ---
+
+/// The detector settings the collector and the probe both run under.
+///
+/// One function rather than two literals so the probe cannot drift from the collector and
+/// start showing boxes a click would have refused. The three departures from
+/// `DetectConfig::default()` are the collector's gates: a higher confidence bar and the
+/// two size limits. Everything else, tiling included, stays at the tuned defaults.
+pub fn collector_config() -> DetectConfig {
+    DetectConfig {
+        widget_conf  : WIDGET_MIN_SCORE,
+        max_widget_w : MAX_WIDGET_W_PX,
+        max_widget_h : MAX_WIDGET_H_PX,
+        ..DetectConfig::default()
+    }
 }
 
 // --- Tests ---
@@ -327,6 +481,92 @@ mod tests {
             .expect("the link contains it");
 
         assert_eq!(hit.id, 1);
+    }
+
+    #[test]
+    fn luma_sd_separates_a_flat_window_from_a_busy_one() {
+        // Flat mid grey: no detail at all, whatever the brightness.
+        let flat = vec![128u8; 32 * 32 * 4];
+
+        assert!(luma_sd(&flat) < 1e-12, "{}", luma_sd(&flat));
+        assert!(luma_sd(&vec![0u8; 32 * 32 * 4]) < 1e-12);
+
+        // A one pixel checkerboard is the busiest a window gets: half at 0, half at 1,
+        // so the population sd is exactly 0.5.
+        let mut checker = vec![0u8; 32 * 32 * 4];
+
+        for i in 0..32 * 32 {
+            if (i / 32 + i % 32) % 2 == 0 {
+                checker[i * 4..i * 4 + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+
+        assert!((luma_sd(&checker) - 0.5).abs() < 1e-9, "{}", luma_sd(&checker));
+        assert!(luma_sd(&checker) > FLAT_LUMA_SD);
+
+        // An empty buffer is unmeasurable rather than flat.
+        assert!(luma_sd(&[]).is_nan());
+        assert!(luma_sd(&[1, 2, 3]).is_nan());
+    }
+
+    #[test]
+    fn pick_returns_the_element_the_click_lands_on() {
+        let elements = vec![
+            element(0, ElementKind::Text  , (  0.0,   0.0, 800.0, 600.0)),
+            element(1, ElementKind::Button, (100.0, 100.0, 200.0,  40.0)),
+        ];
+
+        let hit = pick(&elements, GlobalPx { x: 150.0, y: 110.0 }, 0.3);
+
+        assert_eq!(hit, Pick::Element(&elements[1]));
+    }
+
+    #[test]
+    fn pick_reports_nothing_when_no_box_contains_the_point() {
+        let elements = vec![element(0, ElementKind::Button, (100.0, 100.0, 20.0, 20.0))];
+
+        assert_eq!(pick(&elements, GlobalPx { x: 500.0, y: 500.0 }, 0.3), Pick::Nothing);
+        assert_eq!(pick(&[], GlobalPx { x: 0.0, y: 0.0 }, 0.3), Pick::Nothing);
+    }
+
+    #[test]
+    fn pick_reports_blank_for_a_large_box_over_flat_pixels() {
+        // 600 px tall, well past the flat check's floor.
+        let elements = vec![element(0, ElementKind::Text, (0.0, 0.0, 800.0, 600.0))];
+        let p        = GlobalPx { x: 400.0, y: 300.0 };
+
+        assert_eq!(pick(&elements, p, 0.001), Pick::Blank);
+
+        // Detail under the pointer makes the same box a real target.
+        assert_eq!(pick(&elements, p, 0.15), Pick::Element(&elements[0]));
+
+        // An unmeasurable window is not evidence of flatness.
+        assert_eq!(pick(&elements, p, f64::NAN), Pick::Element(&elements[0]));
+    }
+
+    #[test]
+    fn a_small_box_over_flat_pixels_is_still_a_target() {
+        // A 30 px tall button under the flat check's floor: its body being flat where the
+        // pointer landed says nothing, because its label is a few pixels away.
+        let elements = vec![element(0, ElementKind::Button, (100.0, 100.0, 90.0, 30.0))];
+
+        assert_eq!(pick(&elements, GlobalPx { x: 140.0, y: 115.0 }, 0.0), Pick::Element(&elements[0]));
+    }
+
+    #[test]
+    fn the_collector_config_carries_all_three_gates() {
+        let config = collector_config();
+
+        assert_eq!(config.widget_conf , WIDGET_MIN_SCORE);
+        assert_eq!(config.max_widget_w, MAX_WIDGET_W_PX);
+        assert_eq!(config.max_widget_h, MAX_WIDGET_H_PX);
+
+        // Everything else stays at the tuned detector defaults.
+        let default = gaze_detect::DetectConfig::default();
+
+        assert_eq!(config.tile_px     , default.tile_px);
+        assert_eq!(config.tile_overlap, default.tile_overlap);
+        assert_eq!(config.threads     , default.threads);
     }
 
     #[test]

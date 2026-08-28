@@ -165,6 +165,60 @@ impl ResizePlan {
     }
 }
 
+// --- Local OCR window ---
+
+/// A whole-pixel rectangle of a frame: the window one pointer-local text pass reads.
+///
+/// Whole pixels because the window is copied out of the RGBA buffer row by row, and a
+/// fractional edge would mean resampling a crop whose whole point is to stay native.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OcrWindow {
+    /// Left edge in frame pixels.
+    pub x : u32,
+    /// Top edge in frame pixels.
+    pub y : u32,
+    /// Width in frame pixels, at most `side`.
+    pub w : u32,
+    /// Height in frame pixels, at most `side`.
+    pub h : u32,
+}
+
+/// The `side` x `side` window of a `w` x `h` frame centred on the frame pixel `(fx, fy)`,
+/// clamped to the frame.
+///
+/// The window shrinks at an edge rather than sliding back or padding. Sliding back would
+/// move the pointer off the centre for no gain (the model is fully convolutional, so a
+/// smaller input costs less and sees the same pixels at the same scale), and padding would
+/// feed DBNet a border it can read as text. A frame smaller than `side` on an axis uses
+/// that whole axis, which is also what `side` of zero means.
+pub fn ocr_window(w: u32, h: u32, fx: f64, fy: f64, side: u32) -> OcrWindow {
+    let (x, ww) = window_axis(w, fx, side);
+    let (y, hh) = window_axis(h, fy, side);
+
+    OcrWindow {
+        x : x,
+        y : y,
+        w : ww,
+        h : hh,
+    }
+}
+
+/// One axis of [`ocr_window`]: the start and length of a `side` long span centred on `at`
+/// and clipped to `[0, extent)`.
+fn window_axis(extent: u32, at: f64, side: u32) -> (u32, u32) {
+    if side == 0 || side >= extent {
+        return (0, extent);
+    }
+
+    // The pixel the point falls in, clamped so an out-of-range centre still yields a
+    // window at the corresponding edge rather than an empty one.
+    let centre = at.floor().clamp(0.0, f64::from(extent - 1)) as u32;
+    let start  = centre.saturating_sub(side / 2);
+    let end    = (start + side).min(extent);
+
+    (start, end - start)
+}
+
 // --- Preprocessing ---
 
 /// Renders the frame into the normalised CHW input plane, padding right and bottom.
@@ -376,7 +430,62 @@ fn push_if_text(prob: &[f32], seen: &mut [bool], stack: &mut Vec<u32>, idx: usiz
 mod tests {
     use gaze_core::{ElementKind, ElementSource};
 
-    use super::{ALIGN, ResizePlan, TextConfig, boxes_from_map, components};
+    use super::{ALIGN, OcrWindow, ResizePlan, TextConfig, boxes_from_map, components, ocr_window};
+
+    /// The centred case: a full square window with the point in the middle.
+    #[test]
+    fn a_window_well_inside_the_frame_is_a_full_square() {
+        let win = ocr_window(3840, 1600, 1920.0, 800.0, 640);
+
+        assert_eq!(win, OcrWindow { x: 1600, y: 480, w: 640, h: 640 });
+    }
+
+    /// At an edge the window shrinks rather than sliding back or padding, so the pointer
+    /// stays at the centre of what the model reads on the free axis.
+    #[test]
+    fn a_window_at_an_edge_shrinks_instead_of_sliding() {
+        // Left and top: the window starts at zero and keeps its half beyond the point.
+        let win = ocr_window(3840, 1600, 10.0, 5.0, 640);
+
+        assert_eq!(win, OcrWindow { x: 0, y: 0, w: 640, h: 640 });
+
+        // Right and bottom: only the half before the point fits.
+        let win = ocr_window(3840, 1600, 3839.0, 1599.0, 640);
+
+        assert_eq!(win, OcrWindow { x: 3519, y: 1279, w: 321, h: 321 });
+
+        // Half a window in from the right edge is the last full square.
+        let win = ocr_window(3840, 1600, 3840.0 - 320.0, 800.0, 640);
+
+        assert_eq!((win.x, win.w), (3200, 640));
+    }
+
+    /// A frame smaller than the window on an axis uses that whole axis, and so does a
+    /// `side` of zero.
+    #[test]
+    fn a_frame_smaller_than_the_window_uses_the_whole_axis() {
+        let win = ocr_window(400, 1600, 200.0, 800.0, 640);
+
+        assert_eq!((win.x, win.w), (0, 400));
+        assert_eq!((win.y, win.h), (480, 640));
+
+        assert_eq!(ocr_window(400, 300, 10.0, 10.0, 640), OcrWindow { x: 0, y: 0, w: 400, h: 300 });
+        assert_eq!(ocr_window(400, 300, 10.0, 10.0, 0)  , OcrWindow { x: 0, y: 0, w: 400, h: 300 });
+    }
+
+    /// Every window is inside the frame and never empty, whatever the centre.
+    #[test]
+    fn every_window_stays_inside_the_frame() {
+        for fx in [-50.0, 0.0, 1.0, 319.0, 320.0, 2000.0, 3839.0, 4000.0] {
+            for fy in [-50.0, 0.0, 1.0, 800.0, 1599.0, 5000.0] {
+                let win = ocr_window(3840, 1600, fx, fy, 640);
+
+                assert!(win.w > 0 && win.h > 0, "empty window at {fx},{fy}");
+                assert!(win.x + win.w <= 3840, "{win:?} runs off the right");
+                assert!(win.y + win.h <= 1600, "{win:?} runs off the bottom");
+            }
+        }
+    }
 
     /// The config the detector defaults to, so the box tests exercise real numbers.
     fn cfg() -> TextConfig {

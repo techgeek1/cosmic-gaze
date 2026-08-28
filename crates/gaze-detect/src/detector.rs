@@ -5,10 +5,10 @@ use std::time::Instant;
 
 use gaze_core::{Element, GlobalPx, Rect};
 
-use crate::detection::{Detection, fuse_text, nms};
+use crate::detection::{Detection, drop_oversized, fuse_text, nms};
 use crate::error::{DetectError, Result};
-use crate::ocr::{TextConfig, TextModel};
-use crate::tile::plan_tiles;
+use crate::ocr::{OcrWindow, TextConfig, TextModel, ocr_window};
+use crate::tile::{plan_tiles, tiles_containing};
 use crate::widget::WidgetModel;
 
 /// File name of the exported TargetFinder widget detector inside the models directory.
@@ -35,6 +35,14 @@ pub struct DetectConfig {
     pub tile_overlap : f64,
     /// Minimum widget confidence to keep.
     pub widget_conf  : f32,
+    /// Widget boxes wider than this in frame pixels are dropped before NMS and fusion.
+    /// Zero means unlimited, which is what the snap engine wants: every box is a snap
+    /// candidate there, however wide. A collector that only cares about click targets sets
+    /// it, because a "control" the width of a pane is a pane.
+    pub max_widget_w : f64,
+    /// Widget boxes taller than this in frame pixels are dropped before NMS and fusion.
+    /// Zero means unlimited, as for [`DetectConfig::max_widget_w`].
+    pub max_widget_h : f64,
     /// IoU above which two widget boxes are the same thing, applied across tiles.
     pub nms_iou      : f64,
     /// Fraction of a text box that must lie inside a widget box for the text to be
@@ -97,6 +105,8 @@ impl Default for DetectConfig {
             tile_px      : 1024,
             tile_overlap : 0.15,
             widget_conf  : 0.25,
+            max_widget_w : 0.0,
+            max_widget_h : 0.0,
             nms_iou      : 0.5,
             text_contain : 0.7,
             ocr_max_side : 1600,
@@ -185,21 +195,131 @@ impl Detector {
         if let Some(model) = &self.text {
             let t0 = Instant::now();
 
-            let cfg = TextConfig {
-                max_side    : self.config.ocr_max_side,
-                map_thresh  : self.config.ocr_map,
-                box_thresh  : self.config.ocr_box,
-                unclip      : self.config.ocr_unclip,
-                min_side_px : 2,
-            };
-
-            texts          = model.detect(rgba, w, h, &cfg)?;
+            texts          = model.detect(rgba, w, h, &self.text_config())?;
             timings.ocr_ms = ms_since(t0);
         }
 
-        // Collapse tile duplicates, then drop text that is really a widget's own label.
+        // Drop oversized widgets, collapse tile duplicates, then drop text that is really
+        // a widget's own label.
         let t0 = Instant::now();
 
+        let widgets = drop_oversized(widgets, self.config.max_widget_w, self.config.max_widget_h);
+        let widgets = nms(widgets, self.config.nms_iou);
+        let texts   = fuse_text(&widgets, texts, self.config.text_contain);
+
+        timings.fuse_ms = ms_since(t0);
+        timings.widgets = widgets.len();
+        timings.texts   = texts.len();
+
+        let elements = to_global(widgets.into_iter().chain(texts), origin, scale);
+
+        timings.total_ms = ms_since(start);
+
+        Ok((elements, timings))
+    }
+
+    /// Detects only what could be under one point, which is all a click needs.
+    ///
+    /// `at` is the point of interest in global logical pixels; everything else means what
+    /// it does on [`Detector::detect_timed`]. Returned boxes are global logical pixels and
+    /// are not restricted to ones containing `at`: the caller does the hit test, because
+    /// the boxes that merely neighbour the point still diagnose a coordinate offset.
+    ///
+    /// Two savings, and they are different in kind.
+    ///
+    /// **Widgets.** The tile plan is exactly the one `detect_timed` builds, and only the
+    /// tiles containing the point are run (see [`tiles_containing`] for why that loses
+    /// nothing that contains the point). So this is *not* the +/-256 px crop the
+    /// `gaze-clicks` README records as failing 0 out of 12. That crop cut new pixels and
+    /// fed them to the model as a whole image, which changed the context a wide flat list
+    /// row is recognised by. Here the model sees the same 1024 px tile at the same scale
+    /// with the same surroundings it would have seen in the full pass; the only difference
+    /// is that tiles which cannot hold the point are skipped. One to four tiles instead of
+    /// ten on the ultrawide.
+    ///
+    /// **Text.** The opposite trade. The full pass shrinks the frame to `ocr_max_side` for
+    /// time, and on a 3840x1600 panel that merges lines into paragraph blobs. Locally
+    /// there is no need: an `ocr_px` square at native resolution costs about 62 ms and
+    /// gives line-level boxes, roughly 20 px tall. Text is the thing that benefits from
+    /// resolution locally, exactly where the widget model needed context globally.
+    ///
+    /// A point outside the frame yields no elements and zeroed timings apart from
+    /// `total_ms`.
+    // The argument list is `detect_timed`'s plus the point and the window it reads.
+    // Packing it into a struct would move the same fields somewhere else, not remove them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn detect_near(
+        &self,
+        rgba   : &[u8],
+        w      : u32,
+        h      : u32,
+        origin : GlobalPx,
+        scale  : f64,
+        at     : GlobalPx,
+        ocr_px : u32,
+    )
+        -> Result<(Vec<Element>, DetectTimings)>
+    {
+        let want = w as usize * h as usize * 4;
+
+        if rgba.len() != want {
+            return Err(DetectError::FrameSize { got: rgba.len(), want: want, w: w, h: h });
+        }
+
+        let mut timings = DetectTimings::default();
+        let start       = Instant::now();
+
+        // The inverse of `to_global`: global = origin + frame / scale, so frame is the
+        // offset from the origin scaled back up into the buffer's physical pixels.
+        let fx = (at.x - origin.x) * scale;
+        let fy = (at.y - origin.y) * scale;
+
+        if fx < 0.0 || fy < 0.0 || fx >= f64::from(w) || fy >= f64::from(h) {
+            timings.total_ms = ms_since(start);
+
+            return Ok((Vec::new(), timings));
+        }
+
+        // Widgets, from the tiles of the full plan that can hold the point.
+        let mut widgets = Vec::new();
+
+        if let Some(model) = &self.widget {
+            let t0    = Instant::now();
+            let plan  = plan_tiles(w, h, self.config.tile_px, self.config.tile_overlap, model.input_px());
+            let tiles = tiles_containing(&plan, fx, fy);
+
+            widgets           = model.detect_tiles(rgba, w, h, &tiles, self.config.widget_conf)?;
+            timings.tiles     = tiles.len();
+            timings.widget_ms = ms_since(t0);
+        }
+
+        // Text, native resolution over a square window centred on the point.
+        let mut texts = Vec::new();
+
+        if let Some(model) = &self.text {
+            let t0     = Instant::now();
+            let window = ocr_window(w, h, fx, fy, ocr_px);
+            let pixels = copy_window(rgba, w, &window);
+
+            let cfg = TextConfig {
+                max_side : 0,
+                ..self.text_config()
+            };
+
+            texts = model.detect(&pixels, window.w, window.h, &cfg)?;
+
+            // The model saw the window as its own image, so its boxes are window-local.
+            for t in &mut texts {
+                t.rect.x += f64::from(window.x);
+                t.rect.y += f64::from(window.y);
+            }
+
+            timings.ocr_ms = ms_since(t0);
+        }
+
+        let t0 = Instant::now();
+
+        let widgets = drop_oversized(widgets, self.config.max_widget_w, self.config.max_widget_h);
         let widgets = nms(widgets, self.config.nms_iou);
         let texts   = fuse_text(&widgets, texts, self.config.text_contain);
 
@@ -217,6 +337,23 @@ impl Detector {
     /// The settings this detector runs with.
     pub fn config(&self) -> &DetectConfig {
         &self.config
+    }
+}
+
+impl Detector {
+    /// The text model's settings, built from the shared config.
+    ///
+    /// Shared by both entry points so a change to one of the DB thresholds cannot apply to
+    /// the full pass and not the local one. `detect_near` overrides `max_side` on top of
+    /// this, because locally there is nothing to save by shrinking.
+    fn text_config(&self) -> TextConfig {
+        TextConfig {
+            max_side    : self.config.ocr_max_side,
+            map_thresh  : self.config.ocr_map,
+            box_thresh  : self.config.ocr_box,
+            unclip      : self.config.ocr_unclip,
+            min_side_px : 2,
+        }
     }
 }
 
@@ -319,6 +456,26 @@ fn to_global(
         .collect()
 }
 
+/// Copies a window out of an RGBA frame into a tightly packed buffer.
+///
+/// The text model wants a contiguous `w * h * 4` image, so the window's rows are gathered
+/// rather than passed as a stride into the frame. `window` is assumed to lie inside the
+/// frame, which [`ocr_window`] guarantees.
+fn copy_window(rgba: &[u8], w: u32, window: &OcrWindow) -> Vec<u8> {
+    let stride = w as usize * 4;
+    let bytes  = window.w as usize * 4;
+
+    let mut out = Vec::with_capacity(bytes * window.h as usize);
+
+    for y in window.y..window.y + window.h {
+        let row = y as usize * stride + window.x as usize * 4;
+
+        out.extend_from_slice(&rgba[row..row + bytes]);
+    }
+
+    out
+}
+
 /// Milliseconds elapsed since `t`.
 fn ms_since(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
@@ -330,8 +487,9 @@ fn ms_since(t: Instant) -> f64 {
 mod tests {
     use gaze_core::{ElementKind, ElementSource, GlobalPx, Rect};
 
-    use super::to_global;
+    use super::{copy_window, to_global};
     use crate::detection::Detection;
+    use crate::ocr::OcrWindow;
 
     /// Builds a frame-space detection.
     fn det(x: f64, y: f64, w: f64, h: f64) -> Detection {
@@ -372,6 +530,40 @@ mod tests {
         let out  = to_global(dets.into_iter(), GlobalPx { x: 0.0, y: 0.0 }, 1.0);
 
         assert_eq!(out.iter().map(|e| e.id).collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
+    /// The frame-pixel conversion `detect_near` does must be the exact inverse of
+    /// `to_global`, or every local pass looks in the wrong place. Checked here by round
+    /// tripping a box corner rather than by duplicating the arithmetic.
+    #[test]
+    fn frame_to_global_round_trips_through_both_scales() {
+        for (origin, scale) in [
+            (GlobalPx { x: 2559.0, y: 0.0 }   , 1.0),
+            (GlobalPx { x: 1506.0, y: 1600.0 }, 2.0),
+        ] {
+            let out = to_global(vec![det(640.0, 480.0, 1.0, 1.0)].into_iter(), origin, scale);
+            let at  = GlobalPx { x: out[0].bbox.x, y: out[0].bbox.y };
+
+            assert_eq!(((at.x - origin.x) * scale, (at.y - origin.y) * scale), (640.0, 480.0));
+        }
+    }
+
+    /// The window copy takes exactly the requested rectangle, packed.
+    #[test]
+    fn a_window_is_copied_out_row_by_row() {
+        // A 4x3 frame whose red channel is `y * 4 + x`, so a copy is identifiable.
+        let mut rgba = vec![0_u8; 4 * 3 * 4];
+
+        for y in 0..3_u32 {
+            for x in 0..4_u32 {
+                rgba[(y * 4 + x) as usize * 4] = (y * 4 + x) as u8;
+            }
+        }
+
+        let out = copy_window(&rgba, 4, &OcrWindow { x: 1, y: 1, w: 2, h: 2 });
+
+        assert_eq!(out.len(), 2 * 2 * 4);
+        assert_eq!([out[0], out[4], out[8], out[12]], [5, 6, 9, 10]);
     }
 
     /// Kind, source and score pass through untouched, and text stays empty because the

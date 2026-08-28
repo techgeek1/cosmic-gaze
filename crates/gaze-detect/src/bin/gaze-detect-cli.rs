@@ -5,6 +5,10 @@
 //! gaze-detect-cli screenshots/DP-1-0.png --origin 2559,0 --scale 1 \
 //!     --json out.json --overlay out.png --bench 5
 //! ```
+//!
+//! `--near X,Y` switches to `Detector::detect_near`, the pointer-local pass a click
+//! collector uses: only the widget tiles holding the point, and a native-resolution text
+//! window around it.
 
 // The workspace style is explicit struct field syntax everywhere, which clippy reads as
 // redundant. Same allow as `gaze-core`.
@@ -61,6 +65,20 @@ struct Args {
     #[arg(long)]
     conf : Option<f32>,
 
+    /// Drop widget boxes bigger than `W,H` frame pixels, before NMS and fusion. Zero on
+    /// an axis is unlimited.
+    #[arg(long, value_parser = parse_size)]
+    max_widget : Option<(f64, f64)>,
+
+    /// Recognise only around this point, given in the image's own frame pixels as `X,Y`,
+    /// through `detect_near` instead of the whole-frame pass.
+    #[arg(long, value_parser = parse_origin)]
+    near : Option<GlobalPx>,
+
+    /// Side of the native-resolution text window `--near` reads, frame pixels.
+    #[arg(long, default_value_t = 640)]
+    ocr_px : u32,
+
     /// onnxruntime intra-op threads; 0 for its default.
     #[arg(long)]
     threads : Option<usize>,
@@ -103,6 +121,11 @@ fn main() -> Result<()> {
         config.threads = v;
     }
 
+    if let Some((mw, mh)) = args.max_widget {
+        config.max_widget_w = mw;
+        config.max_widget_h = mh;
+    }
+
     config.widgets = !args.no_widgets;
     config.ocr     = !args.no_ocr;
 
@@ -116,8 +139,7 @@ fn main() -> Result<()> {
         .build()
         .context("loading models")?;
 
-    let (elements, timings) = detector
-        .detect_timed(image.as_raw(), w, h, args.origin, args.scale)
+    let (elements, timings) = detect_once(&detector, image.as_raw(), w, h, &args)
         .context("detecting")?;
 
     report(&args, w, h, &elements, &timings);
@@ -146,11 +168,45 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+// --- Detection ---
+
+/// Runs one pass, whole-frame or pointer-local depending on `--near`.
+///
+/// Both the single reported pass and every `--bench` iteration go through here, so a bench
+/// always times the same thing the report describes.
+fn detect_once(
+    detector : &Detector,
+    rgba     : &[u8],
+    w        : u32,
+    h        : u32,
+    args     : &Args,
+)
+    -> Result<(Vec<Element>, DetectTimings)>
+{
+    let Some(near) = args.near else {
+        return Ok(detector.detect_timed(rgba, w, h, args.origin, args.scale)?);
+    };
+
+    // `--near` is given in the image's own frame pixels, which is what a person reading an
+    // overlay has; `detect_near` wants the global logical point, so undo `to_global`.
+    let at = GlobalPx {
+        x : args.origin.x + near.x / args.scale,
+        y : args.origin.y + near.y / args.scale,
+    };
+
+    Ok(detector.detect_near(rgba, w, h, args.origin, args.scale, at, args.ocr_px)?)
+}
+
 // --- Reporting ---
 
 /// Prints the box counts and the single-pass timing.
 fn report(args: &Args, w: u32, h: u32, elements: &[Element], t: &DetectTimings) {
     println!("image:   {} ({w}x{h} px, origin {},{} scale {})", args.image.display(), args.origin.x, args.origin.y, args.scale);
+
+    if let Some(near) = args.near {
+        println!("near:    frame ({:.0}, {:.0}), ocr window {} px", near.x, near.y, args.ocr_px);
+    }
+
     println!("tiles:   {}", t.tiles);
     println!("widgets: {} boxes after nms", t.widgets);
     println!("text:    {} boxes after fusion", t.texts);
@@ -184,7 +240,7 @@ fn bench(detector: &Detector, rgba: &[u8], w: u32, h: u32, args: &Args, n: u32) 
     let mut total  = Vec::with_capacity(n as usize);
 
     for _ in 0..n {
-        let (_, t) = detector.detect_timed(rgba, w, h, args.origin, args.scale)?;
+        let (_, t) = detect_once(detector, rgba, w, h, args)?;
 
         widget.push(t.widget_ms);
         ocr.push(t.ocr_ms);
@@ -309,4 +365,14 @@ fn parse_origin(s: &str) -> Result<GlobalPx, String> {
         x : x.trim().parse().map_err(|_| format!("bad x in {s:?}"))?,
         y : y.trim().parse().map_err(|_| format!("bad y in {s:?}"))?,
     })
+}
+
+/// Parses a `W,H` size limit in frame pixels. Zero on an axis means unlimited.
+fn parse_size(s: &str) -> Result<(f64, f64), String> {
+    let (w, h) = s.split_once(',').ok_or_else(|| format!("expected W,H, got {s:?}"))?;
+
+    Ok((
+        w.trim().parse().map_err(|_| format!("bad width in {s:?}"))?,
+        h.trim().parse().map_err(|_| format!("bad height in {s:?}"))?,
+    ))
 }

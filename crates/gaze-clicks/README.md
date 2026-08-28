@@ -48,15 +48,25 @@ cargo run --bin gaze-clicks-cli -- devices     # is it reading the right node?
 cargo run --bin gaze-clicks-cli -- probe       # does it see what you see? (runs until Ctrl-C)
 ```
 
-`probe` runs until Ctrl-C (`--seconds N` to stop early). Once a second it prints the
-pointer, its output and the element under it, and draws the same thing on screen: the
-chosen box outlined with its kind, size and text, and a cross where the pointer was
-read, so the cross should sit under the real cursor and the outline should be the thing
-you would say you are pointing at. When nothing contains the pointer it outlines the
-nearest box labelled `NEAREST` (a systematic coordinate offset would show as every box
-sitting a fixed distance away), and `NOTHING` when the frame had no boxes. The overlay
-blanks for 60 ms before each capture so its own outline is never what gets recognised —
-the once-a-second blink is that.
+`probe` runs until Ctrl-C (`--seconds N` to stop early). Four times a second (`--hz`) it
+prints a line and draws the same thing on screen: the chosen box outlined with its kind,
+size, score, text and the round trip's latency, and a cross where the pointer was read.
+The cross should sit under the real cursor and the outline should be the thing you would
+say you are pointing at.
+
+```
+DP-1 (2789, 96): Button 184x31 s=0.95 "Save" 96 ms [44 boxes, luma 0.21, sd 0.184, detect 78 ms, Press { age_s: 0.03 }]
+DP-1 (3011, 402): BLANK 91 ms [12 boxes, luma 0.19, sd 0.004, detect 74 ms, ...]
+DP-1 (120, 1580): NOTHING 88 ms [7 boxes, ... nearest is Button at (96, 1544) 48x48 score 0.91]
+```
+
+The latency is capture-start to overlay-draw, the whole round trip and not just the
+detector's own milliseconds; the bracketed part is stdout only. `BLANK` and `NOTHING` are
+the two rejections a click would get, decided by the same `element::pick` the collector
+calls, so what the probe draws is what a click there would have been written against. On
+`NOTHING` it still outlines the nearest *accepted* box, because a systematic coordinate
+offset shows as every box sitting a fixed distance away. The overlay blanks for 60 ms
+before each capture so its own outline is never what gets recognised; the flicker is that.
 
 `--no-tracker` runs everything except the device: clicks, recognition, tallies and click
 records, with no gaze frames or stop windows. It is the way to exercise the rules with
@@ -77,15 +87,40 @@ capture, one frame per second by default (`--capture-hz`), is the fallback for a
 capture that stalled, and it is never used if it is more than 500 ms old or was taken
 after the release.
 
-Recognition then runs on the **whole** captured output. The smallest accepted box
-containing the pointer wins, because boxes nest and the innermost one is what the user
-aimed at.
+Recognition then runs **around the pointer**, through `Detector::detect_near`. The
+smallest accepted box containing the pointer wins, because boxes nest and the innermost
+one is what the user aimed at.
 
-## Why the whole frame
+## Why local, and why not a crop
+
+`detect_near` runs the widget tiles of the *full* tile plan that contain the pointer, one
+to four instead of ten on the ultrawide, and runs the text model at native resolution over
+a 640 px square window centred there. The two halves are opposite trades and both matter.
+
+The widget half loses nothing, because a box is only ever emitted by a tile that holds it
+whole, so any box containing the point lies in a tile containing the point. Checked on
+identical pixels over 26 points across DP-1 and DP-2 with no gates on either side (`--conf
+0.25 --max-widget 0,0`): the set of non-text boxes containing the point was **identical**
+to the full pass at every one, including the points where four tiles were run.
+
+The text half is the fix for the opposite problem. The full pass shrinks the frame to
+`--ocr-max-side` (1600) for time, and on a 3840x1600 panel that merges the lines of a
+paragraph into one 800x500 blob, which is a useless click target. Native resolution over a
+640 px window costs about 62 ms and gives line-level boxes: measured over two points on
+DP-1's prose, every text box came back between 14 and 25 px tall, against a full-pass
+median of 28 and a maximum of 61 on the same capture.
+
+Measured cost on this desk with the machine under heavy unrelated load, mean of eight: a
+one-tile point is 42 ms of widget plus 66 ms of native OCR, 109 ms total on DP-1 and
+110 ms on DP-2, against 384 ms and 375 ms for the respective full passes.
+
+### Why a crop is not the same thing
 
 The first version recognised a ±256 px crop around the pointer, on the reasoning that a
 click only lands on something under the pointer and a crop costs tens of milliseconds
-against a whole ultrawide frame's few hundred. It loses the widgets that matter.
+against a whole ultrawide frame's few hundred. It loses the widgets that matter, and
+`detect_near` is not a repeat of it: a crop cuts new pixels and hands them to the model as
+a whole image, while `detect_near` runs the unchanged 1024 px tiles of the unchanged plan.
 
 Take one capture of DP-2 (Discord plus a browser), detect it whole as the reference,
 then cut a crop out of **those same pixels** around each of the twelve largest widgets
@@ -100,7 +135,7 @@ failure is not resolution, it is **context** — the widget model needs the surr
 layout to tell a list row from a run of text with padding. Symptomatically it is "it's
 just locking onto the text and icons".
 
-Reproduce it with the example:
+Reproduce the crop failure with the example:
 
 ```sh
 cargo run --bin gaze-capture-cli -- --out shots
@@ -116,8 +151,10 @@ changed between the reference and the check — run it straight after the captur
 judge the misses rather than the count. Two captures a second apart already disagree on
 about one widget in thirty on a working desktop.
 
-`--luma-px` (default 256) is now only the window the screen luminance is averaged over
-for `crop_luma`, the pupil covariate. It has no effect on recognition.
+`--luma-px` (default 256) is only the window the screen luminance is averaged over for
+`crop_luma`, the pupil covariate. It has no effect on recognition. A second, much smaller
+window (±24 px) around the pointer is measured too, and its luma *standard deviation* is
+what the `blank` rule reads.
 
 ## The rejection rules
 
@@ -129,19 +166,29 @@ In the order they apply:
 | `off-desk` | the click landed on an output `desk.toml` does not describe, so there is no surface to put the target on. |
 | `stale` | no press capture within 150 ms and no rolling frame from the last 500 ms. |
 | `no-element` | a frame, but nothing recognisable under the pointer. **This is the important one**: a click on empty space to focus a window says nothing about where you were looking, and it is the most common press on a desktop. |
+| `blank` | a box did contain the pointer, but it is taller than 60 logical px and the luma standard deviation of a ±24 px window around the pointer is under 0.02. The model drew a control over flat pixels, so there is nothing there to have been looking at. Small boxes skip this check: a confident small button's body can be flat where the pointer landed and its label a few pixels away, which is a fine target either way. |
 | `no-gaze` | fewer than 20% of the frames in the 600 ms before the press carried a valid combined gaze. A blink over the approach is not a label. |
-| `overrun` | clicked faster than whole-frame recognition runs, so the detector already had three frames queued and this one was dropped rather than made to wait. |
+| `overrun` | clicked faster than recognition runs, so the detector already had three frames queued and this one was dropped rather than made to wait. |
 
 `late-capture` is not a rejection: it counts accepted clicks that fell back to a rolling
 frame, and a rising count means the compositor is struggling.
 
-`overrun` exists because of how the threads are split. A whole-frame detection takes 250
-to 400 ms and a press capture has to happen within tens of milliseconds of the press, so
-the capture thread (pointer, `Capture`, frame choice) never waits on the detect thread
-(the models): it hands a chosen frame over with a non-blocking send onto a queue three
-deep and refuses the click if that queue is full. A double click's second press is
+Two more gates sit inside the detector rather than in the tally table, because they change
+what it returns rather than what happens to a click. Widget boxes must score at least
+**0.5** (the snap default of 0.25 was tuned for recall; on both reference captures every
+box under 0.5 sat over styled prose, inline-code chips, timestamps and headings, and every
+real control scored above it), and must be at most **1200x240 frame pixels**, because a
+control that big is a pane. The size limit is applied before OCR fusion, so a spurious
+panel box cannot take the text lines inside it down with it.
+
+`overrun` exists because of how the threads are split. A detection is tens to a couple of
+hundred milliseconds and a press capture has to happen within tens of milliseconds of the
+press, so the capture thread (pointer, `Capture`, frame choice) never waits on the detect
+thread (the models): it hands a chosen frame over with a non-blocking send onto a queue
+three deep and refuses the click if that queue is full. A double click's second press is
 captured while the first is still being recognised. A steady `overrun` count means the
-detector cannot keep up with how the machine is used; an occasional one is a burst.
+detector cannot keep up with how the machine is used; an occasional one is a burst. It was
+already rare with whole-frame recognition and is rarer now.
 
 `Icon` and `Slider` are accepted but recorded as themselves, so the export can filter
 them out: an icon's centre is not always where the eye goes and a slider is dragged as
@@ -157,7 +204,7 @@ a fact about eyes worth having in the data rather than one to average away.
 Every ten seconds:
 
 ```
-status: 34 accepted / 7 drag / 12 no-element / 3 no-gaze / 1 stale (2 late-capture, 0 overrun, 0 off-desk, 0 error) — median offset 0.83 deg over the last 20
+status: 34 accepted / 7 drag / 12 no-element / 2 blank / 3 no-gaze / 1 stale (2 late-capture, 0 overrun, 0 off-desk, 0 error) — median offset 0.83 deg over the last 20, median detect 84 ms
 ```
 
 The **median offset** is the daily "is the model drifting" number. For every accepted
@@ -167,6 +214,10 @@ the desk config's nominal seated eye. That is the same measurement
 `gaze-et5-cli calibrate`'s health pass makes against a grid of dots, except it costs
 nothing and accumulates all day. A figure that sits near the sensor's own limit (~0.7°)
 is a healthy day; one that climbs over a week is the signal to look at the model.
+
+The **median detect** is the detector's own cost over the same window of recent clicks,
+which is what `overrun` and the collector's per-click latency both follow from. Each click
+also logs its `detect_ms` at debug level (`--verbose`).
 
 Each accepted click also logs a line:
 

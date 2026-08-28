@@ -593,6 +593,26 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   refuses the click as `overrun` rather than waiting. Live `recognition_check` against a
   fresh reference: 11/12, at the ceiling set by the screen changing between captures
   (two captures a second apart agree 29/30).
+- 2026-08-28, `gaze-clicks` recognition v3: **pointer-local tiles + native OCR window, and a
+  "nothing here" rule.** Two problems from the live probe: ~390 ms per whole frame, and the
+  probe (polling at 1 Hz, drawing ~450 ms later) made it look worse than the collector
+  (frame frozen 20 ms after the press; speed only bites via `overrun`). And text under the
+  pointer was missed on the 3840 panel because full-frame OCR runs at a 1600 px longest
+  side (2.4× shrink) where terminal lines ~6 px apart fuse into paragraph blobs
+  (`Text 794×505`), while widget boxes at `widget_conf 0.25` sat over styled prose (every
+  sub-0.5 box on two captures was an inline-code chip, timestamp, heading or message body;
+  every real control scored ≥ 0.5; no box on either capture covered truly blank pixels).
+  Fix: the "full frame" pass is already 1024 px tiles at 15% overlap, and any box that
+  contains the pointer and is whole in some tile is whole in a tile containing the
+  pointer, so `Detector::detect_near` runs only those 1–4 tiles (28 ms each) — checked
+  identical to the full pass for pointer-containing widget boxes at 26/26 points across
+  both captures — plus native-resolution OCR on a 640 px window (62 ms; line boxes,
+  median ~20 px, none over 25 where the full pass gave 61). Collector gates: score ≥ 0.5,
+  widget size ≤ 1200×240 frame px applied *before* text fusion so a spurious panel cannot
+  swallow the lines under it, and a model-free flat-pixel check (luma σ < 0.02 in a
+  ±24 px window) that refuses a box taller than 60 px when the pointer is on blank;
+  collector and probe share `pick`. Live: ~100 ms capture-to-outline at 4 Hz, and the
+  pointer on empty desktop reads `NOTHING` (0 boxes, σ 0.006) rather than a claim.
 
 ## 11. Open questions
 

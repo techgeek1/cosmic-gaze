@@ -152,10 +152,27 @@ it is the data source E1/E2's flywheel acceptance will eventually run on.
   `capture_output` the moment the press arrives and that frame is used if it lands
   within 150 ms (measured: 20 to 40 ms). A 1 Hz rolling capture is the fallback only,
   never used past 500 ms old or after the release; using it tallies `late-capture`.
-- **Recognition on the whole captured output.** Smallest accepted box containing the
-  pointer wins (boxes nest; the innermost is what was aimed at). `Unknown` boxes are
-  refused even as containers. `Icon` and `Slider` are accepted and recorded as
+- **Recognition around the pointer, via `Detector::detect_near`.** Smallest accepted box
+  containing the pointer wins (boxes nest; the innermost is what was aimed at). `Unknown`
+  boxes are refused even as containers. `Icon` and `Slider` are accepted and recorded as
   themselves so the export can filter them.
+  - Two opposite trades against the whole-frame pass. **Widgets**: the *same* tile plan,
+    restricted to the one to four tiles that contain the pointer, so the model still sees
+    a wide flat row inside its real 1024 px surroundings. Nothing is lost, because a box
+    is only emitted by a tile that holds it whole; checked at 26 points across DP-1 and
+    DP-2 with the gates off, the non-text boxes containing the point were identical to the
+    full pass at every one. **Text**: native resolution over a 640 px window instead of the
+    frame shrunk to 1600, which on a 3840 px panel was merging paragraphs into 800x500
+    blobs; locally it gives line-level boxes (14 to 25 px tall) for about 62 ms. Measured
+    on DP-1 under load, mean of eight: 42 ms widget + 66 ms OCR = 109 ms, against 384 ms
+    whole-frame.
+  - Three gates on top, because a collector wants a click target rather than a snap
+    candidate: widget score at least **0.5** (the 0.25 snap default was tuned for recall
+    and every box under 0.5 on the reference captures sat over styled prose), widget size
+    at most **1200x240 frame pixels** applied *before* OCR fusion so a spurious panel box
+    cannot swallow the text lines inside it, and a **flat check**: a box taller than 60
+    logical px whose ±24 px pointer window has a luma standard deviation under 0.02 is
+    tallied `blank`, because the model drew a control over empty pixels.
   - A ±256 px crop was tried first, for the ~10x saving over a full frame, and it loses
     every wide flat widget. Measured on identical pixels (one capture of DP-2, detected
     whole as the reference, then re-detected as crops around the twelve largest widget
@@ -163,10 +180,12 @@ it is the data source E1/E2's flywheel acceptance will eventually run on.
     widget's inner OCR text or nothing. Channel rows, member rows, the URL bar, links.
     Small square widgets survive cropping, which is what made it look like it worked.
     The widget model needs the surrounding layout; the failure is context, not scale.
-    `crates/gaze-clicks/examples/recognition_check.rs` reruns the measurement.
+    `detect_near` is not that crop: it feeds the model unchanged tiles of the unchanged
+    plan. `crates/gaze-clicks/examples/recognition_check.rs` reruns the measurement.
   - The ±`--luma-px` window survives only as what `crop_luma` is averaged over.
-- **Two threads, because a full frame is slow.** A whole-frame detection is 250 to
-  400 ms and a press capture has to happen within tens of milliseconds of the press, so
+- **Two threads, because recognition is slow.** A detection is tens to a couple of
+  hundred milliseconds (250 to 400 ms before it went pointer-local) and a press capture
+  has to happen within tens of milliseconds of the press, so
   perception is split: a **capture thread** owning `Capture` and `CursorTracker` (pointer
   polling, press and rolling captures, and the frame choice, since the capture times live
   there), and a **detect thread** owning the `Detector`, fed already-chosen `(request,
@@ -177,9 +196,9 @@ it is the data source E1/E2's flywheel acceptance will eventually run on.
   sidesteps moving an `ort` session between threads.
 - **Rejections, in order:** `drag` (held > 400 ms or moved > 6 px), `off-desk` (an output
   `desk.toml` does not describe), `stale` (no usable frame), `overrun` (the detector was
-  three frames behind), `no-element`, `no-gaze` (under 20% of the frames in
-  `[t_press - 0.6, t_press]` carrying a valid combined gaze). `no-element` is the one
-  that matters: a focus click on empty space says nothing about gaze and is the most
+  three frames behind), `no-element`, `blank` (a large box over flat pixels), `no-gaze`
+  (under 20% of the frames in `[t_press - 0.6, t_press]` carrying a valid combined gaze).
+  `no-element` and `blank` are the ones that matter: a focus click on empty space says nothing about gaze and is the most
   common press on a desktop.
 - **Output** is B1's session format verbatim, one file per on-device eye model:
   `config/sessions/<unix>-<blobkey>-clicks.jsonl`, rotated if the tracker reconnects
@@ -201,13 +220,15 @@ it is the data source E1/E2's flywheel acceptance will eventually run on.
   and `device_display_area()` support the session meta and the rotation check.
   `next()` is unchanged.
 - **Live feedback.** A line per accepted click, and a ten-second status line with the
-  tallies and the running median firmware offset over the last twenty accepted clicks.
+  tallies, the running median firmware offset over the last twenty accepted clicks, and
+  the median detector time over the same window.
   That offset is the angle between the firmware's filtered gaze point and where the user
   clicked, measured the way `retrain::run_health` measures its grid, which makes it a
   free daily drift number.
 - `--no-tracker` runs the whole pipeline without the device (clicks, recognition,
   tallies, click records) and is the test mode. `devices` lists candidate nodes; `probe`
-  prints the pointer, its output and the element under it once a second.
+  prints and outlines the element under the pointer four times a second (`--hz`), with the
+  capture-to-draw latency, through the same `element::pick` a click goes through.
 
 ### B3. Collection **[user]**
 - ≥ 6 sessions over ≥ 3 days, morning and evening, glasses state noted. Nothing else moves

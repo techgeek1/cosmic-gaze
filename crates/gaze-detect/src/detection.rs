@@ -21,6 +21,23 @@ pub struct Detection {
     pub source : ElementSource,
 }
 
+// --- Size filtering ---
+
+/// Drops boxes wider than `max_w` or taller than `max_h` frame pixels. Zero on an axis
+/// means that axis is unlimited.
+///
+/// This runs before NMS and fusion rather than after, and that ordering is the point. An
+/// oversized box is almost always a spurious "control" drawn around a paragraph or a whole
+/// pane, and [`fuse_text`] would let it swallow every text line inside it as its own
+/// label. Filtering first leaves those lines standing.
+///
+/// The input is consumed because the caller has no use for the dropped boxes.
+pub fn drop_oversized(dets: Vec<Detection>, max_w: f64, max_h: f64) -> Vec<Detection> {
+    dets.into_iter()
+        .filter(|d| (max_w <= 0.0 || d.rect.w <= max_w) && (max_h <= 0.0 || d.rect.h <= max_h))
+        .collect()
+}
+
 // --- Non-maximum suppression ---
 
 /// Greedy class-agnostic NMS: keeps the highest scoring box and drops every later box
@@ -105,7 +122,7 @@ fn intersection_area(a: &Rect, b: &Rect) -> f64 {
 mod tests {
     use gaze_core::{ElementKind, ElementSource, Rect};
 
-    use super::{Detection, fuse_text, intersection_area, nms};
+    use super::{Detection, drop_oversized, fuse_text, intersection_area, nms};
 
     /// Builds a widget detection from a rect and a score.
     fn widget(x: f64, y: f64, w: f64, h: f64, score: f32) -> Detection {
@@ -125,6 +142,58 @@ mod tests {
             kind   : ElementKind::Text,
             source : ElementSource::Ocr,
         }
+    }
+
+    /// Zero on an axis is "unlimited", which is the default and must change nothing.
+    #[test]
+    fn zero_limits_drop_nothing() {
+        let dets = vec![widget(0.0, 0.0, 4000.0, 3.0, 0.9), widget(0.0, 0.0, 3.0, 4000.0, 0.9)];
+
+        assert_eq!(drop_oversized(dets.clone(), 0.0, 0.0).len(), 2);
+        assert_eq!(drop_oversized(dets, -1.0, -1.0).len(), 2);
+    }
+
+    /// Each axis is tested on its own, so a wide flat list row survives a height limit and
+    /// a tall narrow scrollbar survives a width limit.
+    #[test]
+    fn each_axis_limits_independently() {
+        let row       = widget(0.0, 0.0, 1100.0, 45.0, 0.9);
+        let scrollbar = widget(0.0, 0.0, 12.0, 900.0, 0.9);
+        let pane      = widget(0.0, 0.0, 1900.0, 900.0, 0.9);
+
+        let kept = drop_oversized(vec![row.clone(), scrollbar.clone(), pane], 1200.0, 240.0);
+
+        assert_eq!(kept, vec![row]);
+
+        let kept = drop_oversized(vec![scrollbar.clone()], 1200.0, 0.0);
+
+        assert_eq!(kept, vec![scrollbar]);
+    }
+
+    /// The limit is inclusive, so a box exactly at it is a target rather than a panel.
+    #[test]
+    fn a_box_exactly_at_the_limit_is_kept() {
+        let exact = widget(0.0, 0.0, 1200.0, 240.0, 0.9);
+        let over  = widget(0.0, 0.0, 1200.5, 240.0, 0.9);
+
+        assert_eq!(drop_oversized(vec![exact.clone()], 1200.0, 240.0), vec![exact]);
+        assert!(drop_oversized(vec![over], 1200.0, 240.0).is_empty());
+    }
+
+    /// The reason the filter runs before fusion: an oversized box drawn round a paragraph
+    /// would otherwise swallow every line inside it as its own label.
+    #[test]
+    fn filtering_before_fusion_saves_the_lines_inside_a_spurious_panel() {
+        let panel = widget(0.0, 0.0, 800.0, 500.0, 0.3);
+        let lines = vec![text(10.0, 10.0, 400.0, 20.0), text(10.0, 40.0, 380.0, 20.0)];
+
+        // Fusing against the panel loses both lines.
+        assert!(fuse_text(std::slice::from_ref(&panel), lines.clone(), 0.7).is_empty());
+
+        // Dropping the panel first leaves them standing.
+        let widgets = drop_oversized(vec![panel], 1200.0, 240.0);
+
+        assert_eq!(fuse_text(&widgets, lines, 0.7).len(), 2);
     }
 
     /// The tile-seam case: one widget straddles the overlap and is found twice with a

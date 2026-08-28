@@ -44,6 +44,17 @@ impl Tile {
     pub fn to_model(&self, fx: f64, fy: f64) -> (f64, f64) {
         ((fx - self.x as f64) * self.scale + self.pad_x, (fy - self.y as f64) * self.scale + self.pad_y)
     }
+
+    /// Whether the frame-pixel point `(fx, fy)` lies in this tile's rectangle.
+    ///
+    /// Half open on the right and bottom, the same convention `plan_tiles`' coverage test
+    /// uses, so a point on a seam belongs to exactly the tiles whose interior holds it.
+    pub fn contains(&self, fx: f64, fy: f64) -> bool {
+        fx >= self.x as f64
+            && fx < (self.x + self.w) as f64
+            && fy >= self.y as f64
+            && fy < (self.y + self.h) as f64
+    }
 }
 
 // --- Planning ---
@@ -102,6 +113,21 @@ pub fn plan_tiles(
     tiles
 }
 
+/// The tiles of a plan whose rectangle contains the frame-pixel point `(fx, fy)`.
+///
+/// This is what makes pointer-local detection exact rather than approximate. A box is only
+/// ever emitted by a tile that holds the whole box, so consider any box that contains the
+/// point and is whole in some tile T. The point is inside the box and the box is inside T,
+/// therefore the point is inside T, therefore T is in this list. Running only these tiles
+/// yields every point-containing box the full pass would, with the same tile geometry and
+/// so the same apparent scale for the model. The tiles that are skipped can only have
+/// produced boxes that do not contain the point.
+///
+/// A degenerate `Vec` (no tile contains the point) means the point is outside the frame.
+pub fn tiles_containing(tiles: &[Tile], fx: f64, fy: f64) -> Vec<Tile> {
+    tiles.iter().filter(|t| t.contains(fx, fy)).copied().collect()
+}
+
 /// Start offsets along one axis so that tiles of `tile` cover `extent` with `overlap`.
 ///
 /// The final start is clamped to `extent - tile` rather than allowed to hang off the end,
@@ -122,7 +148,7 @@ fn axis_starts(extent: u32, tile: u32, overlap: f64) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tile, axis_starts, plan_tiles};
+    use super::{Tile, axis_starts, plan_tiles, tiles_containing};
 
     /// The ultrawide case the tiler exists for: full coverage, no tile off the edge, and
     /// the requested overlap actually present between neighbours.
@@ -149,6 +175,63 @@ mod tests {
                 assert!(hit, "pixel {fx},{fy} not covered");
             }
         }
+    }
+
+    /// Every pixel of the ultrawide plan lands in between one and four tiles, and every
+    /// tile returned really does contain the point. Four is the corner of a 2x2 overlap
+    /// region, which is the most an axis-aligned plan can produce.
+    #[test]
+    fn a_point_lands_in_one_to_four_tiles() {
+        let tiles = plan_tiles(3840, 1600, 1024, 0.15, 640);
+
+        for fy in (0..1600).step_by(37) {
+            for fx in (0..3840).step_by(53) {
+                let hit = tiles_containing(&tiles, fx as f64, fy as f64);
+
+                assert!((1..=4).contains(&hit.len()), "{fx},{fy} landed in {} tiles", hit.len());
+
+                for t in &hit {
+                    assert!(t.contains(fx as f64, fy as f64), "{t:?} does not hold {fx},{fy}");
+                    assert!(tiles.contains(t), "{t:?} is not in the plan");
+                }
+            }
+        }
+    }
+
+    /// The corners are outside every overlap region, so exactly one tile holds them.
+    #[test]
+    fn a_corner_lands_in_exactly_one_tile() {
+        let tiles = plan_tiles(3840, 1600, 1024, 0.15, 640);
+
+        for (fx, fy) in [(0.0, 0.0), (3839.0, 0.0), (0.0, 1599.0), (3839.0, 1599.0)] {
+            assert_eq!(tiles_containing(&tiles, fx, fy).len(), 1, "corner {fx},{fy}");
+        }
+    }
+
+    /// A point off the frame belongs to no tile, which is how `detect_near` recognises an
+    /// out-of-frame request.
+    #[test]
+    fn a_point_off_the_frame_lands_in_no_tile() {
+        let tiles = plan_tiles(3840, 1600, 1024, 0.15, 640);
+
+        assert!(tiles_containing(&tiles, -1.0, 800.0).is_empty());
+        assert!(tiles_containing(&tiles, 3840.0, 800.0).is_empty());
+        assert!(tiles_containing(&tiles, 1920.0, 1600.0).is_empty());
+    }
+
+    /// The overlap region really is reachable: a point just inside two neighbouring tiles
+    /// gets both, so a widget on the seam is still found from whichever tile holds it
+    /// whole.
+    #[test]
+    fn a_point_in_an_overlap_gets_both_tiles() {
+        let tiles = plan_tiles(3840, 1600, 1024, 0.15, 640);
+
+        // Column starts are 0 and 870 with 1024 wide tiles, so 900 is in both.
+        let hit = tiles_containing(&tiles, 900.0, 100.0);
+
+        assert_eq!(hit.len(), 2);
+        assert_eq!(hit[0].x, 0);
+        assert_eq!(hit[1].x, 870);
     }
 
     /// Round trip through the tile transform must be exact for an unscaled tile and within

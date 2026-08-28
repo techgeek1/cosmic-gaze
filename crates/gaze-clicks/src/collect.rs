@@ -16,10 +16,14 @@
 //! 4. **no-element** — nothing recognisable under the pointer. This is the "focus
 //!    click on nothing" case, and excluding it is most of what makes the rest of the
 //!    data worth training on.
-//! 5. **no-gaze** — under [`frames::GAZE_MIN_FRACTION`] of the approach carried a
+//! 5. **blank** — a box did contain the pointer, but it is a large one and the pixels
+//!    under the pointer are flat, so the model drew a control over empty space. The same
+//!    rejection as `no-element` wearing a different hat, counted apart so a rising count
+//!    is legible as "the detector is hallucinating panels".
+//! 6. **no-gaze** — under [`frames::GAZE_MIN_FRACTION`] of the approach carried a
 //!    usable combined gaze. A blink over the last half second is not a label.
 //!
-//! A click that survives all five is written, and its firmware offset goes into the
+//! A click that survives all six is written, and its firmware offset goes into the
 //! running median that the status line reports. That median is the daily "is the model
 //! drifting" number: it is measured against where the user clicked rather than against
 //! a dot they were told to look at, so it costs nothing and accumulates all day.
@@ -41,7 +45,7 @@ use glam::DVec3;
 use tracing::{debug, warn};
 
 use crate::click::{Button, ButtonEvent, MultiCounter, PressKind, classify};
-use crate::element::{kind_name, smallest_containing};
+use crate::element::{Pick, kind_name, pick};
 use crate::frames::{
     FrameChoice, GAZE_AFTER_S, GAZE_BEFORE_S, GAZE_MIN_FRACTION, STOP_AFTER_S, STOP_BEFORE_S,
     gaze_fraction, has_combined_gaze,
@@ -59,8 +63,8 @@ const OFFSET_WINDOW: usize = 20;
 
 /// How long a recognition request may take before the click is given up on.
 ///
-/// A whole-frame detection is 250 to 400 ms on the ultrawide and up to three of them
-/// can be queued ahead of this one, so three seconds is the honest bound; anything
+/// A pointer-local detection is well under 200 ms on the ultrawide and up to three of
+/// them can be queued ahead of this one, so three seconds is a generous bound; anything
 /// near it means the detector is wedged rather than merely busy.
 const DETECT_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -93,8 +97,7 @@ pub struct CollectConfig {
     /// Rolling fallback capture rate, hertz.
     pub capture_hz  : f64,
     /// Half-width of the window the screen luminance is averaged over, logical pixels.
-    /// Recognition runs on the whole captured output; this is only the pupil
-    /// covariate's window.
+    /// Recognition is pointer-local; this is only the pupil covariate's window.
     pub luma_px     : f64,
 }
 
@@ -111,14 +114,17 @@ pub struct Tallies {
     pub stale        : u64,
     /// A frame, but nothing recognisable under the pointer.
     pub no_element   : u64,
+    /// A large box did contain the pointer, but the pixels there are flat: a control
+    /// claimed over empty space, which is a click on nothing by another name.
+    pub blank        : u64,
     /// An element, but no gaze over the approach.
     pub no_gaze      : u64,
     /// Accepted, but recognised from the rolling fallback rather than the press's own
     /// capture. Counted alongside `accepted`, not instead of it.
     pub late_capture : u64,
-    /// Clicked faster than whole-frame recognition runs, so the detector's queue was
-    /// full and this click's frame was dropped rather than made to wait. A steady
-    /// count here means the detector cannot keep up with how the machine is used.
+    /// Clicked faster than recognition runs, so the detector's queue was full and this
+    /// click's frame was dropped rather than made to wait. A steady count here means the
+    /// detector cannot keep up with how the machine is used.
     pub overrun      : u64,
     /// The recogniser failed outright.
     pub error        : u64,
@@ -167,6 +173,10 @@ struct Collector<'a> {
     tallies    : Tallies,
     /// Firmware offsets of the recent accepted clicks, degrees.
     offsets    : Vec<f64>,
+    /// What the detector cost on the recent recognised frames, milliseconds. Kept
+    /// alongside the offsets and over the same window, because both answer "is this
+    /// still healthy" at a glance.
+    detects    : Vec<f64>,
     /// Presses waiting for their release, one per button.
     pending    : HashMap<Button, Pending>,
     multi      : MultiCounter,
@@ -259,6 +269,7 @@ pub fn run(config: &CollectConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         t0         : t0,
         tallies    : Tallies::default(),
         offsets    : Vec::new(),
+        detects    : Vec::new(),
         pending    : HashMap::new(),
         multi      : MultiCounter::new(),
         next_id    : 0,
@@ -415,7 +426,7 @@ impl Collector<'_> {
         self.write(&pending, event, &out, &element, crop_luma, choice, &window)
     }
 
-    /// Asks the perception thread to recognise the crop around the press.
+    /// Asks the perception thread to recognise what is around the press.
     ///
     /// `Ok(None)` means a rule rejected the click and the tally has already been
     /// bumped.
@@ -443,14 +454,31 @@ impl Collector<'_> {
         };
 
         match outcome {
-            DetectOutcome::Found { elements, crop_luma, choice } => {
-                let Some(element) = smallest_containing(&elements, pending.px) else {
-                    self.tallies.no_element += 1;
+            DetectOutcome::Found { elements, crop_luma, pointer_sd, detect_ms, choice } => {
+                debug!(detect_ms = detect_ms, boxes = elements.len(),
+                       pointer_sd = pointer_sd, "recognised the frame under a click");
 
-                    return Ok(None);
-                };
+                self.detects.push(detect_ms);
 
-                Ok(Some((element.clone(), crop_luma, choice)))
+                if self.detects.len() > OFFSET_WINDOW {
+                    self.detects.remove(0);
+                }
+
+                match pick(&elements, pending.px, pointer_sd) {
+                    Pick::Element(element) => Ok(Some((element.clone(), crop_luma, choice))),
+
+                    Pick::Nothing          => {
+                        self.tallies.no_element += 1;
+
+                        Ok(None)
+                    }
+
+                    Pick::Blank            => {
+                        self.tallies.blank += 1;
+
+                        Ok(None)
+                    }
+                }
             }
 
             DetectOutcome::Stale    => {
@@ -648,19 +676,27 @@ impl Collector<'_> {
     fn print_status(&self) {
         let t = self.tallies;
 
-        let median = {
+        let offset = {
             match self.offsets.is_empty() {
                 true  => "n/a".to_string(),
                 false => format!("{:.2} deg", median(&mut self.offsets.clone())),
             }
         };
 
+        let detect = {
+            match self.detects.is_empty() {
+                true  => "n/a".to_string(),
+                false => format!("{:.0} ms", median(&mut self.detects.clone())),
+            }
+        };
+
         println!(
-            "status: {} accepted / {} drag / {} no-element / {} no-gaze / {} stale \
-             ({} late-capture, {} overrun, {} off-desk, {} error) — median offset {} \
-             over the last {}",
-            t.accepted, t.drag, t.no_element, t.no_gaze, t.stale,
-            t.late_capture, t.overrun, t.off_desk, t.error, median, self.offsets.len(),
+            "status: {} accepted / {} drag / {} no-element / {} blank / {} no-gaze / \
+             {} stale ({} late-capture, {} overrun, {} off-desk, {} error) — median \
+             offset {} over the last {}, median detect {}",
+            t.accepted, t.drag, t.no_element, t.blank, t.no_gaze, t.stale,
+            t.late_capture, t.overrun, t.off_desk, t.error, offset, self.offsets.len(),
+            detect,
         );
     }
 

@@ -1,8 +1,8 @@
 //! Perception: two threads, one that must never be slow and one that is.
 //!
-//! # Why recognition runs on the whole frame
+//! # Why recognition is pointer-local but not a crop
 //!
-//! The first version recognised a ±256 px crop around the pointer, on the reasoning
+//! The first version recognised a +/-256 px crop around the pointer, on the reasoning
 //! that a click only ever lands on something under the pointer and a crop costs tens of
 //! milliseconds against the whole frame's few hundred. It measured badly enough to be
 //! worth writing down.
@@ -22,20 +22,29 @@
 //! rather than a label. That is exactly what the user saw as "it's just locking onto the
 //! text and icons".
 //!
-//! Whole-frame recognition through this module's own path, checked live against a fresh
-//! reference, agrees 11 or 12 times out of 12; the remaining miss is the screen having
-//! changed between the reference and the check, which two captures a second apart put at
-//! about one widget in thirty on a working desktop.
+//! `Detector::detect_near` is the version that does not have that problem. It builds the
+//! *same* tile plan the whole-frame pass builds and runs the one to four tiles that
+//! contain the pointer, so the model sees the row inside its real 1024 px surroundings at
+//! the real scale; the only thing skipped is tiles that cannot hold a box containing the
+//! pointer. The text model then runs at **native** resolution over a 640 px window, which
+//! is the opposite trade and the other half of the fix: the whole-frame pass shrinks a
+//! 3840 px panel to 1600 for time and merges paragraphs into single blobs, while the
+//! local window keeps lines at ~20 px each for about 62 ms.
 //!
-//! So the detector gets the whole captured output. The ±`luma_half_px` window around
-//! the pointer survives only to measure [`crate::element::mean_luma`], the pupil
-//! covariate. `examples/recognition_check.rs` is the measurement, kept runnable.
+//! `examples/recognition_check.rs` is the crop measurement, kept runnable.
+//!
+//! # What the collector adds on top
+//!
+//! `gaze_clicks::element::collector_config` raises the widget confidence bar to 0.5 and
+//! caps widget boxes at 1200x240 frame pixels, and [`recognise`] measures a second, much
+//! smaller window around the pointer whose [`crate::element::luma_sd`] tells
+//! [`crate::element::pick`] whether there is anything there at all.
 //!
 //! # Why two threads
 //!
-//! A full-frame detection is 250 to 400 ms on the ultrawide. A press capture has to
-//! happen within tens of milliseconds of the press, and a double click's second press
-//! arrives while the first click is still being recognised. One thread cannot do both.
+//! A detection is a couple of hundred milliseconds. A press capture has to happen within
+//! tens of milliseconds of the press, and a double click's second press arrives while the
+//! first click is still being recognised. One thread cannot do both.
 //!
 //! - The **capture thread** owns `Capture` and `CursorTracker`. It polls the pointer,
 //!   takes press and rolling captures, and chooses which frame a click is recognised
@@ -62,7 +71,9 @@ use gaze_core::{Element, GlobalPx};
 use gaze_detect::Detector;
 use tracing::{debug, warn};
 
-use crate::element::{Crop, crop_around, extract, mean_luma};
+use crate::element::{
+    Crop, FLAT_HALF_PX, OCR_PX, collector_config, crop_around, extract, luma_sd, mean_luma,
+};
 use crate::frames::{CachedFrame, FrameChoice, RollingCache, select_frame};
 
 /// How often the pointer is polled, hertz. The pointer only has to be accurate at the
@@ -87,7 +98,9 @@ const PRESS_KEEP: usize = 3;
 /// The same figure as [`PRESS_KEEP`] and for the same reason: each queued job holds a
 /// whole framebuffer, and clicking faster than the detector can keep up is a burst that
 /// ends, not a rate to buffer for. A full queue costs the newest click, not the
-/// collector's responsiveness.
+/// collector's responsiveness. Pointer-local recognition made this much harder to hit
+/// than whole-frame recognition did, but the frames are the same size either way, so the
+/// depth stays where it was.
 const DETECT_QUEUE: usize = PRESS_KEEP;
 
 /// Everything the perception threads need before they start.
@@ -100,7 +113,7 @@ pub struct PerceptionConfig {
     /// stalled one has something within [`crate::frames::STALE_FRAME_S`].
     pub capture_hz   : f64,
     /// Half-width of the window the screen luminance is averaged over, logical pixels.
-    /// Recognition sees the whole frame; this is only the pupil covariate's window.
+    /// Recognition is pointer-local; this is only the pupil covariate's window.
     pub luma_half_px : f64,
     /// The collector's clock, which every time in this module is measured against.
     pub t0           : Instant,
@@ -115,8 +128,8 @@ pub struct DetectRequest {
     pub capture_id : Option<u64>,
     /// Connector the click landed on, for the rolling fallback.
     pub output     : String,
-    /// Where the pointer was at the press, global logical pixels. The luminance window
-    /// centres here and the elements are hit-tested against it.
+    /// Where the pointer was at the press, global logical pixels. Recognition, both
+    /// luminance windows and the hit test all centre on it.
     pub px         : GlobalPx,
     pub t_press    : f64,
     pub t_release  : f64,
@@ -128,12 +141,20 @@ pub enum DetectOutcome {
     /// The frame was recognised. `elements` may still be empty, which is a click on
     /// nothing rather than a failure.
     Found {
-        /// Every element on the whole output, in global logical pixels.
-        elements  : Vec<Element>,
-        /// Mean luminance of the window around the pointer, [0, 1].
-        crop_luma : f64,
+        /// Every element the pointer-local pass found, in global logical pixels. Not
+        /// only the ones containing the pointer: the neighbours diagnose a coordinate
+        /// offset, and the hit test belongs to the caller.
+        elements   : Vec<Element>,
+        /// Mean luminance of the wide window around the pointer, [0, 1]. The pupil
+        /// covariate.
+        crop_luma  : f64,
+        /// Luminance standard deviation of the small window around the pointer, which
+        /// says whether there is anything there at all. NaN when unmeasurable.
+        pointer_sd : f64,
+        /// What the detector itself cost, milliseconds.
+        detect_ms  : f64,
         /// Which frame it came from and how old that frame was.
-        choice    : FrameChoice,
+        choice     : FrameChoice,
     },
     /// No usable frame: the press capture was late or failed and the fallback was
     /// stale or absent.
@@ -359,7 +380,10 @@ fn spawn_detect(
     let join = thread::Builder::new()
         .name("gaze-clicks-detect".to_string())
         .spawn(move || {
-            let loaded = Detector::load(&models_dir)
+            let loaded = Detector::create()
+                .models_dir(&models_dir)
+                .config(collector_config())
+                .build()
                 .with_context(|| format!("loading models from {}", models_dir.display()));
 
             let detector = {
@@ -417,39 +441,64 @@ fn run_detect(
     debug!("detect thread exiting");
 }
 
-/// Runs the detector over one whole frame and measures the pointer's luminance window.
+/// Runs the detector around the pointer and measures the two windows there.
 fn recognise(detector: &Detector, job: &DetectJob) -> DetectOutcome {
     let frame  = &job.frame;
     let origin = GlobalPx { x: frame.logical.x, y: frame.logical.y };
 
-    let detected = detector.detect(
+    let detected = detector.detect_near(
         &frame.rgba,
         frame.width,
         frame.height,
         origin,
         frame.scale(),
+        job.request.px,
+        OCR_PX,
     );
 
     // The luminance window is a small copy out of the same buffer; NaN rather than a
     // failure if the crop and the frame disagree, because the click is still a label.
-    let pixels    = extract(&frame.rgba, frame.width, &job.luma);
-    let crop_luma = {
-        if pixels.is_empty() {
-            f64::NAN
-        }
-        else {
-            mean_luma(&pixels)
-        }
-    };
+    let crop_luma = measure(&frame.rgba, frame.width, Some(job.luma), mean_luma);
+
+    // The flatness window is much smaller and is about the pixels under the pointer
+    // rather than about the region, so it is a second crop rather than a reduction of
+    // the luminance one. Logical pixels, like every other half-width here.
+    let flat = crop_around(
+        frame.logical,
+        frame.width,
+        frame.height,
+        job.request.px,
+        f64::from(FLAT_HALF_PX),
+    );
+
+    let pointer_sd = measure(&frame.rgba, frame.width, flat, luma_sd);
 
     match detected {
-        Ok(elements) => DetectOutcome::Found {
-            elements  : elements,
-            crop_luma : crop_luma,
-            choice    : job.choice,
+        Ok((elements, timings)) => DetectOutcome::Found {
+            elements   : elements,
+            crop_luma  : crop_luma,
+            pointer_sd : pointer_sd,
+            detect_ms  : timings.total_ms,
+            choice     : job.choice,
         },
-        Err(e)       => DetectOutcome::Failed(e.to_string()),
+        Err(e)                  => DetectOutcome::Failed(e.to_string()),
     }
+}
+
+/// Copies one window out of a frame and reduces it with `f`, or NaN when there is no
+/// window or the buffer does not match it.
+fn measure(rgba: &[u8], width: u32, crop: Option<Crop>, f: fn(&[u8]) -> f64) -> f64 {
+    let Some(crop) = crop else {
+        return f64::NAN;
+    };
+
+    let pixels = extract(rgba, width, &crop);
+
+    if pixels.is_empty() {
+        return f64::NAN;
+    }
+
+    f(&pixels)
 }
 
 // --- Capture thread ---
