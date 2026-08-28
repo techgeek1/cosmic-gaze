@@ -493,6 +493,11 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   the device holds exactly `config/calibration-et5.bin` (16:12 retrain). So the tracker had
   *not* lost its model at that moment; whether it does across a power cycle, and whether it
   mutates during use (`blob-watch`), are still open. `BlobCheck::Exact` is the verify mode.
+- 2026-08-28, **power cycle: the model does not survive.** `blob-info` before: 604948 B
+  `d32f6c4b…`; after unplug/replug: **1478 B `bfd74a83…`**, the factory default. This is the
+  mechanism behind every "regressed after sitting off" episode, and the reason the Windows
+  driver and Talon re-upload on every connect. Host-owned blob confirmed as the fix; the
+  provider now uploads at connect, so a power cycle costs nothing once the file exists.
 - 2026-08-28, session zero (the 16:24 readings imported as `config/sessions/1787873083-d32f6c4b.jsonl`,
   1462 rows after saccade gating, no outlier gates). Firmware-only residual of the filtered
   ray, in-sample, no split: **3.75° rms** overall (p50 2.12, p90 5.69); stops 2.48°, glides
