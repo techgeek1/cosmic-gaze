@@ -22,6 +22,14 @@
 //! the frame is at the toplevel's rectangle, so the offset cancels. [`A11y::at`] tries
 //! window coordinates first and screen coordinates second, and accepts an answer only
 //! when the node's extents, asked the same way, contain the query point.
+//!
+//! Toolkits put the shadow in different places. Firefox's frame is `(20, 20) 1271x1428`
+//! for a 1271x1428 toplevel: the origin carries the shadow. Chromium's (Discord) is
+//! `(0, 0) 1291x1448` for the same toplevel: the *size* carries it, and every node was
+//! 10 px right of and below its pixels until this was measured. The shadow is symmetric
+//! in both, so the content origin is `frame.origin + (frame.size - toplevel.size) / 2`,
+//! which is what [`FrameOrigin::of`] computes; a frame no larger than its toplevel adds
+//! nothing.
 
 use std::time::Instant;
 
@@ -76,6 +84,22 @@ struct FrameOrigin {
 }
 
 impl FrameOrigin {
+    /// Where `window`'s top-left corner is in the space of a frame with `extents`.
+    ///
+    /// Any size the frame has beyond the toplevel is a client-side shadow, taken to be
+    /// symmetric and added to the origin; a frame that is not larger contributes only
+    /// its own origin.
+    fn of(extents: (i32, i32, i32, i32), window: &Toplevel) -> Self {
+        let (fx, fy, fw, fh) = extents;
+        let inset_x          = (fw - window.rect.w.round() as i32).max(0) / 2;
+        let inset_y          = (fh - window.rect.h.round() as i32).max(0) / 2;
+
+        FrameOrigin {
+            x : fx + inset_x,
+            y : fy + inset_y,
+        }
+    }
+
     /// The point to send for desk point `p` in `window`.
     fn query_point(self, p: GlobalPx, window: &Toplevel) -> (i32, i32) {
         (
@@ -210,11 +234,11 @@ impl A11y {
         for mode in [CoordMode::Window, CoordMode::Screen] {
             // The frame's own origin is the offset between the toolkit's space and the
             // toplevel; a frame without extents cannot be asked about points.
-            let Some((fx, fy, _, _)) = self.extents(&bus, &frame, mode.atspi()) else {
+            let Some(frame_extents) = self.extents(&bus, &frame, mode.atspi()) else {
                 continue;
             };
 
-            let origin = FrameOrigin { x: fx, y: fy };
+            let origin = FrameOrigin::of(frame_extents, window);
             let (x, y) = origin.query_point(p, window);
             let (leaf_bus, leaf_path) = self.at_point(&bus, &frame, x, y, mode.atspi())?;
 
@@ -448,6 +472,21 @@ mod tests {
         let plain = FrameOrigin { x: 0, y: 0 };
 
         assert_eq!(plain.query_point(p, &window()), (101, 50));
+    }
+
+    #[test]
+    fn a_frame_larger_than_its_toplevel_hides_the_shadow_in_its_size() {
+        let w = window();
+        let (tw, th) = (w.rect.w as i32, w.rect.h as i32);
+
+        // Firefox: origin carries the shadow, size matches the toplevel.
+        assert_eq!(FrameOrigin::of((20, 20, tw, th), &w), FrameOrigin { x: 20, y: 20 });
+
+        // Chromium: origin is zero, the frame is 20 px larger each way.
+        assert_eq!(FrameOrigin::of((0, 0, tw + 20, th + 20), &w), FrameOrigin { x: 10, y: 10 });
+
+        // A frame smaller than its toplevel (a toolkit rounding down) adds nothing.
+        assert_eq!(FrameOrigin::of((0, 0, tw - 1, th), &w), FrameOrigin { x: 0, y: 0 });
     }
 
     #[test]

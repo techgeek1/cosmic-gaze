@@ -727,6 +727,11 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   starts Orca off that key (auto-restart, ignores `OnlyShowIn`), Orca takes the
   keyboard, and Chromium does not consult the property. Ruling: enable accessibility
   per application; the image collector has hit its ceiling and the tree is the plan.
+  Discord then had its own 10 px offset: Chromium's frame answers `(0, 0) 1291x1448`
+  for the 1271x1428 toplevel, the shadow in the size rather than the origin (Firefox:
+  `(20, 20) 1271x1428`). Measured symmetric on the desk, so the content origin is now
+  `frame.origin + (frame.size - toplevel.size) / 2`, which covers both toolkits;
+  verified with a 60 px grid drawn on a capture, headings box their text exactly.
 
 ## 11. Open questions
 

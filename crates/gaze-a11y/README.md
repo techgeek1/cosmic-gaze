@@ -40,6 +40,14 @@ coordinates first and screen coordinates second, and accepts an answer only when
 node's own extents (asked the same way) contain the query point. Verified with a 40 px
 grid over the YouTube window drawn onto a capture: every rectangle on its control.
 
+Chromium hides the shadow somewhere else. Discord's frame answers `(0, 0) 1291x1448` for
+a 1271x1428 toplevel, in both coordinate types: the origin is zero and the *size* carries
+the 20 px, so with the origin-only rule every row and heading sat 10 px right of and below
+its pixels. The shadow is symmetric (with a 10 px shift the sidebar's section lands on the
+toplevel's left edge and bottom exactly), so the content origin is
+`frame.origin + (frame.size - toplevel.size) / 2`, which reads as `(20, 20)` for Firefox
+and `(10, 10)` for Discord. A frame no larger than its toplevel adds nothing.
+
 ## Coverage, measured 2026-08-29
 
 | application | on the bus | answers |
