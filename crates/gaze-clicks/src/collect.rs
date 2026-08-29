@@ -57,7 +57,8 @@ use crate::perceive::{DetectOutcome, DetectRequest, Perception, PerceptionConfig
 use crate::session::ClickSession;
 use crate::tracker::{TrackerEvent, TrackerFeed};
 
-/// How often the status line is printed, seconds.
+/// How often the status line may be printed, seconds. It is only printed when a press
+/// arrived since the last one: an idle desk logs nothing.
 const STATUS_PERIOD_S: u64 = 10;
 
 /// How many recent accepted clicks the running offset median is taken over.
@@ -207,6 +208,8 @@ struct Collector<'a> {
     written    : u64,
     /// How many session files this run has opened.
     files      : u64,
+    /// The tallies as of the last status line, so a quiet stretch prints nothing.
+    reported   : Tallies,
 }
 
 // --- Running ---
@@ -298,6 +301,7 @@ pub fn run(config: &CollectConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         next_tree  : 0,
         written    : 0,
         files      : 1,
+        reported   : Tallies::default(),
     };
 
     let period      = Duration::from_secs(STATUS_PERIOD_S);
@@ -748,8 +752,14 @@ impl Collector<'_> {
         );
     }
 
-    /// The ten-second summary.
-    fn print_status(&self) {
+    /// The ten-second summary, skipped while nothing has happened.
+    fn print_status(&mut self) {
+        if self.tallies == self.reported {
+            return;
+        }
+
+        self.reported = self.tallies;
+
         let t = self.tallies;
 
         let offset = {
