@@ -40,18 +40,38 @@ coordinates first and screen coordinates second, and accepts an answer only when
 node's own extents (asked the same way) contain the query point. Verified with a 40 px
 grid over the YouTube window drawn onto a capture: every rectangle on its control.
 
-## Coverage, measured 2026-08-28
+## Coverage, measured 2026-08-29
 
 | application | on the bus | answers |
 | --- | --- | --- |
 | Firefox | yes | yes, roles and extents correct |
-| Chromium | yes | thirteen frames, all unnamed, null at every point: its accessibility is not switched on |
-| Discord (Electron) | no | — |
+| Discord (Electron, Flatpak) | with the override below | yes, 2–10 ms; `link` rows with names and extents |
+| steamwebhelper (Chromium) | yes, as "Chromium" | thirteen unnamed frames, null at every point: accessibility off |
 | COSMIC Terminal, other iced apps | no | — |
 
-Electron and Chromium expose their trees only when accessibility is enabled
-(`--force-renderer-accessibility`, or an assistive technology announcing itself on the
-bus). `A11y::at` returns `Ok(None)` for all of the above, and the caller falls back to
+Chromium and Electron start their ATK bridge only when `ShouldEnableAccessibility`
+says so, which on Linux means the `GNOME_ACCESSIBILITY` environment variable or the
+`org.gnome.desktop.interface toolkit-accessibility` gsetting. A Flatpak does get the
+a11y bus (`AT_SPI_BUS_ADDRESS=unix:path=/run/flatpak/at-spi-bus`) but not the host's
+dconf, so inside the sandbox that gsetting reads `false` whatever the desk says and
+the app never appears. The fix is per application and needs no screen reader:
+
+```
+flatpak override --user --env=GNOME_ACCESSIBILITY=1 com.discordapp.Discord
+printf -- '--force-renderer-accessibility\n' \
+    > ~/.var/app/com.discordapp.Discord/config/discord-flags.conf   # the wrapper reads it
+```
+
+then restart Discord. The flag keeps the renderer's tree built whether or not an
+assistive technology is asking; the variable is what puts the app on the bus.
+
+Do **not** reach for `org.a11y.Status.ScreenReaderEnabled` on COSMIC: at-spi-bus-launcher
+mirrors it into `org.gnome.desktop.a11y.applications screen-reader-enabled`,
+cosmic-session watches that key and starts Orca (auto-restarting when killed), Orca
+grabs the keyboard, and Chromium ignores the property anyway. Tried 2026-08-29,
+reverted within the minute.
+
+`A11y::at` returns `Ok(None)` for anything not on the bus, and the caller falls back to
 the pixels. That is the division of labour the design set out: the tree where there is
 one, the recogniser where there is not.
 

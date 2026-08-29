@@ -714,11 +714,19 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   mention-highlighted read as `Button` 0.81–0.94, and `fuse_text` swallowed every OCR
   line inside them, so text clicks became 280x69 "buttons" and avatars `NOTHING`.
   Fusion now only lets a widget claim a line when it is the *only* line inside it (a
-  label); rows and cards keep their lines. Also learned: Discord runs as a Flatpak and
-  *is* on the bus, as ":1.502 Chromium" with thirteen unnamed frames answering null; the
-  bus reports `IsEnabled: true, ScreenReaderEnabled: false`, and Chromium/Electron
-  build a content tree only for the latter (or `--force-renderer-accessibility`). Open
-  call: set `ScreenReaderEnabled` for the session and measure what it costs Discord.
+  label); rows and cards keep their lines.
+- 2026-08-29, Discord on the tree. The ":1.502 Chromium" with thirteen null frames was
+  steamwebhelper, not Discord; Discord was never on the bus. Its Flatpak gets the a11y
+  bus but not the host dconf, so Chromium's gate (`GNOME_ACCESSIBILITY` env, else the
+  `toolkit-accessibility` gsetting) reads false inside the sandbox. `flatpak override
+  --user --env=GNOME_ACCESSIBILITY=1` plus `--force-renderer-accessibility` in
+  `discord-flags.conf` puts it on the bus as "Discord" with a named frame, answering
+  `link` rows with names and extents in 2–10 ms; list bodies climb to a scroll pane and
+  fall back to vision, correctly. The session-wide route, `ScreenReaderEnabled` on the
+  a11y bus, is a trap on COSMIC: the launcher mirrors it into gsettings, cosmic-session
+  starts Orca off that key (auto-restart, ignores `OnlyShowIn`), Orca takes the
+  keyboard, and Chromium does not consult the property. Ruling: enable accessibility
+  per application; the image collector has hit its ceiling and the tree is the plan.
 
 ## 11. Open questions
 

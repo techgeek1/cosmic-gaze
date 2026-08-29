@@ -108,8 +108,9 @@ it, and a search field's placeholder line ended 3 px short of the caret; both we
 
 Before any of that, the collector asks the **application** (`gaze-a11y`, on its own
 thread, in parallel with the capture): what is at this point in your accessibility
-tree? Where the application is on the AT-SPI bus (Firefox today; Chromium and Electron
-only with their accessibility switched on; COSMIC's own apps not yet) the answer comes
+tree? Where the application is on the AT-SPI bus (Firefox; Discord and other
+Electron/Chromium apps once switched on per app, see the gaze-a11y README; COSMIC's own
+apps not yet) the answer comes
 back in a few milliseconds with a role, a name and a rectangle on the desk, and it wins
 over the pixels: a tree knows a card is one link and a grey rectangle is an input, and
 pixels do not. The nearest actionable ancestor of the object at the point is the target
