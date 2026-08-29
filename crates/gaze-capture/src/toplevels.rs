@@ -8,11 +8,16 @@
 //! origins gives each window a rectangle on the same desk the pointer and the captures
 //! use.
 //!
-//! The protocol carries no stacking order. [`ToplevelTracker::at`] takes the activated
-//! window when it contains the point, then the smallest containing one, on the grounds
-//! that a dialog sits on its parent and a floating window on the tiled ones. That is a
-//! guess, and a caller that can verify the answer (by asking the window what is at that
-//! point) should.
+//! The protocol carries no stacking order, and it matters: two maximised windows on one
+//! output have identical rectangles, and only one of them is on screen. What the
+//! tracker does see is *activation over time*, and focus is a good proxy for the top of
+//! the stack: the window most recently activated among those containing the point is
+//! the one that was raised. [`ToplevelTracker::at`] uses that first, then the currently
+//! activated window, then the smallest containing one (a dialog sits on its parent).
+//! The first is only as good as the tracker's history, so a long-running tracker
+//! answers better than a fresh one; a caller that can verify the answer against the
+//! pixels should. The complete answer would be a capture of each candidate toplevel
+//! (`ext_foreign_toplevel_image_capture_source_manager_v1`) compared with the screen.
 
 use std::time::Duration;
 
@@ -70,6 +75,9 @@ pub struct Toplevel {
     pub activated  : bool,
     pub minimized  : bool,
     pub fullscreen : bool,
+    /// When this window was last activated, as a rank among the tracker's observations:
+    /// higher is more recent, zero is never while the tracker was watching.
+    pub focus_rank : u64,
 }
 
 /// Follows the compositor's toplevel list.
@@ -110,6 +118,7 @@ impl ToplevelTracker {
             info      : info,
             outputs   : Vec::new(),
             toplevels : Vec::new(),
+            focus_seq : 0,
         };
 
         let registry = globals.registry().clone();
@@ -242,6 +251,7 @@ impl ToplevelTracker {
                     activated  : entry.activated,
                     minimized  : entry.minimized,
                     fullscreen : entry.fullscreen,
+                    focus_rank : entry.focus_rank,
                 });
             }
         }
@@ -249,8 +259,9 @@ impl ToplevelTracker {
         out
     }
 
-    /// The window most likely on top at `p`: the activated one if it contains the
-    /// point, else the smallest containing one. Minimized windows never match.
+    /// The window most likely on top at `p`: the most recently activated one containing
+    /// the point, then the currently activated one, then the smallest containing one.
+    /// Minimized windows never match.
     pub fn at(&self, p: GlobalPx) -> Option<Toplevel> {
         let containing: Vec<Toplevel> = self
             .toplevels()
@@ -260,8 +271,7 @@ impl ToplevelTracker {
 
         containing
             .iter()
-            .find(|t| t.activated)
-            .or_else(|| containing.iter().min_by(|a, b| (a.rect.w * a.rect.h).total_cmp(&(b.rect.w * b.rect.h))))
+            .max_by_key(|t| (t.focus_rank, t.activated, -((t.rect.w * t.rect.h) as i64)))
             .cloned()
     }
 }
@@ -274,6 +284,8 @@ struct ToplevelState {
     info      : ZcosmicToplevelInfoV1,
     outputs   : Vec<OutputEntry>,
     toplevels : Vec<ToplevelEntry>,
+    /// Activations seen so far; the next one gets this plus one.
+    focus_seq : u64,
 }
 
 /// One toplevel's handles and the properties received so far.
@@ -289,6 +301,8 @@ struct ToplevelEntry {
     activated  : bool,
     minimized  : bool,
     fullscreen : bool,
+    /// See [`Toplevel::focus_rank`].
+    focus_rank : u64,
 }
 
 /// A window's rectangle relative to one output.
@@ -425,6 +439,7 @@ impl Dispatch<ExtForeignToplevelListV1, ()> for ToplevelState {
                 activated  : false,
                 minimized  : false,
                 fullscreen : false,
+                focus_rank : 0,
             });
         }
     }
@@ -536,10 +551,24 @@ impl Dispatch<ZcosmicToplevelHandleV1, ()> for ToplevelState {
                     .collect();
                 let has = |s: State| states.contains(&(s as u32));
 
+                let next    = state.focus_seq + 1;
+                let mut raised = false;
+
                 if let Some(entry) = state.by_cosmic(&id) {
-                    entry.activated  = has(State::Activated);
+                    let activated = has(State::Activated);
+
+                    if activated && !entry.activated {
+                        entry.focus_rank = next;
+                        raised           = true;
+                    }
+
+                    entry.activated  = activated;
                     entry.minimized  = has(State::Minimized);
                     entry.fullscreen = has(State::Fullscreen);
+                }
+
+                if raised {
+                    state.focus_seq = next;
                 }
             }
 

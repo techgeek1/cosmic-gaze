@@ -88,6 +88,14 @@ pub fn nms(mut dets: Vec<Detection>, iou_thresh: f64) -> Vec<Detection> {
 /// pixels the OCR lines do, only coarser, and letting them swallow the lines would undo
 /// the native-resolution OCR that exists to get line-level boxes. Both survive, and a
 /// smallest-box hit test prefers the line.
+///
+/// A widget that contains **more than one** line claims none of them either. One line
+/// inside a button is its label; several lines inside a box are content, and the box is
+/// a row, a card or a message the model happened to call a button. On a chat window a
+/// hovered message row comes back as a confident `Button` over avatar, name, timestamp
+/// and text, and fusing its lines away turned every click on that text into a click on
+/// a 280x69 "button". The row still stands as a target of its own; the lines simply
+/// stand beside it, and the smallest-box hit test picks whichever the pointer is on.
 pub fn fuse_text(
     widgets        : &[Detection],
     texts          : Vec<Detection>,
@@ -95,19 +103,28 @@ pub fn fuse_text(
 )
     -> Vec<Detection>
 {
-    let claimants: Vec<&Detection> = widgets.iter().filter(|w| w.kind != ElementKind::Text).collect();
+    let contains = |w: &Detection, t: &Detection| {
+        let area = t.rect.w * t.rect.h;
+
+        area > 0.0 && intersection_area(&w.rect, &t.rect) / area > contain_thresh
+    };
+
+    // A claimant is a non-text widget with exactly one line inside it.
+    let claimants: Vec<&Detection> = widgets
+        .iter()
+        .filter(|w| w.kind != ElementKind::Text)
+        .filter(|w| texts.iter().filter(|t| contains(w, t)).count() == 1)
+        .collect();
 
     texts
         .into_iter()
         .filter(|t| {
-            let area = t.rect.w * t.rect.h;
-
-            // A zero-area box can never be a useful target and would divide by zero.
-            if area <= 0.0 {
+            // A zero-area box can never be a useful target.
+            if t.rect.w * t.rect.h <= 0.0 {
                 return false;
             }
 
-            !claimants.iter().any(|w| intersection_area(&w.rect, &t.rect) / area > contain_thresh)
+            !claimants.iter().any(|w| contains(w, t))
         })
         .collect()
 }
@@ -153,18 +170,24 @@ mod tests {
     }
 
     /// A paragraph box the widget model labelled `Text` sits over the same pixels as the
-    /// OCR lines inside it and must not swallow them; a button over the same lines does.
+    /// OCR lines inside it and must not swallow them, and neither may a button with more
+    /// than one line inside it: that is a row or a card, not a labelled control. A
+    /// button with one line inside it claims that line.
     #[test]
-    fn fuse_ignores_text_class_widgets() {
+    fn fuse_ignores_text_class_widgets_and_multi_line_containers() {
         let paragraph = Detection {
             kind : ElementKind::Text,
             ..widget(0.0, 0.0, 600.0, 200.0, 0.55)
         };
-        let button = widget(0.0, 0.0, 600.0, 200.0, 0.55);
+        let row    = widget(0.0, 0.0, 600.0, 200.0, 0.94);
         let lines  = || vec![text(10.0, 10.0, 500.0, 22.0), text(10.0, 50.0, 500.0, 22.0)];
 
         assert_eq!(fuse_text(&[paragraph], lines(), 0.7).len(), 2);
-        assert_eq!(fuse_text(&[button], lines(), 0.7).len(), 0);
+        assert_eq!(fuse_text(&[row], lines(), 0.7).len(), 2);
+
+        let button = widget(0.0, 0.0, 600.0, 40.0, 0.9);
+
+        assert_eq!(fuse_text(&[button], vec![text(10.0, 10.0, 500.0, 22.0)], 0.7).len(), 0);
     }
 
     /// Zero on an axis is "unlimited", which is the default and must change nothing.
@@ -203,20 +226,21 @@ mod tests {
         assert!(drop_oversized(vec![over], 1200.0, 240.0).is_empty());
     }
 
-    /// The reason the filter runs before fusion: an oversized box drawn round a paragraph
-    /// would otherwise swallow every line inside it as its own label.
+    /// The filter runs before fusion so an oversized box drawn round a single caption
+    /// cannot swallow it as a label; a panel with several lines inside claims nothing
+    /// anyway.
     #[test]
-    fn filtering_before_fusion_saves_the_lines_inside_a_spurious_panel() {
+    fn filtering_before_fusion_saves_the_line_inside_a_spurious_panel() {
         let panel = widget(0.0, 0.0, 800.0, 500.0, 0.3);
-        let lines = vec![text(10.0, 10.0, 400.0, 20.0), text(10.0, 40.0, 380.0, 20.0)];
+        let line  = vec![text(10.0, 10.0, 400.0, 20.0)];
 
-        // Fusing against the panel loses both lines.
-        assert!(fuse_text(std::slice::from_ref(&panel), lines.clone(), 0.7).is_empty());
+        // Fusing against the panel loses the caption.
+        assert!(fuse_text(std::slice::from_ref(&panel), line.clone(), 0.7).is_empty());
 
-        // Dropping the panel first leaves them standing.
+        // Dropping the panel first leaves it standing.
         let widgets = drop_oversized(vec![panel], 1200.0, 240.0);
 
-        assert_eq!(fuse_text(&widgets, lines, 0.7).len(), 2);
+        assert_eq!(fuse_text(&widgets, line, 0.7).len(), 1);
     }
 
     /// The tile-seam case: one widget straddles the overlap and is found twice with a

@@ -422,6 +422,7 @@ mod tests {
             activated  : true,
             minimized  : false,
             fullscreen : false,
+            focus_rank : 1,
         }
     }
 

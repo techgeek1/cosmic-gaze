@@ -294,8 +294,8 @@ fn list_toplevels(duration_s: Option<f64>) -> Result<()> {
             .join(",");
 
             println!(
-                "  {:<9} ({:>6.0},{:>6.0}) {:>5.0}x{:<5.0} {:<28} {:<40} {flags}",
-                t.output, t.rect.x, t.rect.y, t.rect.w, t.rect.h,
+                "  {:<9} ({:>6.0},{:>6.0}) {:>5.0}x{:<5.0} focus#{:<3} {:<28} {:<40} {flags}",
+                t.output, t.rect.x, t.rect.y, t.rect.w, t.rect.h, t.focus_rank,
                 truncate(&t.app_id, 28), truncate(&t.title, 40),
             );
         }

@@ -45,6 +45,13 @@ text class and emits paragraph-sized boxes with it; letting those swallow the li
 them undid the native OCR at the first point tested (a 22 px line replaced by a 562x209
 paragraph). Both survive; a smallest-box hit test prefers the line.
 
+Nor does a widget with **more than one** OCR line inside it. One line inside a button is
+its label; several are content, and the box is a row or a card the model called a
+button. On Discord a hovered or mention-highlighted message row comes back as a `Button`
+at 0.81–0.94 over avatar, name, timestamp and text, and fusing its lines away turned
+every click on the text into a click on a 280x69 button (2026-08-28). The row still
+stands; the lines stand beside it.
+
 `max_widget_w` / `max_widget_h` (both default `0.0`, unlimited) drop widget boxes bigger
 than the given frame pixels **before** NMS and fusion. The ordering is the point: an
 oversized spurious "control" drawn over a paragraph would otherwise swallow every text

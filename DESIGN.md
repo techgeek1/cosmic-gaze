@@ -702,6 +702,23 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   Firefox (`TREE TABLE-CELL 1691x24`, 2–3 ms); the YouTube cases from the batch are
   Firefox too and should now read `link`/`image`/`combo box`. Not verified: Discord and
   Chromium, which need their accessibility enabled to be on the bus at all.
+- 2026-08-28, two follow-ups from the first tree run. **Stacking**: agentic-studio and a
+  Firefox window were both maximised on DP-1 with identical rectangles, neither focused,
+  and the tracker's tie fell to Firefox, so the probe drew GitHub's tabs and URL bar over
+  agentic-studio. `zcosmic_toplevel_info_v1` has no z-order; the tracker now ranks
+  windows by last activation (focus is a proxy for raise) and `at` prefers the highest
+  rank. A fresh tracker has no history, so the collector's day-long one answers better
+  than a just-started probe; the complete answer is a capture of each candidate
+  toplevel (`ext_foreign_toplevel_image_capture_source_manager_v1`, advertised) compared
+  with the screen. **Discord regression**: message rows that are hovered or
+  mention-highlighted read as `Button` 0.81–0.94, and `fuse_text` swallowed every OCR
+  line inside them, so text clicks became 280x69 "buttons" and avatars `NOTHING`.
+  Fusion now only lets a widget claim a line when it is the *only* line inside it (a
+  label); rows and cards keep their lines. Also learned: Discord runs as a Flatpak and
+  *is* on the bus, as ":1.502 Chromium" with thirteen unnamed frames answering null; the
+  bus reports `IsEnabled: true, ScreenReaderEnabled: false`, and Chromium/Electron
+  build a content tree only for the latter (or `--force-renderer-accessibility`). Open
+  call: set `ScreenReaderEnabled` for the session and measure what it costs Discord.
 
 ## 11. Open questions
 
