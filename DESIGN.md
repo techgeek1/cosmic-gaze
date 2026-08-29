@@ -664,14 +664,17 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   names the shape without copying a pixel (Adwaita 24 px: arrow `@3,1`, hand `@7,5`,
   I-beam `@11,12`; `gaze-clicks/src/cursor.rs` has the bands and the two themes' tables;
   the centre is shared with `wait`, `crosshair` and the resize arrows, so an I-beam is
-  only called by exact hotspot). Recorded, not acted on: each click record carries
-  `cursor`, the probe prints it and captions `(HAND)`/`(TEXT)`, and the status line counts
-  refusals made under a hand or I-beam. Open decision: whether that count is large enough,
-  and clean enough, for a hand or I-beam to accept a click on its own with a synthetic box
-  at the pointer. The case against is the card: a hand over a card's padding is a click
-  the eye may have made from the title 100 px away, and a terminal's I-beam covers focus
-  clicks on nothing. The case for is that inputs are among the most clicked things on a
-  desktop and every one of them is currently refused.
+  only called by exact hotspot; the grabbing hands are a pixel from the pointing one and
+  are listed exactly too, since a grab means a drag). Ruling, same day: **the I-beam is
+  trusted, the hand is not yet.** A click on nothing recognisable under an I-beam is
+  accepted as a `caret` (nominal 24 px box at the pointer, `element_kind = "caret"`,
+  score 0), because an input, a terminal or a document is a place the eye was and inputs
+  are among the most clicked things on a desktop; a large flat box under an I-beam stays
+  `blank` (the empty body of an editor). The pointing hand vouches for links and cards,
+  but a card's padding is a click the eye may have made from the title 100 px away, so
+  it is recorded on every click and its refusals are counted on the status line, and
+  that count decides later whether it joins the I-beam. The probe outlines the caret box
+  and captions `CARET`, so it shows exactly what a click would write.
 
 ## 11. Open questions
 

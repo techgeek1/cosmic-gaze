@@ -46,7 +46,7 @@ use tracing::{debug, warn};
 
 use crate::click::{Button, ButtonEvent, MultiCounter, PressKind, classify};
 use crate::cursor::{CursorShape, classify as classify_cursor};
-use crate::element::{Pick, kind_name, pick};
+use crate::element::{CARET_KIND, Pick, kind_name, pick};
 use crate::frames::{
     FrameChoice, GAZE_AFTER_S, GAZE_BEFORE_S, GAZE_MIN_FRACTION, STOP_AFTER_S, STOP_BEFORE_S,
     gaze_fraction, has_combined_gaze,
@@ -115,15 +115,19 @@ pub struct Tallies {
     pub stale        : u64,
     /// A frame, but nothing recognisable under the pointer.
     pub no_element   : u64,
-    /// Of the `no_element` and `blank` refusals, those made under a hand or an I-beam:
-    /// the application said something clickable or editable was there and the
-    /// recogniser did not find it. Counted, not acted on; see [`crate::cursor`].
+    /// Of the `no_element` and `blank` refusals, those made under a pointing hand or an
+    /// I-beam: the application said something clickable or editable was there and the
+    /// rules refused it anyway. With the I-beam accepting a click on nothing, this is
+    /// hands over cards and links plus I-beams over flat boxes; see [`crate::cursor`].
     pub disputed     : u64,
     /// A large box did contain the pointer, but the pixels there are flat: a control
     /// claimed over empty space, which is a click on nothing by another name.
     pub blank        : u64,
     /// An element, but no gaze over the approach.
     pub no_gaze      : u64,
+    /// Accepted on the I-beam's word alone, with no recognised box: an input, a
+    /// terminal, a document. Counted alongside `accepted`, not instead of it.
+    pub caret        : u64,
     /// Accepted, but recognised from the rolling fallback rather than the press's own
     /// capture. Counted alongside `accepted`, not instead of it.
     pub late_capture : u64,
@@ -446,7 +450,7 @@ impl Collector<'_> {
     /// `Ok(None)` means a rule rejected the click and the tally has already been
     /// bumped.
     fn recognise(&mut self, pending: &Pending, t_release: f64)
-        -> Result<Option<(Element, f64, FrameChoice)>>
+        -> Result<Option<(ClickElement, f64, FrameChoice)>>
     {
         let id = self.next_id;
         self.next_id += 1;
@@ -479,8 +483,24 @@ impl Collector<'_> {
                     self.detects.remove(0);
                 }
 
-                match pick(&elements, pending.px, pointer_sd) {
-                    Pick::Element(element) => Ok(Some((element.clone(), crop_luma, choice))),
+                match pick(&elements, pending.px, pointer_sd, pending.cursor) {
+                    Pick::Element(element) => {
+                        Ok(Some((click_element(element), crop_luma, choice)))
+                    }
+
+                    // The I-beam's word, not the recogniser's; see `crate::cursor`.
+                    Pick::Caret(bbox)      => {
+                        self.tallies.caret += 1;
+
+                        let element = ClickElement {
+                            kind  : CARET_KIND.to_string(),
+                            bbox  : bbox,
+                            text  : None,
+                            score : 0.0,
+                        };
+
+                        Ok(Some((element, crop_luma, choice)))
+                    }
 
                     Pick::Nothing          => {
                         self.tallies.no_element += 1;
@@ -551,7 +571,7 @@ impl Collector<'_> {
         pending   : &Pending,
         event     : ButtonEvent,
         out       : &OutputGeometry,
-        element   : &Element,
+        element   : &ClickElement,
         crop_luma : f64,
         choice    : FrameChoice,
         window    : &[TimedFrame],
@@ -573,12 +593,7 @@ impl Collector<'_> {
                 .map(|sample| distance(pending.px, sample.global))
                 .unwrap_or(0.0),
             multi       : pending.multi,
-            element     : ClickElement {
-                kind  : kind_name(element.kind).to_string(),
-                bbox  : element.bbox,
-                text  : element.text.clone(),
-                score : element.score,
-            },
+            element     : element.clone(),
             crop_luma   : crop_luma,
             frame_age_s : age_of(choice),
             cursor      : pending.cursor.map(|c| c.name().to_string()),
@@ -709,12 +724,12 @@ impl Collector<'_> {
         };
 
         println!(
-            "status: {} accepted / {} drag / {} no-element / {} blank ({} under a hand \
-             or I-beam) / {} no-gaze / {} stale ({} late-capture, {} overrun, {} off-desk, \
-             {} error) — median offset {} over the last {}, median detect {}",
-            t.accepted, t.drag, t.no_element, t.blank, t.disputed, t.no_gaze, t.stale,
-            t.late_capture, t.overrun, t.off_desk, t.error, offset, self.offsets.len(),
-            detect,
+            "status: {} accepted ({} caret) / {} drag / {} no-element / {} blank ({} under \
+             a hand or I-beam) / {} no-gaze / {} stale ({} late-capture, {} overrun, \
+             {} off-desk, {} error) — median offset {} over the last {}, median detect {}",
+            t.accepted, t.caret, t.drag, t.no_element, t.blank, t.disputed, t.no_gaze,
+            t.stale, t.late_capture, t.overrun, t.off_desk, t.error, offset,
+            self.offsets.len(), detect,
         );
     }
 
@@ -876,6 +891,16 @@ fn now_unix_s() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+/// A recognised element as the session file records it.
+fn click_element(element: &Element) -> ClickElement {
+    ClickElement {
+        kind  : kind_name(element.kind).to_string(),
+        bbox  : element.bbox,
+        text  : element.text.clone(),
+        score : element.score,
+    }
 }
 
 // --- Tests ---

@@ -331,6 +331,8 @@ fn probe(models: PathBuf, seconds: Option<f64>, hz: f64, luma_px: f64) -> Result
         let reply = perception.replies().recv_timeout(Duration::from_secs(5))
             .context("the recogniser did not answer")?;
 
+        let shape = sample.cursor.map(classify_cursor);
+
         // `body` is the caption without its latency, `note` the extra detail only
         // stdout gets, and `highlight` the box drawn on screen.
         let (body, note, highlight): (String, String, Option<Rect>) = {
@@ -342,9 +344,16 @@ fn probe(models: PathBuf, seconds: Option<f64>, hz: f64, luma_px: f64) -> Result
                         elements.len(),
                     );
 
-                    match pick(&elements, sample.global, pointer_sd) {
+                    match pick(&elements, sample.global, pointer_sd, shape) {
                         Pick::Element(e) => (caption(e), format!("{seen} — {}", describe(e)),
                                              Some(e.bbox)),
+
+                        Pick::Caret(b)   => (
+                            "CARET".to_string(),
+                            format!("{seen} — nothing under the pointer, accepted on the \
+                                     I-beam's word"),
+                            Some(b),
+                        ),
 
                         Pick::Blank      => (
                             "BLANK".to_string(),
@@ -394,7 +403,6 @@ fn probe(models: PathBuf, seconds: Option<f64>, hz: f64, luma_px: f64) -> Result
 
         // The pointer's shape goes on screen only when the application is claiming
         // something the caption may not: a hand or an I-beam.
-        let shape  = sample.cursor.map(classify_cursor);
         let claim  = shape.filter(|s| s.says_something_is_there())
                           .map(|s| format!(" ({})", s.name().to_uppercase()))
                           .unwrap_or_default();

@@ -113,10 +113,17 @@ at the top edge, an I-beam's dead centre (`cursor.rs` has the bands and the 24 p
 Adwaita and Pop hotspots they came from). That is the application's own word on what is
 under the pointer, and it covers exactly what the widget model misses: input fields
 drawn as a slightly different grey, borderless clickable regions, text in a terminal.
-For now it is **recorded, not acted on**: every click carries `cursor: "arrow" |
-"hand" | "text" | "centred" | "other"`, and the status line counts the refusals made under
-a hand or an I-beam, so a day's run says how many clicks the rules are throwing away
-that the application would have vouched for.
+
+The **I-beam is trusted**: a click on nothing recognisable under an I-beam is accepted
+as a `caret`, a nominal 24 px box around the pointer, because an input, a terminal or a
+document is a place the eye was. A large flat box under an I-beam is still `blank`: that
+is the empty body of an editor, and the eye could be anywhere in it. The **pointing hand
+is recorded, not trusted**: it vouches for links and cards, but a card's padding is a
+click the eye may have made from the title 100 px away. A **grab** is neither, since it
+announces a drag. Every click carries `cursor: "arrow" | "hand" | "grab" | "text" |
+"centred" | "other"`, and the status line counts the refusals made under a hand or an
+I-beam, so a day's run says how many clicks the rules are still throwing away that the
+application would have vouched for.
 
 ## Why local, and why not a crop
 
@@ -203,7 +210,7 @@ In the order they apply:
 | `drag` | held longer than 400 ms, or the pointer moved more than 6 logical px between press and release. The press and the release are about different places. |
 | `off-desk` | the click landed on an output `desk.toml` does not describe, so there is no surface to put the target on. |
 | `stale` | no press capture within 150 ms and no rolling frame from the last 500 ms. |
-| `no-element` | a frame, but nothing recognisable under the pointer. **This is the important one**: a click on empty space to focus a window says nothing about where you were looking, and it is the most common press on a desktop. |
+| `no-element` | a frame, but nothing recognisable under the pointer, and the pointer is not an I-beam. **This is the important one**: a click on empty space to focus a window says nothing about where you were looking, and it is the most common press on a desktop. Under an I-beam the same click is accepted as a `caret` instead. |
 | `blank` | a box did contain the pointer, but it is taller than 60 logical px and the luma standard deviation of a ±24 px window around the pointer is under 0.02. The model drew a control over flat pixels, so there is nothing there to have been looking at. Small boxes skip this check: a confident small button's body can be flat where the pointer landed and its label a few pixels away, which is a fine target either way. |
 | `no-gaze` | fewer than 20% of the frames in the 600 ms before the press carried a valid combined gaze. A blink over the approach is not a label. |
 | `overrun` | clicked faster than recognition runs, so the detector already had three frames queued and this one was dropped rather than made to wait. |
@@ -242,14 +249,15 @@ a fact about eyes worth having in the data rather than one to average away.
 Every ten seconds:
 
 ```
-status: 34 accepted / 7 drag / 12 no-element / 2 blank (6 under a hand or I-beam) / 3 no-gaze / 1 stale (2 late-capture, 0 overrun, 0 off-desk, 0 error) — median offset 0.83 deg over the last 20, median detect 84 ms
+status: 34 accepted (5 caret) / 7 drag / 12 no-element / 2 blank (6 under a hand or I-beam) / 3 no-gaze / 1 stale (2 late-capture, 0 overrun, 0 off-desk, 0 error) — median offset 0.83 deg over the last 20, median detect 84 ms
 ```
 
-The parenthesised count is how many of the `no-element` and `blank` refusals happened
-while the pointer was a hand or an I-beam: the application said something was there and
-the recogniser found nothing. It is the size of the gap between the rules and the
-screen, and the number to look at before deciding whether the shape should be allowed
-to accept a click on its own.
+`caret` is how many of the accepted clicks were taken on the I-beam's word with no
+recognised box. The count after `blank` is how many `no-element` and `blank` refusals
+happened under a pointing hand or an I-beam: the application said something was there
+and the rules refused it anyway. It is the size of the gap between the rules and the
+screen, and the number to look at before deciding whether the hand should be trusted
+the way the I-beam is.
 
 The **median offset** is the daily "is the model drifting" number. For every accepted
 click it is the angle between where the firmware said you were looking (its filtered 2D

@@ -23,6 +23,8 @@
 use gaze_core::{Element, ElementKind, GlobalPx, Rect};
 use gaze_detect::{DetectConfig, NearConfig};
 
+use crate::cursor::CursorShape;
+
 /// Half-width of the luminance window taken around the pointer, logical pixels. Wide
 /// enough to average over the panel or page the click landed in rather than the widget
 /// itself, which is the light the pupil is actually responding to.
@@ -70,6 +72,18 @@ pub const NEAR_TILE_PX: u32 = 640;
 /// of it was NOTHING; a search field's placeholder ended 3 px short of the caret. Six
 /// logical pixels covers padding without reaching the next control over.
 pub const HIT_SLOP_PX: f64 = 6.0;
+
+/// Half-side of the box a caret click is written against, logical pixels.
+///
+/// An I-beam over nothing recognisable is accepted on the cursor's word alone (see
+/// [`crate::cursor`]), and the record needs a box. There is no visible element to draw
+/// one around, so this is the nominal extent of what the eye was on: a line of text is
+/// about this tall, and the box is a size for the export's `element_w_px` column rather
+/// than a claim about the screen.
+pub const CARET_HALF_PX: f64 = 12.0;
+
+/// Kind written for a caret click, which no `gaze_core::ElementKind` describes.
+pub const CARET_KIND: &str = "caret";
 
 /// Half-width of the flatness window taken around the pointer, logical pixels.
 ///
@@ -320,9 +334,14 @@ fn contains_within(r: &Rect, p: GlobalPx, slop: f64) -> bool {
 pub enum Pick<'a> {
     /// A box worth labelling a click with.
     Element(&'a Element),
+    /// No box contains the pointer, but the cursor is an I-beam: an input field, a
+    /// terminal, a document. The box is [`CARET_HALF_PX`] around the pointer.
+    Caret(Rect),
     /// A box contained the pointer, but the pixels there are flat, so the model claimed
     /// a control over what is really empty space. Rejected for the same reason
     /// [`Pick::Nothing`] is: a click on nothing says nothing about where the eye was.
+    /// An I-beam does not rescue this one: a large flat box under an I-beam is a click
+    /// on the empty body of an editor, and the eye could be anywhere in it.
     Blank,
     /// No accepted box contains the pointer.
     Nothing,
@@ -338,11 +357,24 @@ pub enum Pick<'a> {
 /// The flat check only applies to boxes taller than [`FLAT_CHECK_MIN_H_PX`]. See that
 /// constant for why small boxes are exempt.
 ///
+/// `cursor` is the pointer's shape at the press when the compositor reported it. Only an
+/// I-beam changes the answer, and only when no box contains the pointer.
+///
 /// Both the collector and the probe call this, so the box the probe outlines on screen is
 /// exactly the one a click there would have been written against.
-pub fn pick<'a>(elements: &'a [Element], p: GlobalPx, pointer_sd: f64) -> Pick<'a> {
+pub fn pick<'a>(
+    elements   : &'a [Element],
+    p          : GlobalPx,
+    pointer_sd : f64,
+    cursor     : Option<CursorShape>,
+)
+    -> Pick<'a>
+{
     let Some(element) = smallest_containing(elements, p) else {
-        return Pick::Nothing;
+        return match cursor.is_some_and(CursorShape::accepts_a_click) {
+            true  => Pick::Caret(caret_box(p)),
+            false => Pick::Nothing,
+        };
     };
 
     if element.bbox.h > FLAT_CHECK_MIN_H_PX && pointer_sd < FLAT_LUMA_SD {
@@ -350,6 +382,16 @@ pub fn pick<'a>(elements: &'a [Element], p: GlobalPx, pointer_sd: f64) -> Pick<'
     }
 
     Pick::Element(element)
+}
+
+/// The box a caret click at `p` is written against.
+pub fn caret_box(p: GlobalPx) -> Rect {
+    Rect {
+        x : p.x - CARET_HALF_PX,
+        y : p.y - CARET_HALF_PX,
+        w : 2.0 * CARET_HALF_PX,
+        h : 2.0 * CARET_HALF_PX,
+    }
 }
 
 // --- Detector settings ---
@@ -546,7 +588,7 @@ mod tests {
             element(1, ElementKind::Button, (100.0, 100.0, 200.0,  40.0)),
         ];
 
-        let hit = pick(&elements, GlobalPx { x: 150.0, y: 110.0 }, 0.3);
+        let hit = pick(&elements, GlobalPx { x: 150.0, y: 110.0 }, 0.3, None);
 
         assert_eq!(hit, Pick::Element(&elements[1]));
     }
@@ -556,9 +598,9 @@ mod tests {
         // The emoji-picker case: the glyph's box, and the pointer 4 px past its edge.
         let elements = vec![element(0, ElementKind::Text, (62.0, 65.0, 31.0, 25.0))];
 
-        assert_eq!(pick(&elements, GlobalPx { x: 97.0, y: 88.0 }, 0.3),
+        assert_eq!(pick(&elements, GlobalPx { x: 97.0, y: 88.0 }, 0.3, None),
                    Pick::Element(&elements[0]));
-        assert_eq!(pick(&elements, GlobalPx { x: 62.0 + 31.0 + HIT_SLOP_PX + 0.5, y: 88.0 }, 0.3),
+        assert_eq!(pick(&elements, GlobalPx { x: 62.0 + 31.0 + HIT_SLOP_PX + 0.5, y: 88.0 }, 0.3, None),
                    Pick::Nothing);
     }
 
@@ -566,8 +608,37 @@ mod tests {
     fn pick_reports_nothing_when_no_box_contains_the_point() {
         let elements = vec![element(0, ElementKind::Button, (100.0, 100.0, 20.0, 20.0))];
 
-        assert_eq!(pick(&elements, GlobalPx { x: 500.0, y: 500.0 }, 0.3), Pick::Nothing);
-        assert_eq!(pick(&[], GlobalPx { x: 0.0, y: 0.0 }, 0.3), Pick::Nothing);
+        assert_eq!(pick(&elements, GlobalPx { x: 500.0, y: 500.0 }, 0.3, None), Pick::Nothing);
+        assert_eq!(pick(&[], GlobalPx { x: 0.0, y: 0.0 }, 0.3, None), Pick::Nothing);
+    }
+
+    #[test]
+    fn an_i_beam_over_nothing_is_a_caret() {
+        let p = GlobalPx { x: 500.0, y: 500.0 };
+
+        assert_eq!(pick(&[], p, 0.3, Some(CursorShape::Text)), Pick::Caret(caret_box(p)));
+        assert_eq!(caret_box(p).center(), p);
+
+        // Any other shape, or none, is still nothing.
+        for shape in [CursorShape::Arrow, CursorShape::Hand, CursorShape::Grab,
+                      CursorShape::Centred, CursorShape::Other] {
+            assert_eq!(pick(&[], p, 0.3, Some(shape)), Pick::Nothing, "{shape}");
+        }
+
+        // A box that does contain the pointer wins over the cursor.
+        let elements = vec![element(0, ElementKind::Button, (490.0, 490.0, 20.0, 20.0))];
+
+        assert_eq!(pick(&elements, p, 0.3, Some(CursorShape::Text)),
+                   Pick::Element(&elements[0]));
+    }
+
+    #[test]
+    fn an_i_beam_does_not_rescue_a_blank_box() {
+        let elements = vec![element(0, ElementKind::Text, (0.0, 0.0, 800.0, 600.0))];
+
+        assert_eq!(pick(&elements, GlobalPx { x: 400.0, y: 300.0 }, 0.001,
+                        Some(CursorShape::Text)),
+                   Pick::Blank);
     }
 
     #[test]
@@ -576,13 +647,13 @@ mod tests {
         let elements = vec![element(0, ElementKind::Text, (0.0, 0.0, 800.0, 600.0))];
         let p        = GlobalPx { x: 400.0, y: 300.0 };
 
-        assert_eq!(pick(&elements, p, 0.001), Pick::Blank);
+        assert_eq!(pick(&elements, p, 0.001, None), Pick::Blank);
 
         // Detail under the pointer makes the same box a real target.
-        assert_eq!(pick(&elements, p, 0.15), Pick::Element(&elements[0]));
+        assert_eq!(pick(&elements, p, 0.15, None), Pick::Element(&elements[0]));
 
         // An unmeasurable window is not evidence of flatness.
-        assert_eq!(pick(&elements, p, f64::NAN), Pick::Element(&elements[0]));
+        assert_eq!(pick(&elements, p, f64::NAN, None), Pick::Element(&elements[0]));
     }
 
     #[test]
@@ -591,7 +662,7 @@ mod tests {
         // pointer landed says nothing, because its label is a few pixels away.
         let elements = vec![element(0, ElementKind::Button, (100.0, 100.0, 90.0, 30.0))];
 
-        assert_eq!(pick(&elements, GlobalPx { x: 140.0, y: 115.0 }, 0.0), Pick::Element(&elements[0]));
+        assert_eq!(pick(&elements, GlobalPx { x: 140.0, y: 115.0 }, 0.0, None), Pick::Element(&elements[0]));
     }
 
     #[test]

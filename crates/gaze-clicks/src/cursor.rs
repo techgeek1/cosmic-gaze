@@ -14,7 +14,16 @@
 //! themes on the desk, Adwaita and Pop, whose hotspots are in the tests. The centre is
 //! shared with `wait`, `crosshair` and every resize cursor, so an I-beam is only called
 //! by exact match against the themes' `text` hotspots, and any other centred image is
-//! [`CursorShape::Centred`].
+//! [`CursorShape::Centred`]. The two hands are told apart the same way: the pointing
+//! hand and the grabbing hands sit within a pixel of each other in the band, and only
+//! the grab means a drag.
+//!
+//! What the collector does with it (2026-08-28): an I-beam over nothing recognisable is
+//! accepted as a caret, because an input field or a terminal is a place the eye was
+//! looking whether or not the widget model drew a box there. A pointing hand is not,
+//! yet: it vouches for links and cards, but a card's padding is a click the eye may have
+//! made from the title 100 px away. Refusals made under a hand are counted so that call
+//! can be made on numbers.
 
 use std::fmt;
 
@@ -39,8 +48,10 @@ impl CursorImage {
 pub enum CursorShape {
     /// The default arrow, or one of its variants (`progress`, `context-menu`, `copy`).
     Arrow,
-    /// A hand: `pointer` over something clickable, or `grab`/`grabbing`.
+    /// The pointing hand (`pointer`, `hand2`) over something clickable.
     Hand,
+    /// An open or closed grabbing hand (`grab`, `grabbing`): a drag, not a click.
+    Grab,
     /// An I-beam over text or an input.
     Text,
     /// Hotspot in the middle of the image but not a known I-beam: `wait`, `crosshair`,
@@ -56,14 +67,22 @@ impl CursorShape {
         match self {
             CursorShape::Arrow   => "arrow",
             CursorShape::Hand    => "hand",
+            CursorShape::Grab    => "grab",
             CursorShape::Text    => "text",
             CursorShape::Centred => "centred",
             CursorShape::Other   => "other",
         }
     }
 
+    /// Whether the shape alone is enough for the collector to accept a click on nothing
+    /// recognisable: only the I-beam is.
+    pub fn accepts_a_click(self) -> bool {
+        matches!(self, CursorShape::Text)
+    }
+
     /// Whether the application put a hand or an I-beam up: its own word that something
-    /// is under the pointer, whatever the recogniser found.
+    /// is under the pointer, whatever the recogniser found. A grab is left out because
+    /// it announces a drag, which is refused on its own terms.
     pub fn says_something_is_there(self) -> bool {
         matches!(self, CursorShape::Hand | CursorShape::Text)
     }
@@ -86,20 +105,39 @@ const TEXT_HOTSPOTS: &[(u32, i32, i32)] = &[
     (24, 12, 11),
 ];
 
+/// Hotspots of the `grab` and `grabbing` images at 24 px: Adwaita `@11,2` and `@9,5`,
+/// Pop `grab`/`openhand` `@11,7`. Pop's `closedhand` (`@12,11`) shares its hotspot with
+/// the vertical I-beam and is not listed, so under Pop a drag in progress reads as
+/// [`CursorShape::Text`]; the drag rule refuses the click before the shape is consulted.
+const GRAB_HOTSPOTS: &[(u32, i32, i32)] = &[
+    (24, 11, 2),
+    (24, 9, 5),
+    (24, 11, 7),
+];
+
 /// The shape of a cursor image.
 ///
 /// Bands are on the hotspot's position as a fraction of the image, so the same rule
-/// holds across sizes. From the 24 px themes: arrows sit at `@3,1` and `@4,4`, hands at
-/// `@7,5`, `@8,5`, `@9,5`, `@11,2` and `@11,7`, and everything with a centred hotspot
-/// (`@11,11` to `@12,13`) is a wait, a crosshair, a resize or an I-beam, which only the
-/// exact list tells apart.
+/// holds across sizes. From the 24 px themes: arrows sit at `@3,1` and `@4,4`, pointing
+/// hands at `@7,5` and `@8,5`, grabbing hands at `@9,5`, `@11,2` and `@11,7` (a pixel
+/// from the pointing ones, so they are listed exactly), and everything with a centred
+/// hotspot (`@11,11` to `@12,13`) is a wait, a crosshair, a resize or an I-beam, which
+/// only the exact list tells apart.
 pub fn classify(image: CursorImage) -> CursorShape {
     if image.w == 0 || image.h == 0 {
         return CursorShape::Other;
     }
 
-    if TEXT_HOTSPOTS.contains(&(image.w, image.hotspot_x, image.hotspot_y)) && image.h == image.w {
-        return CursorShape::Text;
+    let exact = (image.w, image.hotspot_x, image.hotspot_y);
+
+    if image.h == image.w {
+        if TEXT_HOTSPOTS.contains(&exact) {
+            return CursorShape::Text;
+        }
+
+        if GRAB_HOTSPOTS.contains(&exact) {
+            return CursorShape::Grab;
+        }
     }
 
     let nx = (image.hotspot_x as f64 + 0.5) / image.w as f64;
@@ -145,10 +183,18 @@ mod tests {
     }
 
     #[test]
-    fn hands_from_both_themes() {
-        // Adwaita `pointer`, `grab`, `grabbing`; Pop `pointer`, `grab`.
-        for (x, y) in [(7, 5), (11, 2), (9, 5), (8, 5), (11, 7)] {
+    fn pointing_hands_from_both_themes() {
+        // Adwaita `pointer`, Pop `pointer`.
+        for (x, y) in [(7, 5), (8, 5)] {
             assert_eq!(classify(at(x, y)), CursorShape::Hand, "@{x},{y}");
+        }
+    }
+
+    #[test]
+    fn grabbing_hands_are_not_pointing_hands() {
+        // Adwaita `grab`, `grabbing`; Pop `grab`.
+        for (x, y) in [(11, 2), (9, 5), (11, 7)] {
+            assert_eq!(classify(at(x, y)), CursorShape::Grab, "@{x},{y}");
         }
     }
 
@@ -175,9 +221,14 @@ mod tests {
     }
 
     #[test]
-    fn hands_and_i_beams_say_something_is_there() {
+    fn only_the_i_beam_accepts_and_only_hands_and_i_beams_dispute() {
+        assert!(CursorShape::Text.accepts_a_click());
+        assert!(!CursorShape::Hand.accepts_a_click());
+        assert!(!CursorShape::Grab.accepts_a_click());
+
         assert!(CursorShape::Hand.says_something_is_there());
         assert!(CursorShape::Text.says_something_is_there());
+        assert!(!CursorShape::Grab.says_something_is_there());
         assert!(!CursorShape::Arrow.says_something_is_there());
         assert!(!CursorShape::Centred.says_something_is_there());
     }
