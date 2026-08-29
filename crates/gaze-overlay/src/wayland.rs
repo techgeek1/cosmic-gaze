@@ -307,6 +307,12 @@ struct OutputSurface {
     dirty      : bool,
     /// When a frame callback was requested and has not arrived yet.
     frame_sent : Option<Instant>,
+    /// Bounding box of what the last committed buffer drew, in buffer pixels: the marks
+    /// the compositor is showing right now. Damage has to cover this as well as the new
+    /// content, whichever buffer the new content lands in.
+    on_screen  : PixelBox,
+    /// The background the last committed buffer carried, for the same reason.
+    on_screen_bg : Option<[u8; 4]>,
 }
 
 /// Double buffering for one surface. Drawing always targets the buffer the compositor is
@@ -424,9 +430,23 @@ impl App {
             return;
         };
 
-        // Repaint the union of what this buffer already held and what it needs to hold.
-        // Anything outside that rectangle is still valid from an earlier frame.
-        let repaint = {
+        // Two different rectangles. The *repaint* is what has to be redrawn in this
+        // buffer: the union of what it already held and what it needs to hold, because
+        // anything outside that is still valid from the frame this buffer last showed.
+        // The *damage* is what the compositor has to re-read: the union of what is on
+        // screen now and the new content. They differ under double buffering, and using
+        // the repaint as the damage was a real bug: a blank frame drawn into the buffer
+        // that was already blank repainted nothing, so it was committed with no damage,
+        // and the compositor kept showing the other buffer's box and cross. The click
+        // probe then captured its own marks and the widget model called them a button.
+        let damage_area = damage_for(
+            self.surfaces[index].on_screen,
+            wanted,
+            self.surfaces[index].on_screen_bg != background,
+            whole,
+        );
+
+        {
             let slot    = &mut self.surfaces[index].buffers.as_mut().unwrap().slots[slot_index];
             let repaint = {
                 if slot.background == background {
@@ -454,20 +474,29 @@ impl App {
 
             slot.content    = wanted;
             slot.background = background;
-            repaint
-        };
+        }
 
         let surface = &mut self.surfaces[index];
+
+        debug!(
+            output    = %surface.mapping.name,
+            blank     = self.state.is_blank(),
+            damage    = ?damage_area,
+            waited_ms = surface.frame_sent.map(|t| t.elapsed().as_millis()),
+            "overlay commit"
+        );
 
         surface.buffers.as_mut().unwrap().next = 1 - slot_index;
         surface.dirty                          = false;
         surface.frame_sent                     = Some(Instant::now());
+        surface.on_screen                      = wanted;
+        surface.on_screen_bg                   = background;
 
         let scale      = surface.mapping.scale;
         let wl_surface = surface.layer.wl_surface();
 
-        if !repaint.is_empty() {
-            damage(wl_surface, repaint, scale);
+        if !damage_area.is_empty() {
+            damage(wl_surface, damage_area, scale);
         }
 
         // Ask for a frame callback so the next update is paced by the compositor rather
@@ -568,6 +597,8 @@ impl App {
             buffers    : None,
             dirty      : true,
             frame_sent : None,
+            on_screen  : PixelBox::EMPTY,
+            on_screen_bg : None,
         });
     }
 
@@ -604,6 +635,12 @@ impl CompositorHandler for App {
         let Some(index) = self.surface_index(surface) else {
             return;
         };
+
+        debug!(
+            output = %self.surfaces[index].mapping.name,
+            after_ms = self.surfaces[index].frame_sent.map(|t| t.elapsed().as_millis()),
+            "overlay frame callback"
+        );
 
         self.surfaces[index].frame_sent = None;
 
@@ -812,6 +849,24 @@ fn pick_free(pool: &mut SlotPool, buffers: &Buffers) -> Option<usize> {
     order.into_iter().find(|&i| pool.canvas(&buffers.slots[i].buffer).is_some())
 }
 
+/// The rectangle the compositor has to re-read after a commit: whatever it is showing
+/// now plus whatever the new frame draws, or the whole surface when the background
+/// changed underneath everything. Empty only when nothing was and nothing will be shown.
+fn damage_for(
+    on_screen          : PixelBox,
+    wanted             : PixelBox,
+    background_changed : bool,
+    whole              : PixelBox,
+)
+    -> PixelBox
+{
+    if background_changed {
+        return whole;
+    }
+
+    on_screen.union(wanted)
+}
+
 /// Reports a repainted rectangle to the compositor. `damage_buffer` takes buffer pixels
 /// and is what we want; the pre-version-4 `damage` request takes surface-local logical
 /// pixels, so the rectangle has to be divided by the scale (and grown to be safe).
@@ -844,6 +899,19 @@ fn union_rect(a: Rect, b: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The double-buffering case that bit: a blank frame after a box must damage the box,
+    /// even though the buffer it lands in was already blank.
+    #[test]
+    fn a_blank_frame_damages_what_the_other_buffer_showed() {
+        let whole = PixelBox { x: 0, y: 0, w: 1000, h: 800 };
+        let boxed = PixelBox { x: 100, y: 100, w: 50, h: 40 };
+
+        assert_eq!(damage_for(boxed, PixelBox::EMPTY, false, whole), boxed);
+        assert_eq!(damage_for(PixelBox::EMPTY, boxed, false, whole), boxed);
+        assert!(damage_for(PixelBox::EMPTY, PixelBox::EMPTY, false, whole).is_empty());
+        assert_eq!(damage_for(PixelBox::EMPTY, PixelBox::EMPTY, true, whole), whole);
+    }
 
     #[test]
     fn union_of_the_desk_layout_covers_every_output() {

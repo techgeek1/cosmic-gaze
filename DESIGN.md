@@ -630,6 +630,26 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   paragraph box from the new tile counted as a widget in `fuse_text` and swallowed the OCR
   lines inside it (a 22 px line became a 562×209 paragraph). `Text`-class widgets no longer
   claim labels; the lines survive and smallest-box wins.
+- 2026-08-28, **the probe was recognising itself.** Seven live failure cases came in at
+  once: a box that grew every tick on an idle mouse, a 25×25 "button" (s=0.85) on empty
+  editor background around the probe's own cross, and picks cycling button/text/nothing
+  on a static screen. Instrumented run reproduced it exactly (`NOTHING → Text 14×15 →
+  Button 18×19 → Text 25×23 → Button 31×28` at one idle point). Capture ruled out first
+  (fresh `ext_image_copy_capture` session and buffer per call, full damage, no cursor).
+  Cause was in `gaze-overlay`: it double-buffers, computed the repaint as *this buffer's
+  old content ∪ new content*, and used that as the `wl_surface` damage. A blank frame
+  drawn into the already-blank buffer repainted nothing, so it was committed with no
+  damage and the compositor kept showing the other buffer's box and caption through the
+  probe's 60 ms blank. Frame callbacks 2–6 ms after commit were a red herring (pacing
+  hints, not presentation). Fix: damage = on-screen content ∪ new content (whole surface
+  on background change), tracked per surface; repaint region unchanged. Verified: blank
+  commits now carry the previous caption's box and thirteen idle ticks read identically.
+  Lesson filed: on a static screen, suspect the probe's own output before the model.
+  Still open from the same batch, all genuine model gaps rather than probe artefacts:
+  Discord's message field is not an `Input` to the model (best box 0.12 at 195×54 on the
+  DP-2 capture; the pointer there will now read the placeholder line as `Text`, which the
+  collector accepts), a 20 px pause glyph on a dark player bar reads `NOTHING`, OCR finds
+  text inside thumbnails and avatars, and a two-arrow button group comes back as one box.
 
 ## 11. Open questions
 

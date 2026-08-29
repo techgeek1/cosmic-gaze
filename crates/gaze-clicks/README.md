@@ -68,6 +68,17 @@ calls, so what the probe draws is what a click there would have been written aga
 offset shows as every box sitting a fixed distance away. The overlay blanks for 60 ms
 before each capture so its own outline is never what gets recognised; the flicker is that.
 
+The blank has to actually reach the screen, and until 2026-08-28 it did not: the overlay
+double-buffers, and a blank frame drawn into the buffer that was already blank repainted
+nothing, so it was committed with no damage and the compositor kept showing the other
+buffer's box and cross. The probe then captured its own marks: with the mouse idle the
+outline grew every tick (`NOTHING` → `Text 14x15` → `Button 18x19` → `Text 25x23` →
+`Button 31x28`), a 25x25 "button" appeared around the cross on empty background, and picks
+cycled between button, text and nothing on a static screen. `gaze-overlay` now damages
+what is on screen rather than what the target buffer held. If the probe ever looks
+unstable on a still screen again, `RUST_LOG=gaze_overlay=debug` prints every commit with
+its damage box; a blank commit with an empty box after a drawn one is this bug back.
+
 `--no-tracker` runs everything except the device: clicks, recognition, tallies and click
 records, with no gaze frames or stop windows. It is the way to exercise the rules with
 the tracker in use elsewhere.
