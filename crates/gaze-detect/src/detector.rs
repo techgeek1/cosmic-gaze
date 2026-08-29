@@ -8,7 +8,7 @@ use gaze_core::{Element, GlobalPx, Rect};
 use crate::detection::{Detection, drop_oversized, fuse_text, nms};
 use crate::error::{DetectError, Result};
 use crate::ocr::{OcrWindow, TextConfig, TextModel, ocr_window};
-use crate::tile::{plan_tiles, tiles_containing};
+use crate::tile::{plan_tiles, tile_at, tiles_containing};
 use crate::widget::WidgetModel;
 
 /// File name of the exported TargetFinder widget detector inside the models directory.
@@ -63,6 +63,30 @@ pub struct DetectConfig {
     pub widgets      : bool,
     /// Whether to run the text model at all.
     pub ocr          : bool,
+}
+
+/// What [`Detector::detect_near`] reads around the point, on top of the shared
+/// [`DetectConfig`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NearConfig {
+    /// Side of the native-resolution text window, frame pixels. 640 costs about 62 ms on
+    /// the reference machine and returns line-level boxes.
+    pub ocr_px  : u32,
+    /// Side of the extra widget tile centred on the point, frame pixels; zero runs the
+    /// plan's tiles only. At the model's own input size (640) the tile costs one more
+    /// inference, about 28 ms, and shows the model small controls at full resolution: on a
+    /// YouTube action column the 50 px icon buttons score 0.23 to 0.42 from the 1024 px
+    /// plan tiles and 0.79 to 0.95 from this one (see [`tile_at`]).
+    pub tile_px : u32,
+}
+
+impl Default for NearConfig {
+    fn default() -> Self {
+        NearConfig {
+            ocr_px  : 640,
+            tile_px : 640,
+        }
+    }
 }
 
 /// Wall clock cost of one `detect` call, split by stage.
@@ -237,6 +261,13 @@ impl Detector {
     /// is that tiles which cannot hold the point are skipped. One to four tiles instead of
     /// ten on the ultrawide.
     ///
+    /// On top of the plan, one tile of `near.tile_px` centred on the point ([`tile_at`]).
+    /// The plan tiles shrink the frame 1.6x into the model input and lose small icon
+    /// buttons to the labels beside them; a tile at the input's own size shows them at
+    /// full resolution. Its boxes go through the same NMS as the plan's, so a control both
+    /// see is kept once, at the higher score. It cannot replace the plan: a box wider than
+    /// the tile can only be whole in a plan tile.
+    ///
     /// **Text.** The opposite trade. The full pass shrinks the frame to `ocr_max_side` for
     /// time, and on a 3840x1600 panel that merges lines into paragraph blobs. Locally
     /// there is no need: an `ocr_px` square at native resolution costs about 62 ms and
@@ -245,7 +276,7 @@ impl Detector {
     ///
     /// A point outside the frame yields no elements and zeroed timings apart from
     /// `total_ms`.
-    // The argument list is `detect_timed`'s plus the point and the window it reads.
+    // The argument list is `detect_timed`'s plus the point and what to read around it.
     // Packing it into a struct would move the same fields somewhere else, not remove them.
     #[allow(clippy::too_many_arguments)]
     pub fn detect_near(
@@ -256,7 +287,7 @@ impl Detector {
         origin : GlobalPx,
         scale  : f64,
         at     : GlobalPx,
-        ocr_px : u32,
+        near   : NearConfig,
     )
         -> Result<(Vec<Element>, DetectTimings)>
     {
@@ -280,13 +311,18 @@ impl Detector {
             return Ok((Vec::new(), timings));
         }
 
-        // Widgets, from the tiles of the full plan that can hold the point.
+        // Widgets, from the tiles of the full plan that can hold the point, plus the
+        // full-resolution look centred on it.
         let mut widgets = Vec::new();
 
         if let Some(model) = &self.widget {
-            let t0    = Instant::now();
-            let plan  = plan_tiles(w, h, self.config.tile_px, self.config.tile_overlap, model.input_px());
-            let tiles = tiles_containing(&plan, fx, fy);
+            let t0        = Instant::now();
+            let plan      = plan_tiles(w, h, self.config.tile_px, self.config.tile_overlap, model.input_px());
+            let mut tiles = tiles_containing(&plan, fx, fy);
+
+            if near.tile_px > 0 {
+                tiles.push(tile_at(w, h, fx, fy, near.tile_px, model.input_px()));
+            }
 
             widgets           = model.detect_tiles(rgba, w, h, &tiles, self.config.widget_conf)?;
             timings.tiles     = tiles.len();
@@ -298,7 +334,7 @@ impl Detector {
 
         if let Some(model) = &self.text {
             let t0     = Instant::now();
-            let window = ocr_window(w, h, fx, fy, ocr_px);
+            let window = ocr_window(w, h, fx, fy, near.ocr_px);
             let pixels = copy_window(rgba, w, &window);
 
             let cfg = TextConfig {

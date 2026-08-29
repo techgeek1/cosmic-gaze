@@ -13,7 +13,7 @@ let elements = detector.detect(&frame.rgba, frame.width, frame.height, origin, s
 
 ## `detect_near`: everything that could be under one point
 
-`detect_near(rgba, w, h, origin, scale, at, ocr_px)` is the pass a click collector wants,
+`detect_near(rgba, w, h, origin, scale, at, near)` is the pass a click collector wants,
 and it makes two opposite trades against the full pass. For **widgets** it builds the
 *same* tile plan `detect_timed` builds and runs only the tiles whose rectangle contains
 `at`, which is one to four instead of ten on the ultrawide. That loses nothing: a box is
@@ -23,10 +23,27 @@ crop cuts new pixels and hands them to the model as a whole image, which changes
 context a wide flat list row is recognised by, and it measured 0 agreements out of 12
 (`gaze-clicks/README.md`). Here the model sees the same 1024 px tile at the same scale
 with the same surroundings. For **text** it goes the other way: the model runs at native
-resolution over an `ocr_px` square window centred on the point, shrinking at the frame
-edges rather than padding. The full pass caps the frame at `ocr_max_side` for time, and on
-a 3840 px panel that merges lines into paragraph blobs; locally there is nothing to save,
-and a 640 px window costs about 62 ms and returns line-level boxes around 20 px tall.
+resolution over a `near.ocr_px` square window centred on the point, shrinking at the
+frame edges rather than padding. The full pass caps the frame at `ocr_max_side` for time,
+and on a 3840 px panel that merges lines into paragraph blobs; locally there is nothing to
+save, and a 640 px window costs about 62 ms and returns line-level boxes around 20 px tall.
+
+On top of the plan's tiles it runs **one more widget tile**, `near.tile_px` (default 640)
+centred on the point (`tile_at`), through the same NMS. The plan's 1024 px tiles reach the
+640 px model input at 0.625x, and that is where small icon buttons go: on a YouTube action
+column at scale 1 the 50 px circles score 0.23 to 0.42 from the plan tiles while the text
+labels under them score 0.55 to 0.58, so a 0.5 gate keeps the label and loses the button;
+the same circles score 0.79 to 0.95 from the pointer tile, and a Discord server-icon
+column the plan tiles miss entirely comes back at 0.51 to 0.90. Over 40 sampled points on
+the two reference captures the pointer tile changed the smallest containing box at five:
+two same-box refinements, two nested sub-controls (a status-dot pair inside a sidebar row,
+a path inside a prompt line) and one gained icon. It cannot replace the plan, because a box
+wider than the tile is whole only in a plan tile. `tile_px` of zero turns it off.
+
+Widget boxes of kind `Text` do not claim OCR lines in `fuse_text`. The widget model has a
+text class and emits paragraph-sized boxes with it; letting those swallow the lines under
+them undid the native OCR at the first point tested (a 22 px line replaced by a 562x209
+paragraph). Both survive; a smallest-box hit test prefers the line.
 
 `max_widget_w` / `max_widget_h` (both default `0.0`, unlimited) drop widget boxes bigger
 than the given frame pixels **before** NMS and fusion. The ordering is the point: an
@@ -34,10 +51,12 @@ oversized spurious "control" drawn over a paragraph would otherwise swallow ever
 line inside it as its own label.
 
 Measured here on a 5950X with the machine under heavy unrelated load (mean of eight,
-best in brackets). `--near 700,500` on DP-1 3840x1600, one tile: widget 42 ms (39),
-OCR 66 ms (58), total 109 ms (100). `--near 1300,180` on DP-2 2560x1440, one tile:
-widget 38 ms (33), OCR 72 ms (59), total 110 ms (93). Against 384 ms and 375 ms for the
-respective full passes. A four-tile point costs roughly three more widget inferences.
+best in brackets), before the pointer tile. `--near 700,500` on DP-1 3840x1600, one
+tile: widget 42 ms (39), OCR 66 ms (58), total 109 ms (100). `--near 1300,180` on DP-2
+2560x1440, one tile: widget 38 ms (33), OCR 72 ms (59), total 110 ms (93). Against 384 ms
+and 375 ms for the respective full passes. A four-tile point costs roughly three more
+widget inferences. On an idle machine the same DP-1 point is 72 ms with `--near-tile 0`
+and 95 ms with the default pointer tile (widget 29 ms to 51 ms, OCR 43 ms either way).
 
 ## Getting the models
 
@@ -243,14 +262,15 @@ the cost of `WidgetModel` holding N sessions instead of one.
 gaze-detect-cli IMAGE [--models DIR] [--origin X,Y] [--scale S]
                       [--json out.json] [--overlay out.png] [--bench N]
                       [--tile PX] [--ocr-max-side PX] [--conf F] [--threads N]
-                      [--max-widget W,H] [--near X,Y] [--ocr-px N]
+                      [--max-widget W,H] [--near X,Y] [--ocr-px N] [--near-tile N]
                       [--no-widgets] [--no-ocr]
 ```
 
 `--near X,Y` switches to `detect_near` at that point, given in the **image's own frame
 pixels** whatever `--origin` and `--scale` say, and `--bench` then benches `detect_near`
 rather than the full pass. `--ocr-px N` (default 640) is the side of the native-resolution
-text window it reads. `--max-widget W,H` sets the two size limits in frame pixels, zero on
+text window it reads, and `--near-tile N` (default 640, 0 to disable) the side of the
+extra widget tile centred on the point. `--max-widget W,H` sets the two size limits in frame pixels, zero on
 an axis for unlimited. The output format is unchanged, so runs diff against each other;
 with `--near` a `near:` line is added under `image:`.
 

@@ -29,8 +29,8 @@ pub mod tile;
 pub mod widget;
 
 pub use detection::{Detection, drop_oversized, fuse_text, nms};
-pub use detector::{DetectConfig, DetectTimings, Detector, DetectorBuilder, TEXT_MODEL, WIDGET_MODEL};
+pub use detector::{DetectConfig, DetectTimings, Detector, DetectorBuilder, NearConfig, TEXT_MODEL, WIDGET_MODEL};
 pub use error::{DetectError, Result};
 pub use ocr::{OcrWindow, ocr_window};
-pub use tile::{Tile, plan_tiles, tiles_containing};
+pub use tile::{Tile, plan_tiles, tile_at, tiles_containing};
 pub use widget::{CLASS_NAMES, kind_for_class};

@@ -26,7 +26,9 @@
 //! *same* tile plan the whole-frame pass builds and runs the one to four tiles that
 //! contain the pointer, so the model sees the row inside its real 1024 px surroundings at
 //! the real scale; the only thing skipped is tiles that cannot hold a box containing the
-//! pointer. The text model then runs at **native** resolution over a 640 px window, which
+//! pointer. One more tile, 640 px centred on the pointer, shows the model the small
+//! controls the plan's 1.6x shrink loses (icon buttons; see `element::NEAR_TILE_PX`).
+//! The text model then runs at **native** resolution over a 640 px window, which
 //! is the opposite trade and the other half of the fix: the whole-frame pass shrinks a
 //! 3840 px panel to 1600 for time and merges paragraphs into single blobs, while the
 //! local window keeps lines at ~20 px each for about 62 ms.
@@ -72,7 +74,7 @@ use gaze_detect::Detector;
 use tracing::{debug, warn};
 
 use crate::element::{
-    Crop, FLAT_HALF_PX, OCR_PX, collector_config, crop_around, extract, luma_sd, mean_luma,
+    Crop, FLAT_HALF_PX, collector_config, crop_around, extract, luma_sd, mean_luma, near_config,
 };
 use crate::frames::{CachedFrame, FrameChoice, RollingCache, select_frame};
 
@@ -453,7 +455,7 @@ fn recognise(detector: &Detector, job: &DetectJob) -> DetectOutcome {
         origin,
         frame.scale(),
         job.request.px,
-        OCR_PX,
+        near_config(),
     );
 
     // The luminance window is a small copy out of the same buffer; NaN rather than a

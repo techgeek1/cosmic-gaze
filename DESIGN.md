@@ -613,6 +613,23 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   ±24 px window) that refuses a box taller than 60 px when the pointer is on blank;
   collector and probe share `pick`. Live: ~100 ms capture-to-outline at 4 Hz, and the
   pointer on empty desktop reads `NOTHING` (0 boxes, σ 0.006) rather than a claim.
+- 2026-08-28, `gaze-clicks` recognition v3.1: **a full-resolution pointer tile.** Live
+  report: on YouTube's action column the probe outlined the count label or the icon glyph
+  instead of the button. Cause, reproduced on the screenshot: the 1024 px plan tiles reach
+  the 640 px model input at 0.625×, and the 50 px circles (scale 1) score 0.23–0.42 there
+  while the labels beneath score 0.55–0.58, so the 0.5 gate keeps the label; the thumb
+  glyph itself comes back from native OCR as 10×9 px "text". A second widget tile of
+  640 px centred on the pointer (`tile_at`, `NearConfig::tile_px`) shows the model the
+  pixels unscaled: the same circles score 0.79–0.95 (icon+label as one control), and a
+  Discord server-icon column the plan tiles miss outright comes back at 0.51–0.90. It
+  supplements the plan rather than replacing it (a box wider than the tile is whole only in
+  a plan tile), goes through the same NMS, and costs one inference: 72 → 95 ms at a
+  one-tile point, idle machine. Over 40 sampled points on the two captures the pick changed
+  at five — two same-box refinements, two nested sub-controls, one gained icon — plus one
+  regression that exposed a latent bug: the widget model has a `Text` class, and its
+  paragraph box from the new tile counted as a widget in `fuse_text` and swallowed the OCR
+  lines inside it (a 22 px line became a 562×209 paragraph). `Text`-class widgets no longer
+  claim labels; the lines survive and smallest-box wins.
 
 ## 11. Open questions
 

@@ -94,8 +94,19 @@ one is what the user aimed at.
 ## Why local, and why not a crop
 
 `detect_near` runs the widget tiles of the *full* tile plan that contain the pointer, one
-to four instead of ten on the ultrawide, and runs the text model at native resolution over
-a 640 px square window centred there. The two halves are opposite trades and both matter.
+to four instead of ten on the ultrawide, plus one 640 px widget tile centred on the
+pointer, and runs the text model at native resolution over a 640 px square window centred
+there. The two halves are opposite trades and both matter.
+
+The pointer tile is the model's own input size, so it sees the pixels there unscaled. The
+plan's 1024 px tiles shrink everything 1.6x, and that loses small icon buttons to the
+labels beside them: on YouTube's action column (50 px circles at scale 1) the plan tiles
+scored the circles 0.23 to 0.42 and the counts under them 0.55 to 0.58, so the 0.5 gate
+outlined "4.2万" and the thumb glyph's OCR fragments instead of the button. The pointer
+tile scores the same circles 0.79 to 0.95, and finds the Discord server-icon column the
+plan tiles miss. Cost is one more inference, about 23 ms on this desk; over 40 sampled
+points on the reference captures it changed the pick at five, all refinements, nested
+sub-controls or gains (`gaze-detect/README.md`).
 
 The widget half loses nothing, because a box is only ever emitted by a tile that holds it
 whole, so any box containing the point lies in a tile containing the point. Checked on

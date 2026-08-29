@@ -82,6 +82,12 @@ pub fn nms(mut dets: Vec<Detection>, iou_thresh: f64) -> Vec<Detection> {
 /// is the intersection area over the *text* box area rather than IoU, because a label is
 /// much smaller than its button and their IoU is low even when the label is fully
 /// enclosed. Text that only clips a widget's edge (a caption abutting a toolbar) survives.
+///
+/// A widget box of kind [`ElementKind::Text`] claims nothing. The widget model has a text
+/// class of its own and emits paragraph-sized boxes with it; those describe the same
+/// pixels the OCR lines do, only coarser, and letting them swallow the lines would undo
+/// the native-resolution OCR that exists to get line-level boxes. Both survive, and a
+/// smallest-box hit test prefers the line.
 pub fn fuse_text(
     widgets        : &[Detection],
     texts          : Vec<Detection>,
@@ -89,6 +95,8 @@ pub fn fuse_text(
 )
     -> Vec<Detection>
 {
+    let claimants: Vec<&Detection> = widgets.iter().filter(|w| w.kind != ElementKind::Text).collect();
+
     texts
         .into_iter()
         .filter(|t| {
@@ -99,7 +107,7 @@ pub fn fuse_text(
                 return false;
             }
 
-            !widgets.iter().any(|w| intersection_area(&w.rect, &t.rect) / area > contain_thresh)
+            !claimants.iter().any(|w| intersection_area(&w.rect, &t.rect) / area > contain_thresh)
         })
         .collect()
 }
@@ -142,6 +150,21 @@ mod tests {
             kind   : ElementKind::Text,
             source : ElementSource::Ocr,
         }
+    }
+
+    /// A paragraph box the widget model labelled `Text` sits over the same pixels as the
+    /// OCR lines inside it and must not swallow them; a button over the same lines does.
+    #[test]
+    fn fuse_ignores_text_class_widgets() {
+        let paragraph = Detection {
+            kind : ElementKind::Text,
+            ..widget(0.0, 0.0, 600.0, 200.0, 0.55)
+        };
+        let button = widget(0.0, 0.0, 600.0, 200.0, 0.55);
+        let lines  = || vec![text(10.0, 10.0, 500.0, 22.0), text(10.0, 50.0, 500.0, 22.0)];
+
+        assert_eq!(fuse_text(&[paragraph], lines(), 0.7).len(), 2);
+        assert_eq!(fuse_text(&[button], lines(), 0.7).len(), 0);
     }
 
     /// Zero on an axis is "unlimited", which is the default and must change nothing.

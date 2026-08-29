@@ -84,11 +84,7 @@ pub fn plan_tiles(
     let tw = tile_px.min(w);
     let th = tile_px.min(h);
 
-    // The scale is shared by both axes so the tile is not distorted. A tile that is
-    // square and exactly `input_px` across is the common case and gives scale 1.
-    let scale = (input_px as f64 / tw as f64).min(input_px as f64 / th as f64);
-    let pad_x = (input_px as f64 - tw as f64 * scale) * 0.5;
-    let pad_y = (input_px as f64 - th as f64 * scale) * 0.5;
+    let (scale, pad_x, pad_y) = fit(tw, th, input_px);
 
     let xs = axis_starts(w, tw, overlap);
     let ys = axis_starts(h, th, overlap);
@@ -113,6 +109,43 @@ pub fn plan_tiles(
     tiles
 }
 
+/// One tile of `tile_px` frame pixels centred on the frame-pixel point `(fx, fy)`, pulled
+/// back inside the frame when the point is near an edge.
+///
+/// This is the second look `detect_near` takes. The plan's tiles are sized for coverage
+/// (1024 px into a 640 input, so a 50 px icon button is seen at 31 px, where the widget
+/// model starts to lose it to the text label beside it); a tile the size of the model
+/// input shows the same button at full resolution. It is a supplement, not a replacement:
+/// a box wider than the tile can only come from the plan, which is the failure a plain
+/// crop had (see `gaze-clicks`' README). A frame smaller than the tile on an axis gives a
+/// tile that spans the frame on that axis, letterboxed like `plan_tiles` does.
+pub fn tile_at(
+    w        : u32,
+    h        : u32,
+    fx       : f64,
+    fy       : f64,
+    tile_px  : u32,
+    input_px : u32,
+)
+    -> Tile
+{
+    let tw = tile_px.min(w);
+    let th = tile_px.min(h);
+
+    let (scale, pad_x, pad_y) = fit(tw, th, input_px);
+
+    Tile {
+        x     : centred_start(w, tw, fx),
+        y     : centred_start(h, th, fy),
+        w     : tw,
+        h     : th,
+        scale : scale,
+        pad_x : pad_x,
+        pad_y : pad_y,
+        input : input_px,
+    }
+}
+
 /// The tiles of a plan whose rectangle contains the frame-pixel point `(fx, fy)`.
 ///
 /// This is what makes pointer-local detection exact rather than approximate. A box is only
@@ -126,6 +159,27 @@ pub fn plan_tiles(
 /// A degenerate `Vec` (no tile contains the point) means the point is outside the frame.
 pub fn tiles_containing(tiles: &[Tile], fx: f64, fy: f64) -> Vec<Tile> {
     tiles.iter().filter(|t| t.contains(fx, fy)).copied().collect()
+}
+
+/// The uniform scale and letterbox padding that render a `tw` x `th` tile into an
+/// `input_px` square model input.
+///
+/// The scale is shared by both axes so the tile is not distorted. A tile that is square
+/// and exactly `input_px` across is the common case and gives scale 1 with no padding.
+fn fit(tw: u32, th: u32, input_px: u32) -> (f64, f64, f64) {
+    let scale = (input_px as f64 / tw as f64).min(input_px as f64 / th as f64);
+    let pad_x = (input_px as f64 - tw as f64 * scale) * 0.5;
+    let pad_y = (input_px as f64 - th as f64 * scale) * 0.5;
+
+    (scale, pad_x, pad_y)
+}
+
+/// Start offset along one axis of a `tile`-long window centred on `at`, clamped so the
+/// window stays inside `extent`. A window as long as the axis starts at zero.
+fn centred_start(extent: u32, tile: u32, at: f64) -> u32 {
+    let max = f64::from(extent - tile);
+
+    (at - f64::from(tile) * 0.5).round().clamp(0.0, max) as u32
 }
 
 /// Start offsets along one axis so that tiles of `tile` cover `extent` with `overlap`.
@@ -148,7 +202,7 @@ fn axis_starts(extent: u32, tile: u32, overlap: f64) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tile, axis_starts, plan_tiles, tiles_containing};
+    use super::{Tile, axis_starts, centred_start, plan_tiles, tile_at, tiles_containing};
 
     /// The ultrawide case the tiler exists for: full coverage, no tile off the edge, and
     /// the requested overlap actually present between neighbours.
@@ -350,5 +404,41 @@ mod tests {
 
         assert_eq!(t.to_frame(0.0, 0.0), (100.0, 200.0));
         assert_eq!(t.to_frame(640.0, 640.0), (420.0, 520.0));
+    }
+
+    /// The pointer tile is centred where it can be and slides back inside the frame at the
+    /// edges, keeping full size so its scale stays 1 like the plan's.
+    #[test]
+    fn tile_at_centres_and_clamps() {
+        let t = tile_at(3840, 1600, 2000.0, 800.0, 640, 640);
+
+        assert_eq!((t.x, t.y, t.w, t.h), (1680, 480, 640, 640));
+        assert_eq!(t.scale, 1.0);
+        assert!(t.contains(2000.0, 800.0));
+
+        let corner = tile_at(3840, 1600, 10.0, 1595.0, 640, 640);
+
+        assert_eq!((corner.x, corner.y), (0, 960));
+        assert!(corner.contains(10.0, 1595.0));
+
+        let far = tile_at(3840, 1600, 3839.0, 0.0, 640, 640);
+
+        assert_eq!((far.x, far.y), (3200, 0));
+        assert!(far.contains(3839.0, 0.0));
+    }
+
+    /// A frame smaller than the tile on an axis is spanned on that axis and letterboxed
+    /// into the square input, the same way `plan_tiles` handles it.
+    #[test]
+    fn tile_at_letterboxes_a_short_frame() {
+        let t = tile_at(1000, 400, 500.0, 200.0, 640, 640);
+
+        assert_eq!((t.x, t.y, t.w, t.h), (180, 0, 640, 400));
+        assert_eq!(t.scale, 1.0);
+        assert_eq!(t.pad_x, 0.0);
+        assert_eq!(t.pad_y, 120.0);
+
+        assert_eq!(centred_start(400, 400, 200.0), 0);
+        assert_eq!(centred_start(400, 400, 0.0), 0);
     }
 }

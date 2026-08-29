@@ -21,7 +21,7 @@
 //! probe draws on screen is the thing a click would have been labelled with.
 
 use gaze_core::{Element, ElementKind, GlobalPx, Rect};
-use gaze_detect::DetectConfig;
+use gaze_detect::{DetectConfig, NearConfig};
 
 /// Half-width of the luminance window taken around the pointer, logical pixels. Wide
 /// enough to average over the panel or page the click landed in rather than the widget
@@ -53,6 +53,13 @@ pub const MAX_WIDGET_H_PX: f64 = 240.0;
 /// Side of the native-resolution text window read around the pointer, frame pixels.
 /// 640 costs about 62 ms and returns line-level boxes, median height around 20 px.
 pub const OCR_PX: u32 = 640;
+
+/// Side of the extra widget tile centred on the pointer, frame pixels. The model's own
+/// input size, so it sees the pixels there unscaled: the 1024 px plan tiles shrink a
+/// 50 px icon button to 31 px and score YouTube's action column 0.23 to 0.42, under the
+/// gate, so the label beneath each icon won instead; this tile scores the same buttons
+/// 0.79 to 0.95. One more inference, about 28 ms.
+pub const NEAR_TILE_PX: u32 = 640;
 
 /// Half-width of the flatness window taken around the pointer, logical pixels.
 ///
@@ -344,6 +351,14 @@ pub fn collector_config() -> DetectConfig {
         max_widget_w : MAX_WIDGET_W_PX,
         max_widget_h : MAX_WIDGET_H_PX,
         ..DetectConfig::default()
+    }
+}
+
+/// What `detect_near` reads around the pointer, for the collector and the probe alike.
+pub fn near_config() -> NearConfig {
+    NearConfig {
+        ocr_px  : OCR_PX,
+        tile_px : NEAR_TILE_PX,
     }
 }
 

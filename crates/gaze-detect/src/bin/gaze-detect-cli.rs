@@ -7,8 +7,8 @@
 //! ```
 //!
 //! `--near X,Y` switches to `Detector::detect_near`, the pointer-local pass a click
-//! collector uses: only the widget tiles holding the point, and a native-resolution text
-//! window around it.
+//! collector uses: only the widget tiles holding the point plus one full-resolution tile
+//! centred on it, and a native-resolution text window around it.
 
 // The workspace style is explicit struct field syntax everywhere, which clippy reads as
 // redundant. Same allow as `gaze-core`.
@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use gaze_core::{Element, ElementKind, ElementSource, GlobalPx};
-use gaze_detect::{DetectConfig, DetectTimings, Detector};
+use gaze_detect::{DetectConfig, DetectTimings, Detector, NearConfig};
 use image::{Rgba, RgbaImage};
 
 /// Command line arguments.
@@ -78,6 +78,11 @@ struct Args {
     /// Side of the native-resolution text window `--near` reads, frame pixels.
     #[arg(long, default_value_t = 640)]
     ocr_px : u32,
+
+    /// Side of the extra widget tile `--near` centres on the point, frame pixels; 0 runs
+    /// the plan's tiles only.
+    #[arg(long, default_value_t = 640)]
+    near_tile : u32,
 
     /// onnxruntime intra-op threads; 0 for its default.
     #[arg(long)]
@@ -194,7 +199,12 @@ fn detect_once(
         y : args.origin.y + near.y / args.scale,
     };
 
-    Ok(detector.detect_near(rgba, w, h, args.origin, args.scale, at, args.ocr_px)?)
+    let near = NearConfig {
+        ocr_px  : args.ocr_px,
+        tile_px : args.near_tile,
+    };
+
+    Ok(detector.detect_near(rgba, w, h, args.origin, args.scale, at, near)?)
 }
 
 // --- Reporting ---
@@ -204,7 +214,10 @@ fn report(args: &Args, w: u32, h: u32, elements: &[Element], t: &DetectTimings) 
     println!("image:   {} ({w}x{h} px, origin {},{} scale {})", args.image.display(), args.origin.x, args.origin.y, args.scale);
 
     if let Some(near) = args.near {
-        println!("near:    frame ({:.0}, {:.0}), ocr window {} px", near.x, near.y, args.ocr_px);
+        println!(
+            "near:    frame ({:.0}, {:.0}), ocr window {} px, pointer tile {} px",
+            near.x, near.y, args.ocr_px, args.near_tile
+        );
     }
 
     println!("tiles:   {}", t.tiles);
