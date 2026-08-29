@@ -5,6 +5,14 @@
 //! on the window's frame, then role, name and extents of what came back, then a bounded
 //! climb through `Parent` to the nearest ancestor that is something a person clicks.
 //!
+//! The one exception is a hit on a *vacant* node: a nameless, childless, generic
+//! container. Toolkits hit-test topmost first, and an invisible overlay drawn over the
+//! content (VS Code keeps a full-window one for drag regions) wins the toolkit's own
+//! descent with a node that has nothing to say, while the populated document sits in a
+//! covered sibling branch. [`A11y::at`] punches through: climb from the vacant node and
+//! hit-test each ancestor's other point-containing children, topmost first, taking the
+//! first non-vacant answer.
+//!
 //! # Coordinates
 //!
 //! AT-SPI has two coordinate types, screen (0) and window (1), and on Wayland neither is
@@ -54,6 +62,10 @@ const NULL_PATH: &str = "/org/a11y/atspi/null";
 /// content nests deeply, but a click target is rarely more than a few levels above the
 /// text or image it was made on.
 const MAX_CLIMB: usize = 12;
+
+/// How many ancestors [`A11y::at`] will climb from a vacant hit looking for the covered
+/// sibling branch. The overlay and the content are usually direct siblings.
+const MAX_PUNCH: usize = 4;
 
 /// AT-SPI coordinate types, as `Component` methods take them. Both are used
 /// frame-relative; see the module docs.
@@ -246,11 +258,24 @@ impl A11y {
                 continue;
             }
 
+            // An invisible overlay covering the content wins the toolkit's hit test
+            // with a node that says nothing; ask what it was covering instead.
+            let mut hit = (leaf_bus, leaf_path);
+
+            if self.is_vacant(&hit.0, &hit.1)
+                && let Some(covered) = self.punch_through(hit.clone(), &frame, x, y, mode.atspi())
+            {
+                debug!(?mode, from = %hit.1, to = %covered.1, "punched through a vacant hit");
+                hit = covered;
+            }
+
+            let (leaf_bus, leaf_path) = hit;
+
             // Accept the interpretation only if the node agrees it is there.
             let extents = self.extents(&leaf_bus, &leaf_path, mode.atspi());
 
-            if let Some((ex, ey, ew, eh)) = extents
-                && !(x >= ex && x < ex + ew && y >= ey && y < ey + eh)
+            if let Some(extents) = extents
+                && !contains(extents, x, y)
             {
                 debug!(?mode, x, y, ?extents, "node does not contain the query point");
 
@@ -365,16 +390,9 @@ impl A11y {
         while climbed < MAX_CLIMB {
             climbed += 1;
 
-            let proxy = self.proxy(&bus, &path, IFACE_ACCESSIBLE)?;
-            let (pb, pp): (String, OwnedObjectPath) = proxy
-                .get_property("Parent")
-                .map_err(|e| A11yError::Call { method: "Parent", detail: e.to_string() })?;
-
-            let pp = pp.to_string();
-
-            if pp == NULL_PATH || pp == ROOT_PATH || pp == path {
+            let Some((pb, pp)) = self.parent(&bus, &path)? else {
                 break;
-            }
+            };
 
             bus  = pb;
             path = pp;
@@ -392,6 +410,89 @@ impl A11y {
         }
 
         Ok((None, climbed))
+    }
+
+    /// A replacement for a vacant hit: the covered sibling branch's answer.
+    ///
+    /// Climbs from the vacant node; at each ancestor, hit-tests the other children that
+    /// contain the point, topmost (last) first, and returns the first non-vacant answer.
+    /// Opportunistic: any failure along the way just means no better answer.
+    fn punch_through(&self, vacant: (String, String), frame: &str, x: i32, y: i32, coord: u32)
+        -> Option<(String, String)>
+    {
+        let mut came = vacant;
+
+        for _ in 0..MAX_PUNCH {
+            let (pb, pp) = self.parent(&came.0, &came.1).ok().flatten()?;
+
+            for (cb, cp) in self.children(&pb, &pp).unwrap_or_default().into_iter().rev() {
+                if cb == came.0 && cp == came.1 {
+                    continue;
+                }
+
+                let Some(extents) = self.extents(&cb, &cp, coord) else { continue };
+
+                if !contains(extents, x, y) {
+                    continue;
+                }
+
+                // The branch's own hit test, or the branch itself if it answers null.
+                let Ok((hb, hp)) = self.at_point(&cb, &cp, x, y, coord) else { continue };
+                let (hb, hp)     = if hp == NULL_PATH { (cb, cp) } else { (hb, hp) };
+
+                if !self.is_vacant(&hb, &hp) {
+                    return Some((hb, hp));
+                }
+            }
+
+            if pp == frame {
+                return None;
+            }
+
+            came = (pb, pp);
+        }
+
+        None
+    }
+
+    /// Whether a node is a nameless, childless, generic container: a hit on one says
+    /// nothing about what is drawn there.
+    fn is_vacant(&self, bus: &str, path: &str) -> bool {
+        let role: Option<String> = self
+            .proxy(bus, path, IFACE_ACCESSIBLE)
+            .ok()
+            .and_then(|p| p.call("GetRoleName", &()).ok());
+
+        if !matches!(role.as_deref(), Some("panel" | "filler" | "unknown" | "redundant object")) {
+            return false;
+        }
+
+        if self.name(bus, path).is_some_and(|n| !n.is_empty()) {
+            return false;
+        }
+
+        let count: Option<i32> = self
+            .proxy(bus, path, IFACE_ACCESSIBLE)
+            .ok()
+            .and_then(|p| p.get_property("ChildCount").ok());
+
+        count == Some(0)
+    }
+
+    /// The `Parent` property, or `None` past the top of the tree.
+    fn parent(&self, bus: &str, path: &str) -> Result<Option<(String, String)>, A11yError> {
+        let proxy = self.proxy(bus, path, IFACE_ACCESSIBLE)?;
+        let (pb, pp): (String, OwnedObjectPath) = proxy
+            .get_property("Parent")
+            .map_err(|e| A11yError::Call { method: "Parent", detail: e.to_string() })?;
+
+        let pp = pp.to_string();
+
+        if pp == NULL_PATH || pp == ROOT_PATH || pp == path {
+            return Ok(None);
+        }
+
+        Ok(Some((pb, pp)))
     }
 
     /// `Accessible.GetChildren`.
@@ -428,6 +529,13 @@ pub fn is_actionable(role: &str) -> bool {
             | "check menu item" | "radio menu item" | "page tab" | "slider" | "spin button"
             | "image" | "tree item" | "table cell" | "heading"
     )
+}
+
+/// Whether extents `(x, y, w, h)` contain the point.
+fn contains(extents: (i32, i32, i32, i32), x: i32, y: i32) -> bool {
+    let (ex, ey, ew, eh) = extents;
+
+    x >= ex && x < ex + ew && y >= ey && y < ey + eh
 }
 
 // --- Tests ---

@@ -54,6 +54,7 @@ and `(10, 10)` for Discord. A frame no larger than its toplevel adds nothing.
 | --- | --- | --- |
 | Firefox | yes | yes, roles and extents correct |
 | Discord (Electron, Flatpak) | with the override below | yes, 2–10 ms; `link` rows with names and extents |
+| VS Code (Electron, native) | yes | with `--force-renderer-accessibility` and the punch-through below; buttons, menus, headings, list items at 3–5 ms |
 | steamwebhelper (Chromium) | yes, as "Chromium" | thirteen unnamed frames, null at every point: accessibility off |
 | COSMIC Terminal, other iced apps | no | — |
 
@@ -72,6 +73,22 @@ printf -- '--force-renderer-accessibility\n' \
 
 then restart Discord. The flag keeps the renderer's tree built whether or not an
 assistive technology is asking; the variable is what puts the app on the bus.
+
+A *native* Electron app skips the sandbox problem — the host gsetting is already true, so
+it sits on the bus with a named frame — but still needs the flag for the renderer tree.
+VS Code's wrapper (`/usr/bin/code`) reads `~/.config/code-flags.conf`, one flag per line,
+same as Discord's.
+
+VS Code adds one more trap: even with the tree fully populated, `GetAccessibleAtPoint` on
+the frame answered a nameless, childless panel for every content point. Its workbench
+keeps an invisible full-window overlay as a *later sibling* of the branch holding the
+`document web`, and Chromium hit-tests topmost first, so the empty overlay wins. `at`
+now treats a hit on such a *vacant* node (nameless, childless, generic container role) as
+a non-answer and punches through: climb from it, hit-test each ancestor's other
+point-containing children topmost first, take the first non-vacant answer. Verified with
+a 40–80 px grid: menu items, title-bar buttons, welcome-page headings and buttons all
+answer with names and extents. VS Code's frame extents equal its toplevel exactly (no
+shadow insets, custom title bar), so the shadow rule is a no-op there.
 
 Do **not** reach for `org.a11y.Status.ScreenReaderEnabled` on COSMIC: at-spi-bus-launcher
 mirrors it into `org.gnome.desktop.a11y.applications screen-reader-enabled`,

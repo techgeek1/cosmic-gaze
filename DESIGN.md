@@ -732,6 +732,20 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   `(20, 20) 1271x1428`). Measured symmetric on the desk, so the content origin is now
   `frame.origin + (frame.size - toplevel.size) / 2`, which covers both toolkits;
   verified with a 60 px grid drawn on a capture, headings box their text exactly.
+- 2026-08-29, VS Code on the tree, and the vacant-overlay punch-through. Native package,
+  so the host gsetting already had it on the bus with a named frame; the renderer tree
+  needed `--force-renderer-accessibility` in `~/.config/code-flags.conf` (the
+  `/usr/bin/code` wrapper reads it). Even then every content point answered a nameless,
+  childless panel: VS Code's workbench keeps an invisible full-window overlay as a later
+  sibling of the `document web` branch, and Chromium hit-tests topmost first, so the
+  empty overlay wins its own descent. `A11y::at` now calls such a hit *vacant* (nameless,
+  childless, generic container role) and punches through — climb from it, hit-test each
+  ancestor's other point-containing children topmost first, first non-vacant answer wins.
+  After that: menus, title-bar buttons, welcome headings and list items with names and
+  extents at 3–5 ms. VS Code's frame extents equal its toplevel (no shadow insets, custom
+  title bar). Pixel-grid verification blocked that day by stacking — DP-1 was wholly
+  covered by another window while the ranking still resolved probe points to VS Code —
+  the known focus-rank wrinkle, again.
 
 ## 11. Open questions
 
