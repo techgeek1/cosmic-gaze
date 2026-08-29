@@ -23,13 +23,22 @@ makes about eight round trips per query. Firefox answers in 2 to 9 ms on the des
 A Wayland client does not know where its window is (at-spi2-core#14), so a tree reports
 window coordinates. `gaze_capture::ToplevelTracker` reads every window's rectangle from
 `zcosmic_toplevel_info_v1`, which is what turns a window point into a desk point. Even
-then toolkits disagree about what "window" and "screen" mean: Firefox's window
-coordinates match the compositor's rectangle and its screen coordinates add its shadow
-margin; Chromium's screen coordinates look like desk coordinates. `at` tries window
-coordinates relative to the toplevel, then screen coordinates as-is, then screen
-coordinates window-relative, and accepts an interpretation only when the node's own
-extents (asked the same way) contain the query point. The `Hit` reports which one
-worked.
+then toolkits disagree about what "window" and "screen" mean, and not in the way you
+would guess: Firefox reports its frame at `(20, 20)` in *both* coordinate types, because
+its space is its surface including the 20 px client-side shadow, and every node is offset
+by the same amount. The first version added the toplevel origin to window coordinates
+directly, and every YouTube button sat 20 px below its pixels (the probe drew boxes under
+the controls; GitHub looked fine only because a 24 px table row shifted by 20 px still
+contains the pointer).
+
+The rule that works for any toolkit is **frame-relative**: read the frame node's own
+extents in the coordinate type in use and treat them as the origin, so a desk point is
+`p - toplevel.origin + frame.origin` and a node's extents are
+`extents - frame.origin + toplevel.origin`. Whatever space the toolkit answers in, its
+frame is at the toplevel's rectangle, and the offset cancels. `at` tries window
+coordinates first and screen coordinates second, and accepts an answer only when the
+node's own extents (asked the same way) contain the query point. Verified with a 40 px
+grid over the YouTube window drawn onto a capture: every rectangle on its control.
 
 ## Coverage, measured 2026-08-28
 

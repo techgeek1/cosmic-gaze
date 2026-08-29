@@ -8,13 +8,20 @@
 //! # Coordinates
 //!
 //! AT-SPI has two coordinate types, screen (0) and window (1), and on Wayland neither is
-//! the desk. Firefox's "window" is the toplevel geometry cosmic-comp reports; its
-//! "screen" is that plus its client-side shadow margin. Chromium reports "screen" in
-//! what look like desk coordinates. Rather than know each toolkit, [`A11y::at`] tries
-//! window coordinates relative to the toplevel first and screen coordinates second,
-//! and accepts an answer only when the node's extents, asked in the same coordinate
-//! type, contain the query point. The mode that worked is reported on the [`Hit`] and
-//! used to bring the extents back to the desk.
+//! the desk, nor even reliably the window. Firefox reports its frame at `(20, 20)` in
+//! *both* types, because its coordinate space is its surface including the 20 px
+//! client-side shadow margin, and every node in the tree is offset by the same amount;
+//! cosmic-comp's toplevel geometry excludes the shadow. Measured on the desk before this
+//! was understood: every YouTube button sat 20 px below its pixels. Chromium's "screen"
+//! numbers look like desk coordinates instead.
+//!
+//! The toolkit-agnostic rule is to make everything **frame-relative**: read the frame
+//! node's own extents in the coordinate type being used, and treat them as the origin.
+//! A desk point becomes `p - toplevel.origin + frame.origin`; a node's extents become
+//! `extents - frame.origin + toplevel.origin`. Whatever space the toolkit answers in,
+//! the frame is at the toplevel's rectangle, so the offset cancels. [`A11y::at`] tries
+//! window coordinates first and screen coordinates second, and accepts an answer only
+//! when the node's extents, asked the same way, contain the query point.
 
 use std::time::Instant;
 
@@ -40,17 +47,14 @@ const NULL_PATH: &str = "/org/a11y/atspi/null";
 /// text or image it was made on.
 const MAX_CLIMB: usize = 12;
 
-/// AT-SPI coordinate types, as `Component` methods take them.
+/// AT-SPI coordinate types, as `Component` methods take them. Both are used
+/// frame-relative; see the module docs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoordMode {
-    /// Coordinate type 1, relative to the window; the query point is the desk point
-    /// minus the toplevel's origin.
+    /// Coordinate type 1.
     Window,
-    /// Coordinate type 0 with the desk point as-is.
-    ScreenGlobal,
-    /// Coordinate type 0 with the window-relative point: for toolkits whose "screen"
-    /// is really the window.
-    ScreenLocal,
+    /// Coordinate type 0.
+    Screen,
 }
 
 impl CoordMode {
@@ -58,32 +62,35 @@ impl CoordMode {
     fn atspi(self) -> u32 {
         match self {
             CoordMode::Window => 1,
-            CoordMode::ScreenGlobal | CoordMode::ScreenLocal => 0,
+            CoordMode::Screen => 0,
         }
     }
+}
 
-    /// The point to send for a desk point `p` in window `window`.
+/// The frame node's origin in the toolkit's coordinate space: what the toolkit thinks
+/// is at the toplevel's top-left corner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrameOrigin {
+    x : i32,
+    y : i32,
+}
+
+impl FrameOrigin {
+    /// The point to send for desk point `p` in `window`.
     fn query_point(self, p: GlobalPx, window: &Toplevel) -> (i32, i32) {
-        match self {
-            CoordMode::ScreenGlobal => (p.x.round() as i32, p.y.round() as i32),
-            CoordMode::Window | CoordMode::ScreenLocal => (
-                (p.x - window.rect.x).round() as i32,
-                (p.y - window.rect.y).round() as i32,
-            ),
-        }
+        (
+            (p.x - window.rect.x).round() as i32 + self.x,
+            (p.y - window.rect.y).round() as i32 + self.y,
+        )
     }
 
-    /// Extents in this mode brought back to the desk.
+    /// Extents in the toolkit's space brought back to the desk.
     fn to_global(self, extents: (i32, i32, i32, i32), window: &Toplevel) -> Rect {
         let (x, y, w, h) = extents;
-        let (ox, oy) = match self {
-            CoordMode::ScreenGlobal => (0.0, 0.0),
-            CoordMode::Window | CoordMode::ScreenLocal => (window.rect.x, window.rect.y),
-        };
 
         Rect {
-            x : ox + f64::from(x),
-            y : oy + f64::from(y),
+            x : window.rect.x + f64::from(x - self.x),
+            y : window.rect.y + f64::from(y - self.y),
             w : f64::from(w),
             h : f64::from(h),
         }
@@ -200,8 +207,15 @@ impl A11y {
             return Ok(None);
         };
 
-        for mode in [CoordMode::Window, CoordMode::ScreenGlobal, CoordMode::ScreenLocal] {
-            let (x, y) = mode.query_point(p, window);
+        for mode in [CoordMode::Window, CoordMode::Screen] {
+            // The frame's own origin is the offset between the toolkit's space and the
+            // toplevel; a frame without extents cannot be asked about points.
+            let Some((fx, fy, _, _)) = self.extents(&bus, &frame, mode.atspi()) else {
+                continue;
+            };
+
+            let origin = FrameOrigin { x: fx, y: fy };
+            let (x, y) = origin.query_point(p, window);
             let (leaf_bus, leaf_path) = self.at_point(&bus, &frame, x, y, mode.atspi())?;
 
             if leaf_path == NULL_PATH {
@@ -219,8 +233,8 @@ impl A11y {
                 continue;
             }
 
-            let leaf = self.node(&leaf_bus, &leaf_path, mode, window)?;
-            let (target, climbed) = self.climb(&leaf, mode, window)?;
+            let leaf = self.node(&leaf_bus, &leaf_path, mode, origin, window)?;
+            let (target, climbed) = self.climb(&leaf, mode, origin, window)?;
 
             debug!(?mode, role = %leaf.role, ms = started.elapsed().as_secs_f64() * 1000.0, "a11y hit");
 
@@ -295,7 +309,7 @@ impl A11y {
     }
 
     /// The object's role, name and desk rectangle.
-    fn node(&self, bus: &str, path: &str, mode: CoordMode, window: &Toplevel)
+    fn node(&self, bus: &str, path: &str, mode: CoordMode, origin: FrameOrigin, window: &Toplevel)
         -> Result<Node, A11yError>
     {
         let proxy = self.proxy(bus, path, IFACE_ACCESSIBLE)?;
@@ -308,12 +322,12 @@ impl A11y {
             path : path.to_string(),
             role : role,
             name : self.name(bus, path).unwrap_or_default(),
-            rect : self.extents(bus, path, mode.atspi()).map(|e| mode.to_global(e, window)),
+            rect : self.extents(bus, path, mode.atspi()).map(|e| origin.to_global(e, window)),
         })
     }
 
     /// Climbs from `leaf` to the nearest actionable ancestor-or-self.
-    fn climb(&self, leaf: &Node, mode: CoordMode, window: &Toplevel)
+    fn climb(&self, leaf: &Node, mode: CoordMode, origin: FrameOrigin, window: &Toplevel)
         -> Result<(Option<Node>, usize), A11yError>
     {
         if is_actionable(&leaf.role) {
@@ -341,7 +355,7 @@ impl A11y {
             bus  = pb;
             path = pp;
 
-            let node = self.node(&bus, &path, mode, window)?;
+            let node = self.node(&bus, &path, mode, origin, window)?;
 
             if is_actionable(&node.role) {
                 return Ok((Some(node), climbed));
@@ -412,18 +426,27 @@ mod tests {
     }
 
     #[test]
-    fn window_and_local_modes_subtract_the_origin_and_add_it_back() {
+    fn the_frame_origin_cancels_whatever_space_the_toolkit_uses() {
         let p = GlobalPx { x: 1100.5, y: 250.0 };
 
-        for mode in [CoordMode::Window, CoordMode::ScreenLocal] {
-            assert_eq!(mode.query_point(p, &window()), (101, 50));
-            assert_eq!(mode.to_global((100, 50, 10, 20), &window()),
-                       Rect { x: 1100.0, y: 250.0, w: 10.0, h: 20.0 });
-        }
+        // Firefox: the frame sits at (20, 20) of its shadowed surface.
+        let shadowed = FrameOrigin { x: 20, y: 20 };
 
-        assert_eq!(CoordMode::ScreenGlobal.query_point(p, &window()), (1101, 250));
-        assert_eq!(CoordMode::ScreenGlobal.to_global((100, 50, 10, 20), &window()),
-                   Rect { x: 100.0, y: 50.0, w: 10.0, h: 20.0 });
+        assert_eq!(shadowed.query_point(p, &window()), (121, 70));
+        assert_eq!(shadowed.to_global((120, 70, 10, 20), &window()),
+                   Rect { x: 1100.0, y: 250.0, w: 10.0, h: 20.0 });
+
+        // Chromium: the frame reports something like desk coordinates.
+        let global = FrameOrigin { x: 1000, y: 200 };
+
+        assert_eq!(global.query_point(p, &window()), (1101, 250));
+        assert_eq!(global.to_global((1100, 250, 10, 20), &window()),
+                   Rect { x: 1100.0, y: 250.0, w: 10.0, h: 20.0 });
+
+        // A toolkit whose window space starts at the frame.
+        let plain = FrameOrigin { x: 0, y: 0 };
+
+        assert_eq!(plain.query_point(p, &window()), (101, 50));
     }
 
     #[test]

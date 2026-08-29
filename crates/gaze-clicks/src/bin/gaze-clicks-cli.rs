@@ -359,8 +359,13 @@ fn probe(models: PathBuf, seconds: Option<f64>, hz: f64, luma_px: f64) -> Result
 
                     match pick(&elements, sample.global, pointer_sd, shape, hit) {
                         Pick::Tree(t)    => {
+                            // The overlay font is ASCII; a Japanese label would draw
+                            // as a row of question marks, so it is left off.
                             let name = t.name.as_deref()
-                                .map(|n| n.chars().take(24).collect::<String>())
+                                .map(|n| n.chars().filter(|c| c.is_ascii_graphic() || *c == ' ')
+                                          .take(24).collect::<String>())
+                                .map(|n| n.trim().to_string())
+                                .filter(|n| n.len() >= 2)
                                 .map(|n| format!(" \"{n}\""))
                                 .unwrap_or_default();
 

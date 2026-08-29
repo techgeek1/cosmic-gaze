@@ -686,9 +686,13 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   gives each window's rectangle per output, `ext_foreign_toplevel_list_v1` its title, and
   window coordinates plus that origin are desk coordinates (`gaze_capture::ToplevelTracker`;
   cosmic-comp answers `get_cosmic_toplevel` after the sync reply, so `connect` waits on
-  the socket). Toolkits disagree about "window" vs "screen" coordinates (Firefox's
-  screen adds its shadow margin, Chromium's looks global), so `gaze-a11y` tries three
-  interpretations and accepts only the one whose node contains the query point. No tree
+  the socket). Toolkits disagree about "window" vs "screen" coordinates, and Firefox
+  offsets *both* by its 20 px CSD shadow (its frame node reports `(20, 20)`); the first
+  cut added the toplevel origin directly and every YouTube button drew 20 px below its
+  pixels. Fix: frame-relative coordinates, `p - toplevel.origin + frame.origin` and back,
+  which cancels whatever space the toolkit uses; verified by drawing a 40 px grid of tree
+  rectangles onto a capture. `gaze-a11y` accepts only an answer whose node contains the
+  query point. No tree
   walk anywhere — one point query plus a bounded `Parent` climb to the nearest actionable
   role (`gaze-a11y/src/bus.rs`), ~8 round trips; the §2 verdict on on-demand walks
   stands. Collector rule: the tree's target is authoritative when it contains the pointer

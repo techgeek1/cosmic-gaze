@@ -32,10 +32,11 @@ enum Command {
     /// List the applications on the AT-SPI bus and their windows.
     Apps,
 
-    /// Report the node under a desk point, given as `X,Y` in global logical pixels.
+    /// Report the node under one or more desk points, each given as `X,Y` in global
+    /// logical pixels.
     At {
-        #[arg(value_parser = parse_point)]
-        point: GlobalPx,
+        #[arg(value_parser = parse_point, num_args = 1..)]
+        points: Vec<GlobalPx>,
     },
 
     /// Report the node under the pointer whenever it moves.
@@ -55,7 +56,7 @@ fn main() -> Result<()> {
 
     match args.command {
         Command::Apps               => apps(),
-        Command::At { point }       => at(point),
+        Command::At { points }      => at(&points),
         Command::Follow { seconds, hz } => follow(seconds, hz),
     }
 }
@@ -75,27 +76,37 @@ fn apps() -> Result<()> {
     Ok(())
 }
 
-/// Reports the node under one point.
-fn at(point: GlobalPx) -> Result<()> {
+/// Reports the node under each point.
+fn at(points: &[GlobalPx]) -> Result<()> {
     let mut windows = ToplevelTracker::connect().context("opening the toplevel list")?;
     let mut a11y    = A11y::connect().context("connecting to the accessibility bus")?;
 
     windows.pump().context("reading the toplevel list")?;
 
-    let Some(window) = windows.at(point) else {
-        println!("({:.0}, {:.0}): no window", point.x, point.y);
+    for &point in points {
+        let Some(window) = windows.at(point) else {
+            println!("({:.0}, {:.0}): no window", point.x, point.y);
 
-        return Ok(());
-    };
+            continue;
+        };
 
-    let started = Instant::now();
-    let hit     = a11y.at(point, &window).context("asking the tree")?;
+        let started = Instant::now();
+        let hit     = a11y.at(point, &window).context("asking the tree")?;
 
-    println!("({:.0}, {:.0}) in {:?} [{}]: {}  ({:.1} ms)",
-             point.x, point.y, window.title, window.app_id, describe(hit.as_ref()),
-             started.elapsed().as_secs_f64() * 1000.0);
+        println!("({:.0}, {:.0}) in {:?} [{}]: {}  ({:.1} ms)",
+                 point.x, point.y, truncate(&window.title, 30), window.app_id,
+                 describe(hit.as_ref()), started.elapsed().as_secs_f64() * 1000.0);
+    }
 
     Ok(())
+}
+
+/// `s` cut to `n` characters with an ellipsis.
+fn truncate(s: &str, n: usize) -> String {
+    match s.chars().count() > n {
+        true  => format!("{}…", s.chars().take(n - 1).collect::<String>()),
+        false => s.to_string(),
+    }
 }
 
 /// Reports the node under the pointer on every move.
