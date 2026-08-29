@@ -35,7 +35,9 @@ mod cursor;
 mod frame;
 mod outputs;
 mod shm;
+mod toplevels;
 
 pub use capture::{Capture, CaptureError};
 pub use cursor::{CursorReport, CursorTracker};
 pub use frame::{Frame, OutputInfo, changed_fraction};
+pub use toplevels::{Toplevel, ToplevelTracker};

@@ -20,6 +20,7 @@
 //! the workspace. Both the collector and the probe go through [`pick`], so the thing the
 //! probe draws on screen is the thing a click would have been labelled with.
 
+use gaze_a11y::Hit;
 use gaze_core::{Element, ElementKind, GlobalPx, Rect};
 use gaze_detect::{DetectConfig, NearConfig};
 
@@ -329,9 +330,26 @@ fn contains_within(r: &Rect, p: GlobalPx, slop: f64) -> bool {
 
 // --- Picking ---
 
+/// What the accessibility tree said was clicked: the nearest actionable ancestor of
+/// the object at the point, with its rectangle on the desk.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TreeTarget {
+    /// The role folded into the session's kind vocabulary; see [`role_kind`].
+    pub kind : String,
+    /// The AT-SPI role as the application spelled it.
+    pub role : String,
+    pub bbox : Rect,
+    /// The object's accessible name: a link's text, a button's label, an image's alt.
+    pub name : Option<String>,
+}
+
 /// What was under the pointer, once every gate has been applied.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Pick<'a> {
+    /// The application's own answer, which wins over the pixels whenever it exists:
+    /// a tree knows a card is one link and a grey rectangle is an input, and pixels
+    /// do not.
+    Tree(TreeTarget),
     /// A box worth labelling a click with.
     Element(&'a Element),
     /// No box contains the pointer, but the cursor is an I-beam: an input field, a
@@ -357,6 +375,11 @@ pub enum Pick<'a> {
 /// The flat check only applies to boxes taller than [`FLAT_CHECK_MIN_H_PX`]. See that
 /// constant for why small boxes are exempt.
 ///
+/// `tree` is the accessibility tree's answer for the press, when there was one. Its
+/// actionable target is authoritative when it contains the pointer, subject to the same
+/// flat check as a recognised box: a wide link whose padding is what got clicked is
+/// still a click on nothing to look at.
+///
 /// `cursor` is the pointer's shape at the press when the compositor reported it. Only an
 /// I-beam changes the answer, and only when no box contains the pointer.
 ///
@@ -367,9 +390,18 @@ pub fn pick<'a>(
     p          : GlobalPx,
     pointer_sd : f64,
     cursor     : Option<CursorShape>,
+    tree       : Option<&Hit>,
 )
     -> Pick<'a>
 {
+    if let Some(target) = tree.and_then(|hit| tree_target(hit, p)) {
+        if target.bbox.h > FLAT_CHECK_MIN_H_PX && pointer_sd < FLAT_LUMA_SD {
+            return Pick::Blank;
+        }
+
+        return Pick::Tree(target);
+    }
+
     let Some(element) = smallest_containing(elements, p) else {
         return match cursor.is_some_and(CursorShape::accepts_a_click) {
             true  => Pick::Caret(caret_box(p)),
@@ -382,6 +414,43 @@ pub fn pick<'a>(
     }
 
     Pick::Element(element)
+}
+
+/// The tree's target for a press at `p`, when it has one whose rectangle contains `p`
+/// (to within [`HIT_SLOP_PX`]). A target that does not contain the point is the tree
+/// disagreeing with the compositor about where the window is, and is not trusted.
+pub fn tree_target(hit: &Hit, p: GlobalPx) -> Option<TreeTarget> {
+    let target = hit.target.as_ref()?;
+    let bbox   = target.rect?;
+
+    if !contains_within(&bbox, p, HIT_SLOP_PX) {
+        return None;
+    }
+
+    Some(TreeTarget {
+        kind : role_kind(&target.role),
+        role : target.role.clone(),
+        bbox : bbox,
+        name : Some(target.name.trim().to_string()).filter(|n| !n.is_empty()),
+    })
+}
+
+/// An AT-SPI role name folded into the session file's kind vocabulary, so a tree
+/// button and a recognised button export as the same `element_kind`. Roles the
+/// recogniser has no class for keep their own name, hyphenated.
+pub fn role_kind(role: &str) -> String {
+    match role {
+        "push button" | "button" | "toggle button"                        => "button",
+        "link"                                                            => "link",
+        "entry" | "text" | "password text" | "combo box" | "spin button"  => "input",
+        "check box" | "check menu item"                                   => "checkbox",
+        "slider"                                                          => "slider",
+        "image"                                                           => "image",
+        other                                                             => {
+            return other.split_whitespace().collect::<Vec<_>>().join("-");
+        }
+    }
+    .to_string()
 }
 
 /// The box a caret click at `p` is written against.
@@ -588,7 +657,7 @@ mod tests {
             element(1, ElementKind::Button, (100.0, 100.0, 200.0,  40.0)),
         ];
 
-        let hit = pick(&elements, GlobalPx { x: 150.0, y: 110.0 }, 0.3, None);
+        let hit = pick(&elements, GlobalPx { x: 150.0, y: 110.0 }, 0.3, None, None);
 
         assert_eq!(hit, Pick::Element(&elements[1]));
     }
@@ -598,9 +667,9 @@ mod tests {
         // The emoji-picker case: the glyph's box, and the pointer 4 px past its edge.
         let elements = vec![element(0, ElementKind::Text, (62.0, 65.0, 31.0, 25.0))];
 
-        assert_eq!(pick(&elements, GlobalPx { x: 97.0, y: 88.0 }, 0.3, None),
+        assert_eq!(pick(&elements, GlobalPx { x: 97.0, y: 88.0 }, 0.3, None, None),
                    Pick::Element(&elements[0]));
-        assert_eq!(pick(&elements, GlobalPx { x: 62.0 + 31.0 + HIT_SLOP_PX + 0.5, y: 88.0 }, 0.3, None),
+        assert_eq!(pick(&elements, GlobalPx { x: 62.0 + 31.0 + HIT_SLOP_PX + 0.5, y: 88.0 }, 0.3, None, None),
                    Pick::Nothing);
     }
 
@@ -608,27 +677,77 @@ mod tests {
     fn pick_reports_nothing_when_no_box_contains_the_point() {
         let elements = vec![element(0, ElementKind::Button, (100.0, 100.0, 20.0, 20.0))];
 
-        assert_eq!(pick(&elements, GlobalPx { x: 500.0, y: 500.0 }, 0.3, None), Pick::Nothing);
-        assert_eq!(pick(&[], GlobalPx { x: 0.0, y: 0.0 }, 0.3, None), Pick::Nothing);
+        assert_eq!(pick(&elements, GlobalPx { x: 500.0, y: 500.0 }, 0.3, None, None), Pick::Nothing);
+        assert_eq!(pick(&[], GlobalPx { x: 0.0, y: 0.0 }, 0.3, None, None), Pick::Nothing);
+    }
+
+    /// A tree answer whose target is `role` at `bbox`.
+    fn hit(role: &str, name: &str, bbox: (f64, f64, f64, f64)) -> Hit {
+        let node = gaze_a11y::Node {
+            bus  : ":1.5".into(),
+            path : "/org/a11y/atspi/accessible/9".into(),
+            role : role.into(),
+            name : name.into(),
+            rect : Some(Rect { x: bbox.0, y: bbox.1, w: bbox.2, h: bbox.3 }),
+        };
+
+        Hit {
+            leaf    : node.clone(),
+            target  : Some(node),
+            climbed : 0,
+            coord   : gaze_a11y::CoordMode::Window,
+        }
+    }
+
+    #[test]
+    fn the_tree_wins_over_the_pixels() {
+        let elements = vec![element(0, ElementKind::Text, (110.0, 110.0, 40.0, 12.0))];
+        let p        = GlobalPx { x: 120.0, y: 115.0 };
+        let card     = hit("link", "Boss Battle", (100.0, 100.0, 300.0, 40.0));
+
+        assert_eq!(pick(&elements, p, 0.3, None, Some(&card)), Pick::Tree(TreeTarget {
+            kind : "link".into(),
+            role : "link".into(),
+            bbox : Rect { x: 100.0, y: 100.0, w: 300.0, h: 40.0 },
+            name : Some("Boss Battle".into()),
+        }));
+
+        // A target that does not contain the point is not trusted; the pixels answer.
+        let elsewhere = hit("link", "", (900.0, 900.0, 50.0, 20.0));
+
+        assert_eq!(pick(&elements, p, 0.3, None, Some(&elsewhere)), Pick::Element(&elements[0]));
+
+        // The flat check applies to a tall tree target too.
+        let tall = hit("link", "", (0.0, 0.0, 400.0, 300.0));
+
+        assert_eq!(pick(&elements, p, 0.001, None, Some(&tall)), Pick::Blank);
+    }
+
+    #[test]
+    fn roles_fold_into_kinds() {
+        assert_eq!(role_kind("push button"), "button");
+        assert_eq!(role_kind("entry"), "input");
+        assert_eq!(role_kind("page tab"), "page-tab");
+        assert_eq!(role_kind("image"), "image");
     }
 
     #[test]
     fn an_i_beam_over_nothing_is_a_caret() {
         let p = GlobalPx { x: 500.0, y: 500.0 };
 
-        assert_eq!(pick(&[], p, 0.3, Some(CursorShape::Text)), Pick::Caret(caret_box(p)));
+        assert_eq!(pick(&[], p, 0.3, Some(CursorShape::Text), None), Pick::Caret(caret_box(p)));
         assert_eq!(caret_box(p).center(), p);
 
         // Any other shape, or none, is still nothing.
         for shape in [CursorShape::Arrow, CursorShape::Hand, CursorShape::Grab,
                       CursorShape::Centred, CursorShape::Other] {
-            assert_eq!(pick(&[], p, 0.3, Some(shape)), Pick::Nothing, "{shape}");
+            assert_eq!(pick(&[], p, 0.3, Some(shape), None), Pick::Nothing, "{shape}");
         }
 
         // A box that does contain the pointer wins over the cursor.
         let elements = vec![element(0, ElementKind::Button, (490.0, 490.0, 20.0, 20.0))];
 
-        assert_eq!(pick(&elements, p, 0.3, Some(CursorShape::Text)),
+        assert_eq!(pick(&elements, p, 0.3, Some(CursorShape::Text), None),
                    Pick::Element(&elements[0]));
     }
 
@@ -637,7 +756,7 @@ mod tests {
         let elements = vec![element(0, ElementKind::Text, (0.0, 0.0, 800.0, 600.0))];
 
         assert_eq!(pick(&elements, GlobalPx { x: 400.0, y: 300.0 }, 0.001,
-                        Some(CursorShape::Text)),
+                        Some(CursorShape::Text), None),
                    Pick::Blank);
     }
 
@@ -647,13 +766,13 @@ mod tests {
         let elements = vec![element(0, ElementKind::Text, (0.0, 0.0, 800.0, 600.0))];
         let p        = GlobalPx { x: 400.0, y: 300.0 };
 
-        assert_eq!(pick(&elements, p, 0.001, None), Pick::Blank);
+        assert_eq!(pick(&elements, p, 0.001, None, None), Pick::Blank);
 
         // Detail under the pointer makes the same box a real target.
-        assert_eq!(pick(&elements, p, 0.15, None), Pick::Element(&elements[0]));
+        assert_eq!(pick(&elements, p, 0.15, None, None), Pick::Element(&elements[0]));
 
         // An unmeasurable window is not evidence of flatness.
-        assert_eq!(pick(&elements, p, f64::NAN, None), Pick::Element(&elements[0]));
+        assert_eq!(pick(&elements, p, f64::NAN, None, None), Pick::Element(&elements[0]));
     }
 
     #[test]
@@ -662,7 +781,7 @@ mod tests {
         // pointer landed says nothing, because its label is a few pixels away.
         let elements = vec![element(0, ElementKind::Button, (100.0, 100.0, 90.0, 30.0))];
 
-        assert_eq!(pick(&elements, GlobalPx { x: 140.0, y: 115.0 }, 0.0, None), Pick::Element(&elements[0]));
+        assert_eq!(pick(&elements, GlobalPx { x: 140.0, y: 115.0 }, 0.0, None, None), Pick::Element(&elements[0]));
     }
 
     #[test]

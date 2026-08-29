@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use gaze_capture::{Capture, CursorTracker, Frame, changed_fraction};
+use gaze_capture::{Capture, CursorTracker, Frame, ToplevelTracker, changed_fraction};
 use image::{ColorType, ImageEncoder};
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 
@@ -39,6 +39,11 @@ struct Args {
     #[arg(long)]
     all: bool,
 
+    /// Print every window's rectangle in global logical pixels and the window under the
+    /// pointer, then exit. With `--duration`, keep printing on every change instead.
+    #[arg(long)]
+    toplevels: bool,
+
     /// Poll the pointer position at 10 Hz instead of capturing, and exit after
     /// `--duration` seconds (default 5).
     #[arg(long)]
@@ -56,6 +61,10 @@ fn main() -> Result<()> {
 
     if args.cursor {
         return track_cursor(args.duration.unwrap_or(5.0));
+    }
+
+    if args.toplevels {
+        return list_toplevels(args.duration);
     }
 
     std::fs::create_dir_all(&args.out)
@@ -257,6 +266,63 @@ fn cursor_image(hotspot: Option<(i32, i32)>, image_px: Option<(u32, u32)>) -> St
     let spot = hotspot.map_or("?".to_string(), |(x, y)| format!("{x},{y}"));
 
     format!("{size}@{spot}")
+}
+
+/// Prints every toplevel and the one under the pointer, once or for `duration_s`.
+fn list_toplevels(duration_s: Option<f64>) -> Result<()> {
+    let mut windows = ToplevelTracker::connect().context("opening the toplevel list")?;
+    let mut cursor  = CursorTracker::connect().context("opening cursor sessions")?;
+    let start       = Instant::now();
+
+    loop {
+        windows.pump().context("reading the toplevel list")?;
+
+        let pointer = cursor.position().context("reading the pointer position")?;
+
+        println!("--- {:6.2}s", start.elapsed().as_secs_f64());
+
+        for t in windows.toplevels() {
+            let flags = [
+                (t.activated , "activated"),
+                (t.minimized , "minimized"),
+                (t.fullscreen, "fullscreen"),
+            ]
+            .iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, name)| *name)
+            .collect::<Vec<_>>()
+            .join(",");
+
+            println!(
+                "  {:<9} ({:>6.0},{:>6.0}) {:>5.0}x{:<5.0} {:<28} {:<40} {flags}",
+                t.output, t.rect.x, t.rect.y, t.rect.w, t.rect.h,
+                truncate(&t.app_id, 28), truncate(&t.title, 40),
+            );
+        }
+
+        match pointer.and_then(|p| windows.at(p).map(|t| (p, t))) {
+            Some((p, t)) => println!(
+                "  pointer ({:.0},{:.0}) is on {:?} at ({:.0},{:.0}) in the window",
+                p.x, p.y, t.title, p.x - t.rect.x, p.y - t.rect.y,
+            ),
+            None => println!("  pointer is on no window"),
+        }
+
+        match duration_s {
+            Some(d) if start.elapsed().as_secs_f64() < d => {
+                windows.wait(Duration::from_millis(500)).context("waiting for toplevel events")?;
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
+/// `s` cut to `n` characters with an ellipsis.
+fn truncate(s: &str, n: usize) -> String {
+    match s.chars().count() > n {
+        true  => format!("{}…", s.chars().take(n - 1).collect::<String>()),
+        false => s.to_string(),
+    }
 }
 
 /// Prints the current output list.

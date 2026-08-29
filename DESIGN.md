@@ -675,6 +675,29 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   it is recorded on every click and its refusals are counted on the status line, and
   that count decides later whether it joins the I-beam. The probe outlines the caret box
   and captions `CARET`, so it shows exactly what a click would write.
+- 2026-08-28, **the collector asks the accessibility tree first.** The remaining failures
+  (a card is one link, a grey rectangle is an input, a thumbnail is a picture) are
+  contextual, and pixels are pixels; the design always meant the vision path for where
+  AT-SPI is absent, not instead of it. Measured: the AT-SPI bus is up under the session,
+  cosmic-comp implements `org.freedesktop.a11y.Manager`, Firefox answers
+  `GetAccessibleAtPoint` in 2–9 ms with correct roles and extents; Chromium is on the bus
+  with unnamed frames and answers null (accessibility off); Discord and the iced apps are
+  absent. The geometry trap (§2) closes as predicted: `zcosmic_toplevel_info_v1` v2+
+  gives each window's rectangle per output, `ext_foreign_toplevel_list_v1` its title, and
+  window coordinates plus that origin are desk coordinates (`gaze_capture::ToplevelTracker`;
+  cosmic-comp answers `get_cosmic_toplevel` after the sync reply, so `connect` waits on
+  the socket). Toolkits disagree about "window" vs "screen" coordinates (Firefox's
+  screen adds its shadow margin, Chromium's looks global), so `gaze-a11y` tries three
+  interpretations and accepts only the one whose node contains the query point. No tree
+  walk anywhere — one point query plus a bounded `Parent` climb to the nearest actionable
+  role (`gaze-a11y/src/bus.rs`), ~8 round trips; the §2 verdict on on-demand walks
+  stands. Collector rule: the tree's target is authoritative when it contains the pointer
+  (UFO2, a11y-first), subject to the same flat check as a recognised box; vision is the
+  fallback; every click records `source`. The status line's `tree` count doubles as a
+  measure of how much of the desktop is accessible. Verified live on the GitHub diff in
+  Firefox (`TREE TABLE-CELL 1691x24`, 2–3 ms); the YouTube cases from the batch are
+  Firefox too and should now read `link`/`image`/`combo box`. Not verified: Discord and
+  Chromium, which need their accessibility enabled to be on the bus at all.
 
 ## 11. Open questions
 

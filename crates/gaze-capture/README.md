@@ -90,6 +90,23 @@ and on every pointer motion over it, not on a timer. A still pointer therefore p
 event and then silence, which is why `position()` returns the last known value rather than
 requiring a fresh event.
 
+## ToplevelTracker
+
+Where every window is, in global logical pixels. Wayland clients cannot know this, so
+anything they report about their own contents (an accessibility tree, say) is in window
+coordinates; cosmic-comp can, and says so through `zcosmic_toplevel_info_v1` (bound at
+version 2 or 3), whose `geometry` event gives each toplevel's rectangle relative to each
+output it is on. Titles and app ids come from `ext_foreign_toplevel_list_v1`, which the
+cosmic object is created from (`get_cosmic_toplevel`). Adding the output's logical origin
+puts the window on the same desk as the pointer and the captures.
+
+Two things learned on the desk. cosmic-comp answers `get_cosmic_toplevel` from its own
+loop, *after* the `wl_display.sync` reply, so no number of round trips brings the
+geometry; `connect` waits on the socket until every listed window has a rectangle (up
+to 500 ms). And the protocol carries no stacking order, so `at(point)` returns the
+activated window if it contains the point, else the smallest containing one, on the
+grounds that a dialog sits on its parent; a caller that can verify the answer should.
+
 ## CLI
 
 ```
@@ -99,6 +116,8 @@ gaze-capture-cli --out screenshots/ --loop 1 --duration 5
 gaze-capture-cli --out screenshots/ --output DP-1
 gaze-capture-cli --out screenshots/ --all     # time the batch capture_all call
 gaze-capture-cli --cursor --duration 5        # poll the pointer at 10 Hz for 5 s
+gaze-capture-cli --toplevels                  # every window's desk rectangle, and the one under the pointer
+gaze-capture-cli --toplevels --duration 30    # the same, reprinted on every change
 ```
 
 `--cursor` prints the raw buffer coordinates next to the converted global position, plus

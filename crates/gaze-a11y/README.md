@@ -1,0 +1,58 @@
+# gaze-a11y
+
+What the application says is under a point on the desk, via the session's AT-SPI bus.
+
+The screen recogniser (`gaze-detect`) reads pixels, and pixels cannot say that a
+thumbnail, a title and a view count are one link, that a grey rounded rectangle is an
+input, or that the thing under the pointer is a picture. The application's accessibility
+tree can, and on a COSMIC session the bus is already running: `at-spi-bus-launcher` under
+the session, cosmic-comp implementing `org.freedesktop.a11y.Manager`, Firefox and GTK
+apps registered on it.
+
+## The one question
+
+`A11y::at(point, window)` asks the window's frame `Component.GetAccessibleAtPoint`, reads
+the role, name and extents of what came back, and climbs `Parent` (at most twelve
+levels) to the nearest ancestor with an actionable role: button, link, entry, check box,
+list item, page tab, image and so on (`is_actionable`). There is no tree walk, ever;
+DESIGN.md's finding that on-demand AT-SPI walks are non-viable stands, and this crate
+makes about eight round trips per query. Firefox answers in 2 to 9 ms on the desk.
+
+## Coordinates, and why this needs cosmic-comp
+
+A Wayland client does not know where its window is (at-spi2-core#14), so a tree reports
+window coordinates. `gaze_capture::ToplevelTracker` reads every window's rectangle from
+`zcosmic_toplevel_info_v1`, which is what turns a window point into a desk point. Even
+then toolkits disagree about what "window" and "screen" mean: Firefox's window
+coordinates match the compositor's rectangle and its screen coordinates add its shadow
+margin; Chromium's screen coordinates look like desk coordinates. `at` tries window
+coordinates relative to the toplevel, then screen coordinates as-is, then screen
+coordinates window-relative, and accepts an interpretation only when the node's own
+extents (asked the same way) contain the query point. The `Hit` reports which one
+worked.
+
+## Coverage, measured 2026-08-28
+
+| application | on the bus | answers |
+| --- | --- | --- |
+| Firefox | yes | yes, roles and extents correct |
+| Chromium | yes | thirteen frames, all unnamed, null at every point: its accessibility is not switched on |
+| Discord (Electron) | no | — |
+| COSMIC Terminal, other iced apps | no | — |
+
+Electron and Chromium expose their trees only when accessibility is enabled
+(`--force-renderer-accessibility`, or an assistive technology announcing itself on the
+bus). `A11y::at` returns `Ok(None)` for all of the above, and the caller falls back to
+the pixels. That is the division of labour the design set out: the tree where there is
+one, the recogniser where there is not.
+
+## CLI
+
+```
+gaze-a11y-cli apps                 # applications and their windows on the bus
+gaze-a11y-cli at 4919,698          # the node under a desk point, with timing
+gaze-a11y-cli follow --seconds 30  # the node under the pointer whenever it moves
+```
+
+`follow` is the one to run beside `gaze-clicks-cli probe`: put the pointer on a card, an
+input, an avatar, and read what the tree calls it and how long it took.

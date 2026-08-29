@@ -46,6 +46,7 @@ use tracing::{debug, warn};
 
 use crate::click::{Button, ButtonEvent, MultiCounter, PressKind, classify};
 use crate::cursor::{CursorShape, classify as classify_cursor};
+use crate::tree::{TREE_TIMEOUT, TreeService};
 use crate::element::{CARET_KIND, Pick, kind_name, pick};
 use crate::frames::{
     FrameChoice, GAZE_AFTER_S, GAZE_BEFORE_S, GAZE_MIN_FRACTION, STOP_AFTER_S, STOP_BEFORE_S,
@@ -125,6 +126,9 @@ pub struct Tallies {
     pub blank        : u64,
     /// An element, but no gaze over the approach.
     pub no_gaze      : u64,
+    /// Accepted from the accessibility tree rather than the pixels. Counted alongside
+    /// `accepted`, not instead of it.
+    pub tree         : u64,
     /// Accepted on the I-beam's word alone, with no recognised box: an input, a
     /// terminal, a document. Counted alongside `accepted`, not instead of it.
     pub caret        : u64,
@@ -165,6 +169,8 @@ struct Pending {
     multi      : u32,
     /// The pointer's shape at the press, when the compositor reported the image.
     cursor     : Option<CursorShape>,
+    /// Id of the question put to the accessibility tree at the press.
+    tree_id    : u64,
 }
 
 /// The running state of one collector run.
@@ -193,6 +199,10 @@ struct Collector<'a> {
     multi      : MultiCounter,
     /// Ids handed to recognition requests.
     next_id    : u64,
+    /// The accessibility tree, on its own thread.
+    tree       : TreeService,
+    /// Ids handed to tree questions.
+    next_tree  : u64,
     /// Total clicks written, across session rotations.
     written    : u64,
     /// How many session files this run has opened.
@@ -284,6 +294,8 @@ pub fn run(config: &CollectConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         pending    : HashMap::new(),
         multi      : MultiCounter::new(),
         next_id    : 0,
+        tree       : TreeService::spawn(),
+        next_tree  : 0,
         written    : 0,
         files      : 1,
     };
@@ -369,6 +381,12 @@ impl Collector<'_> {
             return;
         };
 
+        // The tree is asked now, in parallel with the capture the reader already
+        // fired, so its answer is normally waiting by the time the recogniser's is.
+        let tree_id = self.next_tree;
+        self.next_tree += 1;
+        self.tree.ask(tree_id, sample.global);
+
         self.pending.insert(event.button, Pending {
             t_press    : event.t_s,
             capture_id : event.capture_id,
@@ -376,6 +394,7 @@ impl Collector<'_> {
             output     : sample.output,
             multi      : multi,
             cursor     : sample.cursor.map(classify_cursor),
+            tree_id    : tree_id,
         });
     }
 
@@ -412,7 +431,7 @@ impl Collector<'_> {
             return Ok(());
         };
 
-        let Some((element, crop_luma, choice)) = self.recognise(&pending, event.t_s)? else {
+        let Some((element, crop_luma, choice, source)) = self.recognise(&pending, event.t_s)? else {
             return Ok(());
         };
 
@@ -442,7 +461,7 @@ impl Collector<'_> {
             }
         }
 
-        self.write(&pending, event, &out, &element, crop_luma, choice, &window)
+        self.write(&pending, event, &out, &element, source, crop_luma, choice, &window)
     }
 
     /// Asks the perception thread to recognise what is around the press.
@@ -450,7 +469,7 @@ impl Collector<'_> {
     /// `Ok(None)` means a rule rejected the click and the tally has already been
     /// bumped.
     fn recognise(&mut self, pending: &Pending, t_release: f64)
-        -> Result<Option<(ClickElement, f64, FrameChoice)>>
+        -> Result<Option<(ClickElement, f64, FrameChoice, &'static str)>>
     {
         let id = self.next_id;
         self.next_id += 1;
@@ -483,9 +502,29 @@ impl Collector<'_> {
                     self.detects.remove(0);
                 }
 
-                match pick(&elements, pending.px, pointer_sd, pending.cursor) {
+                let tree = self.tree.take(pending.tree_id, TREE_TIMEOUT);
+                let hit  = tree.as_ref().and_then(|reply| reply.hit.as_ref());
+
+                if let Some(reply) = &tree {
+                    debug!(ms = reply.ms, hit = reply.hit.is_some(), "tree answered");
+                }
+
+                match pick(&elements, pending.px, pointer_sd, pending.cursor, hit) {
+                    Pick::Tree(target)     => {
+                        self.tallies.tree += 1;
+
+                        let element = ClickElement {
+                            kind  : target.kind,
+                            bbox  : target.bbox,
+                            text  : target.name,
+                            score : 1.0,
+                        };
+
+                        Ok(Some((element, crop_luma, choice, "tree")))
+                    }
+
                     Pick::Element(element) => {
-                        Ok(Some((click_element(element), crop_luma, choice)))
+                        Ok(Some((click_element(element), crop_luma, choice, "vision")))
                     }
 
                     // The I-beam's word, not the recogniser's; see `crate::cursor`.
@@ -499,7 +538,7 @@ impl Collector<'_> {
                             score : 0.0,
                         };
 
-                        Ok(Some((element, crop_luma, choice)))
+                        Ok(Some((element, crop_luma, choice, "caret")))
                     }
 
                     Pick::Nothing          => {
@@ -572,6 +611,7 @@ impl Collector<'_> {
         event     : ButtonEvent,
         out       : &OutputGeometry,
         element   : &ClickElement,
+        source    : &'static str,
         crop_luma : f64,
         choice    : FrameChoice,
         window    : &[TimedFrame],
@@ -594,6 +634,7 @@ impl Collector<'_> {
                 .unwrap_or(0.0),
             multi       : pending.multi,
             element     : element.clone(),
+            source      : Some(source.to_string()),
             crop_luma   : crop_luma,
             frame_age_s : age_of(choice),
             cursor      : pending.cursor.map(|c| c.name().to_string()),
@@ -699,9 +740,11 @@ impl Collector<'_> {
         };
 
         println!(
-            "click #{} {} ({:.0}, {:.0}) {}{}{} — {}, {} frames",
+            "click #{} {} ({:.0}, {:.0}) {}{}{}{} — {}, {} frames",
             click.n, click.output, click.px.x, click.px.y,
-            click.element.kind, label, multi, gaze, frames,
+            click.element.kind, label,
+            click.source.as_deref().map(|s| format!(" [{s}]")).unwrap_or_default(),
+            multi, gaze, frames,
         );
     }
 
@@ -724,10 +767,11 @@ impl Collector<'_> {
         };
 
         println!(
-            "status: {} accepted ({} caret) / {} drag / {} no-element / {} blank ({} under \
-             a hand or I-beam) / {} no-gaze / {} stale ({} late-capture, {} overrun, \
-             {} off-desk, {} error) — median offset {} over the last {}, median detect {}",
-            t.accepted, t.caret, t.drag, t.no_element, t.blank, t.disputed, t.no_gaze,
+            "status: {} accepted ({} tree, {} caret) / {} drag / {} no-element / {} blank \
+             ({} under a hand or I-beam) / {} no-gaze / {} stale ({} late-capture, \
+             {} overrun, {} off-desk, {} error) — median offset {} over the last {}, \
+             median detect {}",
+            t.accepted, t.tree, t.caret, t.drag, t.no_element, t.blank, t.disputed, t.no_gaze,
             t.stale, t.late_capture, t.overrun, t.off_desk, t.error, offset,
             self.offsets.len(), detect,
         );

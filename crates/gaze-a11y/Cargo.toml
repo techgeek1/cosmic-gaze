@@ -1,0 +1,25 @@
+[package]
+name    = "gaze-a11y"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+gaze-core    = { workspace = true }
+gaze-capture = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+
+# Used only by `gaze-a11y-cli`.
+anyhow = { workspace = true }
+clap   = { workspace = true }
+
+[[bin]]
+name = "gaze-a11y-cli"
+path = "src/bin/gaze-a11y-cli.rs"
+
+[lints.clippy]
+# The workspace style mandates explicit `Foo { x: x }` field syntax everywhere.
+redundant_field_names = "allow"

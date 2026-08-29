@@ -11,6 +11,7 @@ tracing   = { workspace = true }
 
 wayland-client    = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client", "staging", "unstable"] }
+cosmic-protocols  = { git = "https://github.com/pop-os/cosmic-protocols", rev = "32283d7", default-features = false, features = ["client"] }
 memmap2           = "0.9"
 rustix            = { version = "1.1", features = ["event", "fs", "time"] }
 

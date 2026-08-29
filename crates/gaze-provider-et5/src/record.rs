@@ -287,6 +287,11 @@ pub struct ClickRecord {
     pub multi       : u32,
     /// The element under the pointer.
     pub element     : ClickElement,
+    /// Where `element` came from: `tree` (the application's accessibility tree, via
+    /// `gaze-a11y`), `vision` (the screen recogniser), or `caret` (the I-beam's word
+    /// alone). Absent in files written before 2026-08-28, which are all `vision`.
+    #[serde(default)]
+    pub source      : Option<String>,
     /// Mean luminance of the crop the element was found in, [0, 1]. The pupil
     /// covariate a passive session gets instead of a driven background.
     pub crop_luma   : f64,

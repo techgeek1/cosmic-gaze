@@ -106,6 +106,20 @@ an emoji-picker button came back as its 31x25 glyph with the pointer 4 px to the
 it, and a search field's placeholder line ended 3 px short of the caret; both were
 `NOTHING` without the slop.
 
+Before any of that, the collector asks the **application** (`gaze-a11y`, on its own
+thread, in parallel with the capture): what is at this point in your accessibility
+tree? Where the application is on the AT-SPI bus (Firefox today; Chromium and Electron
+only with their accessibility switched on; COSMIC's own apps not yet) the answer comes
+back in a few milliseconds with a role, a name and a rectangle on the desk, and it wins
+over the pixels: a tree knows a card is one link and a grey rectangle is an input, and
+pixels do not. The nearest actionable ancestor of the object at the point is the target
+(`element_kind` folds its role into the same vocabulary as recognised boxes: `button`,
+`link`, `input`, `checkbox`, `slider`, `image`, else the hyphenated role), it has to
+contain the pointer, and the flat check below applies to it exactly as to a recognised
+box. Every click records its `source`: `tree`, `vision` or `caret`. Where the tree has no
+answer, nothing changes: the recogniser is the fallback, which is what it was built to
+be.
+
 The collector also reads the **pointer's shape**. The cursor session that reports the
 position also reports the cursor image's size and hotspot, and those two numbers name
 the shape without copying a pixel: an arrow's hotspot is in the top-left corner, a hand's
@@ -210,7 +224,7 @@ In the order they apply:
 | `drag` | held longer than 400 ms, or the pointer moved more than 6 logical px between press and release. The press and the release are about different places. |
 | `off-desk` | the click landed on an output `desk.toml` does not describe, so there is no surface to put the target on. |
 | `stale` | no press capture within 150 ms and no rolling frame from the last 500 ms. |
-| `no-element` | a frame, but nothing recognisable under the pointer, and the pointer is not an I-beam. **This is the important one**: a click on empty space to focus a window says nothing about where you were looking, and it is the most common press on a desktop. Under an I-beam the same click is accepted as a `caret` instead. |
+| `no-element` | a frame, no answer from the accessibility tree, nothing recognisable under the pointer, and the pointer is not an I-beam. **This is the important one**: a click on empty space to focus a window says nothing about where you were looking, and it is the most common press on a desktop. Under an I-beam the same click is accepted as a `caret` instead. |
 | `blank` | a box did contain the pointer, but it is taller than 60 logical px and the luma standard deviation of a ±24 px window around the pointer is under 0.02. The model drew a control over flat pixels, so there is nothing there to have been looking at. Small boxes skip this check: a confident small button's body can be flat where the pointer landed and its label a few pixels away, which is a fine target either way. |
 | `no-gaze` | fewer than 20% of the frames in the 600 ms before the press carried a valid combined gaze. A blink over the approach is not a label. |
 | `overrun` | clicked faster than recognition runs, so the detector already had three frames queued and this one was dropped rather than made to wait. |
@@ -249,11 +263,12 @@ a fact about eyes worth having in the data rather than one to average away.
 Every ten seconds:
 
 ```
-status: 34 accepted (5 caret) / 7 drag / 12 no-element / 2 blank (6 under a hand or I-beam) / 3 no-gaze / 1 stale (2 late-capture, 0 overrun, 0 off-desk, 0 error) — median offset 0.83 deg over the last 20, median detect 84 ms
+status: 34 accepted (20 tree, 5 caret) / 7 drag / 12 no-element / 2 blank (6 under a hand or I-beam) / 3 no-gaze / 1 stale (2 late-capture, 0 overrun, 0 off-desk, 0 error) — median offset 0.83 deg over the last 20, median detect 84 ms
 ```
 
-`caret` is how many of the accepted clicks were taken on the I-beam's word with no
-recognised box. The count after `blank` is how many `no-element` and `blank` refusals
+`tree` is how many of the accepted clicks were labelled from the accessibility tree
+rather than the pixels; it is also a running measure of how much of the desktop is
+accessible. `caret` is how many were taken on the I-beam's word with no recognised box. The count after `blank` is how many `no-element` and `blank` refusals
 happened under a pointing hand or an I-beam: the application said something was there
 and the rules refused it anyway. It is the size of the gap between the rules and the
 screen, and the number to look at before deciding whether the hand should be trusted
@@ -286,8 +301,9 @@ reconnects holding a *different* one (which only happens if you retrain mid-run)
 collector closes the file and opens a new one rather than mixing two feature extractors.
 
 Per accepted click: a `"stop"` record with `phase: "click"` whose window is
-`[t_press - 0.6, t_press + 0.1]`, a `"click"` record with the press, the element and the
-pointer's shape (`cursor`, absent in files written before 2026-08-28), and
+`[t_press - 0.6, t_press + 0.1]`, a `"click"` record with the press, the element, where
+the element came from (`source`: `tree`, `vision` or `caret`) and the pointer's shape
+(`cursor`; both absent in files written before 2026-08-28), and
 the `"frame"` records of `[t_press - 1.2, t_press + 0.4]`, deduplicated so overlapping
 clicks never write a frame twice. The file is flushed after every click, because this
 process gets killed rather than stopped; a session missing its `meta_end` line still

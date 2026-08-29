@@ -21,6 +21,7 @@ use gaze_clicks::cursor::classify as classify_cursor;
 use gaze_clicks::element::{Pick, is_accepted, pick};
 use gaze_clicks::mouse;
 use gaze_clicks::perceive::{DetectOutcome, DetectRequest, Perception, PerceptionConfig};
+use gaze_clicks::tree::{TREE_TIMEOUT, TreeService};
 use gaze_core::{Element, GlobalPx, Rect};
 use gaze_overlay::{Overlay, OverlayState};
 use signal_hook::consts::SIGINT;
@@ -287,6 +288,7 @@ fn probe(models: PathBuf, seconds: Option<f64>, hz: f64, luma_px: f64) -> Result
         press_rx,
     )?;
 
+    let mut tree = TreeService::spawn();
     let deadline = seconds.map(|s| Instant::now() + Duration::from_secs_f64(s));
     let stop     = Arc::new(AtomicBool::new(false));
 
@@ -311,6 +313,7 @@ fn probe(models: PathBuf, seconds: Option<f64>, hz: f64, luma_px: f64) -> Result
         let started = Instant::now();
 
         press_tx.send(id).context("the perception thread stopped")?;
+        tree.ask(id, sample.global);
 
         let now = t0.elapsed().as_secs_f64();
 
@@ -326,12 +329,22 @@ fn probe(models: PathBuf, seconds: Option<f64>, hz: f64, luma_px: f64) -> Result
         })
         .context("the perception thread stopped")?;
 
-        id += 1;
-
         let reply = perception.replies().recv_timeout(Duration::from_secs(5))
             .context("the recogniser did not answer")?;
 
         let shape = sample.cursor.map(classify_cursor);
+        let asked = tree.take(id, TREE_TIMEOUT);
+
+        id += 1;
+        let hit   = asked.as_ref().and_then(|reply| reply.hit.as_ref());
+        let tree_note = match &asked {
+            Some(reply) => match &reply.hit {
+                Some(h) => format!(", tree {:.0} ms: leaf {} {:?}{}", reply.ms, h.leaf.role, h.leaf.name,
+                                   h.target.as_ref().map(|t| format!(" → {} {:?}", t.role, t.name)).unwrap_or_default()),
+                None    => format!(", tree {:.0} ms: no answer", reply.ms),
+            },
+            None => ", tree: no reply".to_string(),
+        };
 
         // `body` is the caption without its latency, `note` the extra detail only
         // stdout gets, and `highlight` the box drawn on screen.
@@ -344,8 +357,23 @@ fn probe(models: PathBuf, seconds: Option<f64>, hz: f64, luma_px: f64) -> Result
                         elements.len(),
                     );
 
-                    match pick(&elements, sample.global, pointer_sd, shape) {
-                        Pick::Element(e) => (caption(e), format!("{seen} — {}", describe(e)),
+                    match pick(&elements, sample.global, pointer_sd, shape, hit) {
+                        Pick::Tree(t)    => {
+                            let name = t.name.as_deref()
+                                .map(|n| n.chars().take(24).collect::<String>())
+                                .map(|n| format!(" \"{n}\""))
+                                .unwrap_or_default();
+
+                            (
+                                format!("TREE {} {:.0}x{:.0}{name}", t.kind.to_uppercase(),
+                                        t.bbox.w, t.bbox.h),
+                                format!("{seen}{tree_note} — {} at ({:.0}, {:.0}) {:.0}x{:.0}",
+                                        t.role, t.bbox.x, t.bbox.y, t.bbox.w, t.bbox.h),
+                                Some(t.bbox),
+                            )
+                        }
+
+                        Pick::Element(e) => (caption(e), format!("{seen}{tree_note} — {}", describe(e)),
                                              Some(e.bbox)),
 
                         Pick::Caret(b)   => (
