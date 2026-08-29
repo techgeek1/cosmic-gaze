@@ -746,6 +746,18 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   title bar). Pixel-grid verification blocked that day by stacking — DP-1 was wholly
   covered by another window while the ranking still resolved probe points to VS Code —
   the known focus-rank wrinkle, again.
+- 2026-08-29, hardening for the first all-day drive. A D-Bus call to an application
+  that stops answering blocks with no timeout — measured 138 s against a `SIGSTOP`ped
+  steamwebhelper, returning only on `SIGCONT` — and one such app stalls tree queries
+  for *every* window, since the app lookup walks the registry list. The collector's
+  tree thread now carries a watchdog: questions outstanding and silence past 5 s means
+  wedged; the thread is abandoned (it exits itself if its blocked call ever returns,
+  its reply channel being closed) and replaced, with per-replacement doubling patience
+  capped at 320 s so a permanently wedged app costs a bounded number of parked threads.
+  Collector audit for the day run: every cache bounded (gaze ring 3 s span, rolling 2
+  per output, press captures 3, parked tree replies 16, medians 20), session flushed
+  per click, rotation on blob change; burst throughput is detector-bound at ~5–15
+  clicks/s since `wait_for` only sleeps for the first click of a backlog.
 
 ## 11. Open questions
 
