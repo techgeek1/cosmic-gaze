@@ -45,6 +45,7 @@ use glam::DVec3;
 use tracing::{debug, warn};
 
 use crate::click::{Button, ButtonEvent, MultiCounter, PressKind, classify};
+use crate::cursor::{CursorShape, classify as classify_cursor};
 use crate::element::{Pick, kind_name, pick};
 use crate::frames::{
     FrameChoice, GAZE_AFTER_S, GAZE_BEFORE_S, GAZE_MIN_FRACTION, STOP_AFTER_S, STOP_BEFORE_S,
@@ -114,6 +115,10 @@ pub struct Tallies {
     pub stale        : u64,
     /// A frame, but nothing recognisable under the pointer.
     pub no_element   : u64,
+    /// Of the `no_element` and `blank` refusals, those made under a hand or an I-beam:
+    /// the application said something clickable or editable was there and the
+    /// recogniser did not find it. Counted, not acted on; see [`crate::cursor`].
+    pub disputed     : u64,
     /// A large box did contain the pointer, but the pixels there are flat: a control
     /// claimed over empty space, which is a click on nothing by another name.
     pub blank        : u64,
@@ -154,6 +159,8 @@ struct Pending {
     output     : String,
     /// Position of this press within its multi-click.
     multi      : u32,
+    /// The pointer's shape at the press, when the compositor reported the image.
+    cursor     : Option<CursorShape>,
 }
 
 /// The running state of one collector run.
@@ -364,7 +371,15 @@ impl Collector<'_> {
             px         : sample.global,
             output     : sample.output,
             multi      : multi,
+            cursor     : sample.cursor.map(classify_cursor),
         });
+    }
+
+    /// Counts a refusal the pointer's own shape disagreed with.
+    fn tally_dispute(&mut self, pending: &Pending) {
+        if pending.cursor.is_some_and(CursorShape::says_something_is_there) {
+            self.tallies.disputed += 1;
+        }
     }
 
     /// Applies every rule to a completed press and writes it when it survives.
@@ -469,12 +484,14 @@ impl Collector<'_> {
 
                     Pick::Nothing          => {
                         self.tallies.no_element += 1;
+                        self.tally_dispute(pending);
 
                         Ok(None)
                     }
 
                     Pick::Blank            => {
                         self.tallies.blank += 1;
+                        self.tally_dispute(pending);
 
                         Ok(None)
                     }
@@ -564,6 +581,7 @@ impl Collector<'_> {
             },
             crop_luma   : crop_luma,
             frame_age_s : age_of(choice),
+            cursor      : pending.cursor.map(|c| c.name().to_string()),
         };
 
         let stop = self.feed.map(|_| StopWindow {
@@ -691,10 +709,10 @@ impl Collector<'_> {
         };
 
         println!(
-            "status: {} accepted / {} drag / {} no-element / {} blank / {} no-gaze / \
-             {} stale ({} late-capture, {} overrun, {} off-desk, {} error) — median \
-             offset {} over the last {}, median detect {}",
-            t.accepted, t.drag, t.no_element, t.blank, t.no_gaze, t.stale,
+            "status: {} accepted / {} drag / {} no-element / {} blank ({} under a hand \
+             or I-beam) / {} no-gaze / {} stale ({} late-capture, {} overrun, {} off-desk, \
+             {} error) — median offset {} over the last {}, median detect {}",
+            t.accepted, t.drag, t.no_element, t.blank, t.disputed, t.no_gaze, t.stale,
             t.late_capture, t.overrun, t.off_desk, t.error, offset, self.offsets.len(),
             detect,
         );

@@ -73,6 +73,7 @@ use gaze_core::{Element, GlobalPx};
 use gaze_detect::Detector;
 use tracing::{debug, warn};
 
+use crate::cursor::CursorImage;
 use crate::element::{
     Crop, FLAT_HALF_PX, collector_config, crop_around, extract, luma_sd, mean_luma, near_config,
 };
@@ -188,7 +189,12 @@ pub struct PointerSample {
     pub global : GlobalPx,
     /// Connector the pointer was on.
     pub output : String,
+    /// The cursor image's hotspot and size, when the compositor has reported them: the
+    /// pointer's shape, which is the application's own word on what is under it. See
+    /// [`crate::cursor`].
+    pub cursor : Option<CursorImage>,
 }
+
 
 /// The last few seconds of pointer readings.
 #[derive(Debug)]
@@ -637,10 +643,21 @@ fn poll_pointer(state: &mut Capturing) -> Option<PointerSample> {
 
     let report = state.tracker.last_report()?;
 
+    let cursor = match (report.hotspot, report.image_px) {
+        (Some((hx, hy)), Some((w, h))) => Some(CursorImage {
+            hotspot_x : hx,
+            hotspot_y : hy,
+            w         : w,
+            h         : h,
+        }),
+        _ => None,
+    };
+
     let sample = PointerSample {
         t_s    : state.config.t0.elapsed().as_secs_f64(),
         global : report.global,
         output : report.output,
+        cursor : cursor,
     };
 
     if let Ok(mut history) = state.pointer.lock() {
@@ -837,6 +854,7 @@ mod tests {
             t_s    : t_s,
             global : GlobalPx { x: x, y: 100.0 },
             output : output.to_string(),
+            cursor : None,
         }
     }
 

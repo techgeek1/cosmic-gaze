@@ -650,6 +650,28 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   DP-2 capture; the pointer there will now read the placeholder line as `Text`, which the
   collector accepts), a 20 px pause glyph on a dark player bar reads `NOTHING`, OCR finds
   text inside thumbnails and avatars, and a two-arrow button group comes back as one box.
+- 2026-08-28, **the pointer's shape is a free signal.** Twelve more live cases after the
+  overlay fix, with the failures the model has no answer to: Discord's search and message
+  fields (`NOTHING`; no `Input` box above 0.1 on either), a YouTube card's blank padding,
+  the description panel, a channel watermark, a terminal's empty prompt line, and the
+  player bar boxed as one 216×40 button with the time display fused into it. Two of the
+  twelve were the pointer 3–4 px *outside* a tight glyph or placeholder box (the
+  emoji-picker button read as its 31×25 glyph; the search placeholder ending short of the
+  caret): containment now allows 6 logical px of slop. For the rest, the one thing the
+  pixels do not carry is what the application itself thinks is there, and it says so in
+  the cursor: hand over a link or a card, I-beam over an input or a terminal. The cursor
+  session already reports the image's hotspot and now its `buffer_size` too, and the pair
+  names the shape without copying a pixel (Adwaita 24 px: arrow `@3,1`, hand `@7,5`,
+  I-beam `@11,12`; `gaze-clicks/src/cursor.rs` has the bands and the two themes' tables;
+  the centre is shared with `wait`, `crosshair` and the resize arrows, so an I-beam is
+  only called by exact hotspot). Recorded, not acted on: each click record carries
+  `cursor`, the probe prints it and captions `(HAND)`/`(TEXT)`, and the status line counts
+  refusals made under a hand or I-beam. Open decision: whether that count is large enough,
+  and clean enough, for a hand or I-beam to accept a click on its own with a synthetic box
+  at the pointer. The case against is the card: a hand over a card's padding is a click
+  the eye may have made from the title 100 px away, and a terminal's I-beam covers focus
+  clicks on nothing. The case for is that inputs are among the most clicked things on a
+  desktop and every one of them is currently refused.
 
 ## 11. Open questions
 

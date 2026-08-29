@@ -77,7 +77,13 @@ under half a logical pixel. Neither matters at gaze precision; both would matter
 were used for pixel-exact placement.
 
 `hotspot` is the cursor image's own offset and is not part of the position: cosmic-comp
-sends the pointer location itself. It is logged but otherwise ignored.
+sends the pointer location itself. It is kept, along with the `buffer_size` the derived
+capture session announces, as `CursorReport::hotspot` and `CursorReport::image_px`: the
+pair is the cursor's *shape*, re-sent whenever the client under the pointer changes it
+(Adwaita at 24 px: the arrow is `24x24@3,1`, the I-beam `@11,12`, the hand `@7,5`). A
+shape change without motion arrives as those two events alone, so the report is updated
+in place rather than rebuilt from the next `position`. `gaze-capture-cli --cursor`
+prints the pair as `cursor WxH@X,Y` on every line.
 
 cosmic-comp emits `position` when a session is created (if the pointer is on that output)
 and on every pointer motion over it, not on a timer. A still pointer therefore produces one

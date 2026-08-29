@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use gaze_clicks::collect::{self, CollectConfig};
+use gaze_clicks::cursor::classify as classify_cursor;
 use gaze_clicks::element::{Pick, is_accepted, pick};
 use gaze_clicks::mouse;
 use gaze_clicks::perceive::{DetectOutcome, DetectRequest, Perception, PerceptionConfig};
@@ -390,9 +391,20 @@ fn probe(models: PathBuf, seconds: Option<f64>, hz: f64, luma_px: f64) -> Result
         };
 
         let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let label      = format!("{body} {latency_ms:.0} ms");
 
-        println!("{} ({:.0}, {:.0}): {label} [{note}]",
+        // The pointer's shape goes on screen only when the application is claiming
+        // something the caption may not: a hand or an I-beam.
+        let shape  = sample.cursor.map(classify_cursor);
+        let claim  = shape.filter(|s| s.says_something_is_there())
+                          .map(|s| format!(" ({})", s.name().to_uppercase()))
+                          .unwrap_or_default();
+        let label  = format!("{body}{claim} {latency_ms:.0} ms");
+        let cursor = match (sample.cursor, shape) {
+            (Some(c), Some(s)) => format!("{} {s}", c.describe()),
+            _                  => "?".to_string(),
+        };
+
+        println!("{} ({:.0}, {:.0}) cursor {cursor}: {label} [{note}]",
                  sample.output, sample.global.x, sample.global.y);
 
         // The cross is where the pointer was read, so a coordinate error in the cursor

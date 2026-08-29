@@ -294,6 +294,11 @@ pub struct ClickRecord {
     /// press. Positive for the capture fired by the press itself, negative for a
     /// fallback frame taken from the rolling cache.
     pub frame_age_s : f64,
+    /// The pointer's shape at the press, as `gaze_clicks::cursor::CursorShape` names it:
+    /// `arrow`, `hand`, `text`, `centred` or `other`. Absent when the compositor had not
+    /// reported the cursor image, and in files written before it was recorded.
+    #[serde(default)]
+    pub cursor      : Option<String>,
 }
 
 /// What a finished session produced.

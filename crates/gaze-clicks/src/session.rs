@@ -217,6 +217,7 @@ mod tests {
             },
             crop_luma   : 0.21,
             frame_age_s : 0.031,
+            cursor      : Some("hand".into()),
         }
     }
 

@@ -100,7 +100,23 @@ after the release.
 
 Recognition then runs **around the pointer**, through `Detector::detect_near`. The
 smallest accepted box containing the pointer wins, because boxes nest and the innermost
-one is what the user aimed at.
+one is what the user aimed at. "Containing" allows 6 logical px of slop: boxes are drawn
+around what is visible, and a control's padding is invisible to both models. On the desk
+an emoji-picker button came back as its 31x25 glyph with the pointer 4 px to the right of
+it, and a search field's placeholder line ended 3 px short of the caret; both were
+`NOTHING` without the slop.
+
+The collector also reads the **pointer's shape**. The cursor session that reports the
+position also reports the cursor image's size and hotspot, and those two numbers name
+the shape without copying a pixel: an arrow's hotspot is in the top-left corner, a hand's
+at the top edge, an I-beam's dead centre (`cursor.rs` has the bands and the 24 px
+Adwaita and Pop hotspots they came from). That is the application's own word on what is
+under the pointer, and it covers exactly what the widget model misses: input fields
+drawn as a slightly different grey, borderless clickable regions, text in a terminal.
+For now it is **recorded, not acted on**: every click carries `cursor: "arrow" |
+"hand" | "text" | "centred" | "other"`, and the status line counts the refusals made under
+a hand or an I-beam, so a day's run says how many clicks the rules are throwing away
+that the application would have vouched for.
 
 ## Why local, and why not a crop
 
@@ -226,8 +242,14 @@ a fact about eyes worth having in the data rather than one to average away.
 Every ten seconds:
 
 ```
-status: 34 accepted / 7 drag / 12 no-element / 2 blank / 3 no-gaze / 1 stale (2 late-capture, 0 overrun, 0 off-desk, 0 error) — median offset 0.83 deg over the last 20, median detect 84 ms
+status: 34 accepted / 7 drag / 12 no-element / 2 blank (6 under a hand or I-beam) / 3 no-gaze / 1 stale (2 late-capture, 0 overrun, 0 off-desk, 0 error) — median offset 0.83 deg over the last 20, median detect 84 ms
 ```
+
+The parenthesised count is how many of the `no-element` and `blank` refusals happened
+while the pointer was a hand or an I-beam: the application said something was there and
+the recogniser found nothing. It is the size of the gap between the rules and the
+screen, and the number to look at before deciding whether the shape should be allowed
+to accept a click on its own.
 
 The **median offset** is the daily "is the model drifting" number. For every accepted
 click it is the angle between where the firmware said you were looking (its filtered 2D
@@ -256,7 +278,8 @@ reconnects holding a *different* one (which only happens if you retrain mid-run)
 collector closes the file and opens a new one rather than mixing two feature extractors.
 
 Per accepted click: a `"stop"` record with `phase: "click"` whose window is
-`[t_press - 0.6, t_press + 0.1]`, a `"click"` record with the press and the element, and
+`[t_press - 0.6, t_press + 0.1]`, a `"click"` record with the press, the element and the
+pointer's shape (`cursor`, absent in files written before 2026-08-28), and
 the `"frame"` records of `[t_press - 1.2, t_press + 0.4]`, deduplicated so overlapping
 clicks never write a frame twice. The file is flushed after every click, because this
 process gets killed rather than stopped; a session missing its `meta_end` line still

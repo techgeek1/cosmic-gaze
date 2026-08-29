@@ -225,13 +225,14 @@ fn track_cursor(duration_s: f64) -> Result<()> {
         reported += 1;
 
         println!(
-            "{:6.2}s  {:<10} buffer ({:>5},{:>5})  global ({:>8.1},{:>8.1}){}",
+            "{:6.2}s  {:<10} buffer ({:>5},{:>5})  global ({:>8.1},{:>8.1})  cursor {}{}",
             start.elapsed().as_secs_f64(),
             report.output,
             report.buffer_x,
             report.buffer_y,
             report.global.x,
             report.global.y,
+            cursor_image(report.hotspot, report.image_px),
             if moved.is_some() { "  new" } else { "" },
         );
 
@@ -247,6 +248,15 @@ fn track_cursor(duration_s: f64) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The cursor image as `WxH@X,Y` (size, hotspot), with `?` for whatever has not been
+/// reported yet.
+fn cursor_image(hotspot: Option<(i32, i32)>, image_px: Option<(u32, u32)>) -> String {
+    let size = image_px.map_or("?".to_string(), |(w, h)| format!("{w}x{h}"));
+    let spot = hotspot.map_or("?".to_string(), |(x, y)| format!("{x},{y}"));
+
+    format!("{size}@{spot}")
 }
 
 /// Prints the current output list.

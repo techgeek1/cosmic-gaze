@@ -49,7 +49,9 @@ use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_captu
     Event as CursorEvent, ExtImageCopyCaptureCursorSessionV1,
 };
 use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1;
-use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1;
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_session_v1::{
+    Event as SessionEvent, ExtImageCopyCaptureSessionV1,
+};
 use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_manager_v1::ZxdgOutputManagerV1;
 use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_v1::{
     Event as XdgOutputEvent, ZxdgOutputV1,
@@ -78,6 +80,15 @@ pub struct CursorReport {
     /// `buffer_x`/`buffer_y` scaled down to logical pixels and offset by the output's
     /// logical origin.
     pub global   : GlobalPx,
+    /// The cursor image's hotspot, in the image's own pixels, from the session's last
+    /// `hotspot` event. `None` until one has arrived for this output.
+    pub hotspot  : Option<(i32, i32)>,
+    /// The cursor image's size, from the derived capture session's `buffer_size`. `None`
+    /// until it has arrived. With `hotspot` this is the cursor's *shape* without copying
+    /// a pixel: an arrow's hotspot sits in a corner, an I-beam's in the centre, a hand's
+    /// at the top edge, and the compositor re-sends both whenever the client under the
+    /// pointer changes the cursor.
+    pub image_px : Option<(u32, u32)>,
 }
 
 /// Tracks the pointer's position in global logical pixels.
@@ -345,8 +356,13 @@ struct CursorSession {
     source      : ExtImageCaptureSourceV1,
     session     : ExtImageCopyCaptureCursorSessionV1,
     /// The frame session derived from the cursor session. Never used to capture, but some
-    /// compositors only start tracking the pointer once it exists.
+    /// compositors only start tracking the pointer once it exists, and its `buffer_size`
+    /// is the cursor image's size.
     capture     : ExtImageCopyCaptureSessionV1,
+    /// Last `hotspot` event on this output.
+    hotspot     : Option<(i32, i32)>,
+    /// Last `buffer_size` event on the derived capture session.
+    image_px    : Option<(u32, u32)>,
 }
 
 impl CursorState {
@@ -394,14 +410,38 @@ impl CursorState {
                 qh,
                 entry.global_name,
             );
-            let capture = session.get_capture_session(qh, ());
+            let capture = session.get_capture_session(qh, entry.global_name);
 
             self.sessions.push(CursorSession {
                 global_name : entry.global_name,
                 source      : source,
                 session     : session,
                 capture     : capture,
+                hotspot     : None,
+                image_px    : None,
             });
+        }
+    }
+
+    /// The session following one output.
+    fn session(&self, global_name: u32) -> Option<&CursorSession> {
+        self.sessions.iter().find(|s| s.global_name == global_name)
+    }
+
+    /// Copies one output's cursor image details into the current report, when the
+    /// pointer is on that output. A shape change without motion arrives as `hotspot` and
+    /// `buffer_size` alone, with no `position` to rebuild the report from.
+    fn refresh_cursor_image(&mut self, global_name: u32) {
+        if self.inside != Some(global_name) {
+            return;
+        }
+
+        let (hotspot, image_px) = self.session(global_name)
+            .map_or((None, None), |s| (s.hotspot, s.image_px));
+
+        if let Some(report) = self.report.as_mut() {
+            report.hotspot  = hotspot;
+            report.image_px = image_px;
         }
     }
 
@@ -568,6 +608,9 @@ impl Dispatch<ExtImageCopyCaptureCursorSessionV1, u32> for CursorState {
                     });
 
                 if let Some((global, name)) = converted {
+                    let (hotspot, image_px) = state.session(global_name)
+                        .map_or((None, None), |s| (s.hotspot, s.image_px));
+
                     state.inside = Some(global_name);
                     state.last   = Some(global);
                     state.report = Some(CursorReport {
@@ -575,6 +618,8 @@ impl Dispatch<ExtImageCopyCaptureCursorSessionV1, u32> for CursorState {
                         buffer_x : x,
                         buffer_y : y,
                         global   : global,
+                        hotspot  : hotspot,
+                        image_px : image_px,
                     });
                 }
 
@@ -584,8 +629,14 @@ impl Dispatch<ExtImageCopyCaptureCursorSessionV1, u32> for CursorState {
 
             // The hotspot is the cursor image's own offset, not part of the pointer
             // position: cosmic-comp sends the pointer location itself in `position`.
-            // Logged so a caller debugging an offset can see it.
+            // It is kept as half of the cursor's shape (see `CursorReport::image_px`)
+            // and logged so a caller debugging an offset can see it.
             CursorEvent::Hotspot { x, y } => {
+                if let Some(s) = state.sessions.iter_mut().find(|s| s.global_name == global_name) {
+                    s.hotspot = Some((x, y));
+                }
+
+                state.refresh_cursor_image(global_name);
                 state.log_event(global_name, format!("hotspot {x},{y}"));
             }
 
@@ -598,7 +649,28 @@ delegate_noop!(CursorState: ignore WlPointer);
 delegate_noop!(CursorState: ignore ExtImageCaptureSourceV1);
 delegate_noop!(CursorState: ignore ExtOutputImageCaptureSourceManagerV1);
 delegate_noop!(CursorState: ignore ExtImageCopyCaptureManagerV1);
-delegate_noop!(CursorState: ignore ExtImageCopyCaptureSessionV1);
+impl Dispatch<ExtImageCopyCaptureSessionV1, u32> for CursorState {
+    /// Keeps the cursor image's size; the session is never asked for a frame.
+    fn event(
+        state    : &mut Self,
+        _proxy   : &ExtImageCopyCaptureSessionV1,
+        event    : SessionEvent,
+        data     : &u32,
+        _conn    : &Connection,
+        _qh      : &QueueHandle<Self>,
+    ) {
+        let global_name = *data;
+
+        if let SessionEvent::BufferSize { width, height } = event {
+            if let Some(s) = state.sessions.iter_mut().find(|s| s.global_name == global_name) {
+                s.image_px = Some((width, height));
+            }
+
+            state.refresh_cursor_image(global_name);
+            state.log_event(global_name, format!("buffer_size {width}x{height}"));
+        }
+    }
+}
 delegate_noop!(CursorState: ignore ZxdgOutputManagerV1);
 
 // --- Helpers ---

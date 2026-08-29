@@ -61,6 +61,16 @@ pub const OCR_PX: u32 = 640;
 /// 0.79 to 0.95. One more inference, about 28 ms.
 pub const NEAR_TILE_PX: u32 = 640;
 
+/// How far outside a box the pointer may sit and still count as in it, logical pixels.
+///
+/// Boxes are drawn around what is visible, and what is visible is usually smaller than
+/// what is clickable: an icon button's box is its glyph, an input's placeholder line ends
+/// where the text does, and the control's padding is invisible to both models. On the
+/// desk, an emoji-picker button read as its 31x25 glyph and the pointer 4 px to the right
+/// of it was NOTHING; a search field's placeholder ended 3 px short of the caret. Six
+/// logical pixels covers padding without reaching the next control over.
+pub const HIT_SLOP_PX: f64 = 6.0;
+
 /// Half-width of the flatness window taken around the pointer, logical pixels.
 ///
 /// Logical rather than buffer pixels so the window means the same thing on the scale-2
@@ -281,7 +291,7 @@ pub fn kind_name(kind: ElementKind) -> &'static str {
     }
 }
 
-/// The smallest accepted element whose box contains `p`.
+/// The smallest accepted element whose box contains `p`, to within [`HIT_SLOP_PX`].
 ///
 /// Smallest wins because boxes nest: a line of text sits inside a text area which sits
 /// inside a panel, and the innermost one is the thing the user was aiming at. Kinds are
@@ -294,8 +304,13 @@ pub fn kind_name(kind: ElementKind) -> &'static str {
 pub fn smallest_containing(elements: &[Element], p: GlobalPx) -> Option<&Element> {
     elements
         .iter()
-        .filter(|e| is_accepted(e.kind) && e.bbox.contains(p))
+        .filter(|e| is_accepted(e.kind) && contains_within(&e.bbox, p, HIT_SLOP_PX))
         .min_by(|a, b| (a.bbox.w * a.bbox.h).total_cmp(&(b.bbox.w * b.bbox.h)))
+}
+
+/// Whether `p` is inside `r` grown by `slop` on every side.
+fn contains_within(r: &Rect, p: GlobalPx, slop: f64) -> bool {
+    p.x >= r.x - slop && p.x <= r.x + r.w + slop && p.y >= r.y - slop && p.y <= r.y + r.h + slop
 }
 
 // --- Picking ---
@@ -534,6 +549,17 @@ mod tests {
         let hit = pick(&elements, GlobalPx { x: 150.0, y: 110.0 }, 0.3);
 
         assert_eq!(hit, Pick::Element(&elements[1]));
+    }
+
+    #[test]
+    fn pick_tolerates_a_pointer_just_outside_a_box() {
+        // The emoji-picker case: the glyph's box, and the pointer 4 px past its edge.
+        let elements = vec![element(0, ElementKind::Text, (62.0, 65.0, 31.0, 25.0))];
+
+        assert_eq!(pick(&elements, GlobalPx { x: 97.0, y: 88.0 }, 0.3),
+                   Pick::Element(&elements[0]));
+        assert_eq!(pick(&elements, GlobalPx { x: 62.0 + 31.0 + HIT_SLOP_PX + 0.5, y: 88.0 }, 0.3),
+                   Pick::Nothing);
     }
 
     #[test]

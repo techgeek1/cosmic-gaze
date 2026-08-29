@@ -58,6 +58,7 @@
 #![allow(clippy::redundant_field_names)]
 
 pub mod click;
+pub mod cursor;
 pub mod collect;
 pub mod element;
 pub mod frames;
