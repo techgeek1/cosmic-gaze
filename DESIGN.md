@@ -758,6 +758,20 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   per output, press captures 3, parked tree replies 16, medians 20), session flushed
   per click, rotation on blob change; burst throughput is detector-bound at ~5–15
   clicks/s since `wait_for` only sleeps for the first click of a backlog.
+- 2026-08-30, the dead-clone failure and reading every mouse. The first drive attempt
+  wrote two empty sessions: the collector read the input-remapper clone by name, but the
+  G502 had re-enumerated (a second hardware node, event24, had appeared), input-remapper
+  kept grabbing the *old* node, and cosmic-comp switched to the new one directly — the
+  desktop worked, the clone never spoke again, and a press dropped before reaching the
+  collector bumps no tally, so the run reported zero across the board. Measured live:
+  during 30 s of normal use, all motion and clicks were on event24; the clone and the
+  old node carried nothing. Fix: the reader now opens *every* mouse-shaped node (left
+  button, not a keyboard, plus the configured name) and rescans every 2 s for new ones.
+  EVIOCGRAB semantics make this double-count-proof — a remapper's source node is grabbed
+  and therefore silent to other readers, so exactly one open node speaks per physical
+  press. Verified with a raw event monitor beside a live run: clicks register through
+  event24 and both sides agree when idle. Lesson for anything reading evdev by identity:
+  a node's continued existence says nothing about its liveness after re-enumeration.
 
 ## 11. Open questions
 

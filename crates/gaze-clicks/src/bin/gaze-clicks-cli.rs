@@ -217,8 +217,7 @@ fn run(config: CollectConfig) -> Result<()> {
 
 /// Lists candidate mice.
 fn devices(mouse_name: &str) -> Result<()> {
-    let all    = mouse::candidates();
-    let chosen = mouse::choose(mouse_name).ok();
+    let all = mouse::candidates();
 
     if all.is_empty() {
         println!("no readable evdev nodes; the user needs an ACL on the mouse node");
@@ -228,10 +227,14 @@ fn devices(mouse_name: &str) -> Result<()> {
 
     println!("{:<22} {:<8} {:<8} name", "node", "buttons", "keyboard");
 
+    let mut read = 0usize;
+
     for candidate in &all {
         let mark = {
-            if chosen.as_deref() == Some(candidate.path.as_path()) {
-                " <- default"
+            if mouse::wanted(candidate, mouse_name) {
+                read += 1;
+
+                " <- read"
             }
             else {
                 ""
@@ -248,9 +251,12 @@ fn devices(mouse_name: &str) -> Result<()> {
         );
     }
 
-    match chosen {
-        Some(path) => println!("\ndefault: {}", path.display()),
-        None       => println!("\nno default; pass --mouse PATH"),
+    // Every marked node is read at once: a grabbed node (a remapper's source) is
+    // silent to other readers, so exactly one of them speaks per physical press.
+    match read {
+        0 => println!("\nnothing to read; pass --mouse PATH"),
+        n => println!("\nreading all {n} marked nodes; a rescan picks up ones that \
+                       appear later"),
     }
 
     Ok(())

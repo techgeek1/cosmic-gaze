@@ -251,8 +251,9 @@ pub fn run(config: &CollectConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
 
     let mut mouse = MouseReader::open(config.mouse.as_deref(), &config.mouse_name, t0, press_tx)?;
 
-    println!("reading {} ({}), read-only, not grabbed",
-             mouse.path().display(), mouse.name());
+    for (path, name) in mouse.nodes() {
+        println!("reading {} ({}), read-only, not grabbed", path.display(), name);
+    }
 
     // The tracker, when there is one. It owns the device for the life of the run: no
     // other tool in this workspace can open it at the same time.
