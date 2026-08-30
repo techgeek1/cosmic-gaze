@@ -772,6 +772,23 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   press. Verified with a raw event monitor beside a live run: clicks register through
   event24 and both sides agree when idle. Lesson for anything reading evdev by identity:
   a node's continued existence says nothing about its liveness after re-enumeration.
+- 2026-08-30, first real driven session (PR review, 72 min active, session
+  `1788078351-70289bb2`). 213 accepted clicks, 10,193 frames, ~33 Hz, every stop window
+  0.7 s with 23–24 frames, click/stop `n` gapless 0–212, `moved_px` max 5.1 (under the
+  6 px drag threshold), `frame_age_s` p95 32 ms. Sources: tree 163 / caret 26 / vision
+  24; all clicks on DP-1. Frame validity: 9,777/10,193 both-eyes (416 both-zero-origin
+  = the meta_end invalid count exactly; a further 817 frames are one-eye — combined
+  gaze still present and finite in all 10,193, so export gates must key off eye-origin
+  validity, not gaze finiteness). Twelve vision clicks land ≤6 px outside their tight
+  OCR/detector box (expected; box-center target absorbs it). Caret elements carry
+  score 0.0 by construction. Biggest boxes are GitHub diff-hunk `table-cell`s up to
+  1051×956 — exactly what the heteroscedastic box-size label noise is for; an
+  export-time box-area cap is worth considering. Free drift number, median gaze vs
+  click point over each stop window: **3.0° median, p90 10.9°, max 24.2°** — the tail
+  is look-away/muscle-memory clicks (fixation gates at export handle it), the median is
+  the raw uncorrected-calibration baseline the residual model has to beat. Bias drifted
+  (−84,+49) px → (−45,+109) px first-to-last third: real intra-session drift, visible
+  for free, as hoped.
 
 ## 11. Open questions
 
