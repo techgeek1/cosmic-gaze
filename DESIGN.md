@@ -1231,7 +1231,15 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   control is marked, and the band they are in or approaching is drawn as a faint zone
   with the dot, deeper while the scroll runs. The old aiming guard (eyes on a small
   control hold the scroller off) went with it: it was gating on the recogniser's boxes,
-  which the near gate and the tree verdicts had since stopped trusting.
+  which the near gate and the tree verdicts had since stopped trusting. So did the
+  controller's held/idle arbitration against the mouse, and the detector now sleeps
+  while the thumb is up (the fans came up while scrolling by eye, and no box is wanted
+  then); an edge scroll puts the pointer back where it borrowed it from, and a commit
+  lands on the marked element's centre, since the highlight is the promise. YouTube's
+  page in Firefox offered a scroll up at the top of the page and none down: a
+  `section` with `-1x-1` extents sits between the page and the document, and taken as
+  the document's child it "overflowed" 106 px above it. Nodes without extents are now
+  left out before the overflow test (`gaze-a11y`).
 
 ## 11. Open questions
 

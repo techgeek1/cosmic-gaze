@@ -133,11 +133,6 @@ impl ClickFeed {
         out
     }
 
-    /// When the real mouse last moved, scrolled or clicked. `None` until it has.
-    pub fn last_mouse_input(&self) -> Option<Instant> {
-        self.mouse.last_input()
-    }
-
     /// Stops the mouse reader. The cursor session closes with the drop.
     pub fn stop(&mut self) {
         self.mouse.stop();

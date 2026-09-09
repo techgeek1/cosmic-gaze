@@ -15,14 +15,11 @@
 //!   from then on moves the commit point until the thumb lifts. Pressing the pad to click
 //!   implies touching it, so a refine always ends in a commit if one is wanted.
 //!
-//! The controller also says whether it *owns the pointer* ([`Daydream::owner`]). Two
-//! things take it away: the controller being put down (a held controller never reads a
-//! gyro as still as one lying on the desk for long, so nothing above [`HELD_GYRO_RAD_S`]
-//! and no touch or button within [`HELD_WINDOW`] means down) and the mouse moving, which
-//! wins on the spot the way a mouse takes over from a gamepad in a game. The mouse keeps
-//! it until the controller is used on purpose: a touch, a button, or a swing past
-//! [`PICKUP_GYRO_RAD_S`], which is what lifting it off the desk does and what a hand
-//! merely resting around it does not.
+//! The controller used to arbitrate the pointer against the mouse from its gyro (held or
+//! on the desk, picked up since the mouse last moved). That went on 2026-09-09 with the
+//! modes: a thumb on the pad is the whole statement of intent, and with the thumb up
+//! nothing on the gaze side moves the pointer except a scroll that borrows it and gives
+//! it back.
 //!
 //! The touchpad is the default; the gyro was the bet (no pad-edge problem) but on the desk
 //! it was jittery and its yaw barely registered, so it stays as an option behind
@@ -75,20 +72,6 @@ pub const TAP_MAX: Duration = Duration::from_millis(250);
 /// Pad travel (in pad widths) past which a touch is a drag, not a tap. The pad's 8-bit
 /// resolution puts one count at 0.004; a thumb landing and lifting moves a few counts.
 pub const TAP_MAX_PAD: f32 = 0.04;
-
-/// Gyro magnitude above which the controller is moving in a hand, rad/s. Lying on the desk
-/// the gyro peaks under 0.03; held in a relaxed arm at the side it dropped under the earlier
-/// 0.06 for seconds at a time (2026-09-05 session), so the bar sits just above desk noise.
-pub const HELD_GYRO_RAD_S: f32 = 0.035;
-
-/// How long after the last motion, touch or button the controller still counts as held. A
-/// resting hand goes quiet for a few seconds at a time; a desk stays quiet for good.
-pub const HELD_WINDOW: Duration = Duration::from_secs(6);
-
-/// Gyro magnitude that reads as picking the controller up or swinging it on purpose,
-/// rad/s. Above the tremor of a hand that is resting around it while the other hand
-/// works the mouse; a lift off the desk sweeps well past it.
-pub const PICKUP_GYRO_RAD_S: f32 = 0.25;
 
 /// How far the thumb must have moved from where it landed, as a fraction of the pad,
 /// before a touch becomes a refine. A thumb settling onto the pad shifts its centroid a
@@ -205,24 +188,8 @@ struct Mapper {
     pending_move  : Option<(f64, f64)>,
     /// When the last report arrived, for the gyro's `dt`.
     last_at       : Option<Instant>,
-    /// When the controller last moved, was touched or had a button pressed.
-    last_active   : Option<Instant>,
-    /// When it was last used on purpose: touched, a button pressed, or swung past
-    /// [`PICKUP_GYRO_RAD_S`]. This is what takes the pointer back from the mouse.
-    last_pickup   : Option<Instant>,
     /// Held volume keys and when each next repeats.
     repeats       : Vec<(Button, Instant)>,
-}
-
-/// Who the pointer belongs to, from the controller's and the mouse's point of view.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Owner {
-    /// The controller is held and the mouse has not been used since it was picked up.
-    Controller,
-    /// The mouse was used more recently than the controller was picked up or touched.
-    Mouse,
-    /// The controller has been still for [`HELD_WINDOW`] and the mouse was never used.
-    Nobody,
 }
 
 // --- Daydream ---
@@ -263,11 +230,6 @@ impl Daydream {
         out
     }
 
-    /// Who the pointer belongs to right now, given when the mouse was last used.
-    pub fn owner(&self, mouse_at: Option<Instant>) -> Owner {
-        self.mapper.owner(Instant::now(), mouse_at)
-    }
-
     /// Stops the reader. Idempotent.
     pub fn stop(&mut self) {
         self.controller.stop();
@@ -292,30 +254,7 @@ impl Mapper {
             touch_clicked : false,
             pending_move  : None,
             last_at       : None,
-            last_active   : None,
-            last_pickup   : None,
             repeats       : Vec::new(),
-        }
-    }
-
-    /// Whether anything happened on the controller within [`HELD_WINDOW`] of `now`.
-    fn held(&self, now: Instant) -> bool {
-        self.last_active.is_some_and(|at| now.saturating_duration_since(at) <= HELD_WINDOW)
-    }
-
-    /// Who owns the pointer: the mouse if it was used since the controller was last
-    /// picked up or used, otherwise the controller while it is held, otherwise nobody.
-    fn owner(&self, now: Instant, mouse_at: Option<Instant>) -> Owner {
-        let mouse_wins = match (mouse_at, self.last_pickup) {
-            (Some(m), Some(c)) => m > c,
-            (Some(_), None)    => true,
-            (None, _)          => false,
-        };
-
-        match (mouse_wins, self.held(now)) {
-            (true, _)      => Owner::Mouse,
-            (false, true)  => Owner::Controller,
-            (false, false) => Owner::Nobody,
         }
     }
 
@@ -323,17 +262,6 @@ impl Mapper {
     fn step(&mut self, report: Report, out: &mut Vec<Control>) {
         let p  = report.packet;
         let dt = self.last_at.map(|t| report.at.saturating_duration_since(t)).unwrap_or(MAX_DT);
-
-        let used = p.touch.is_some() || p.buttons.bits() != 0;
-        let rate = p.gyro.length();
-
-        if used || rate > HELD_GYRO_RAD_S {
-            self.last_active = Some(report.at);
-        }
-
-        if used || rate > PICKUP_GYRO_RAD_S {
-            self.last_pickup = Some(report.at);
-        }
 
         // A tap: the thumb lifting soon after it landed, having gone nowhere and clicked
         // nothing. Emitted before the refine ends so the commit still has the anchor.
@@ -683,59 +611,6 @@ mod tests {
         mapper.step(touch_report(t0 + Duration::from_millis(620), None), &mut out);
 
         assert!(!out.contains(&Control::Context), "{out:?}");
-
-        // Touching counts as held; a full window of silence does not.
-        assert!(mapper.held(t0 + Duration::from_millis(700)));
-        assert!(!mapper.held(t0 + Duration::from_millis(620) + HELD_WINDOW + Duration::from_millis(1)));
-    }
-
-    #[test]
-    fn the_mouse_takes_the_pointer_until_the_controller_is_picked_up() {
-        let config = DaydreamConfig {
-            mode              : RefineMode::Touch,
-            gyro_gain_px_rad  : DEFAULT_GYRO_GAIN_PX_PER_RAD,
-            touch_gain_px     : DEFAULT_TOUCH_GAIN_PX,
-            axes              : parse_axes(DEFAULT_AXES).unwrap(),
-        };
-        let mut mapper = Mapper::new(config);
-        let mut out    = Vec::new();
-        let t0         = Instant::now();
-        let ms         = |n: u64| t0 + Duration::from_millis(n);
-
-        let gyro_report = |at: Instant, rate: f32| Report {
-            at     : at,
-            packet : Packet {
-                time        : 0,
-                seq         : 0,
-                orientation : glam::Vec3::ZERO,
-                accel       : glam::Vec3::ZERO,
-                gyro        : glam::Vec3::new(rate, 0.0, 0.0),
-                touch       : None,
-                buttons     : Buttons::default(),
-            },
-        };
-
-        // Held and moving a little: the controller owns the pointer with no mouse around.
-        mapper.step(gyro_report(ms(0), 0.1), &mut out);
-        assert_eq!(mapper.owner(ms(10), None), Owner::Controller);
-
-        // The mouse moves: it wins on the spot, and a resting hand's tremor does not
-        // take the pointer back.
-        assert_eq!(mapper.owner(ms(110), Some(ms(100))), Owner::Mouse);
-        mapper.step(gyro_report(ms(200), 0.1), &mut out);
-        assert_eq!(mapper.owner(ms(210), Some(ms(100))), Owner::Mouse);
-
-        // A swing past the pickup rate does.
-        mapper.step(gyro_report(ms(300), PICKUP_GYRO_RAD_S + 0.1), &mut out);
-        assert_eq!(mapper.owner(ms(310), Some(ms(100))), Owner::Controller);
-
-        // So does a touch, after the mouse has taken it again.
-        assert_eq!(mapper.owner(ms(410), Some(ms(400))), Owner::Mouse);
-        mapper.step(touch_report(ms(500), Some((0.5, 0.5))), &mut out);
-        assert_eq!(mapper.owner(ms(510), Some(ms(400))), Owner::Controller);
-
-        // Put down with the mouse never used: nobody.
-        assert_eq!(mapper.owner(ms(500) + HELD_WINDOW + Duration::from_millis(1), None), Owner::Nobody);
     }
 
     /// The touch mapping at its defaults.

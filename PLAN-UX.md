@@ -63,6 +63,19 @@ thread presents it on its own clock (`present.rs`). Rules:
   the dot, and a running scroll keeps it up whatever the eyes do. This replaced the
   old rule that eyes on a small control held the scroller off, which after the near
   gate and the tree verdicts was gating on elements that no longer existed.
+  The modes carry three more things. **The detector sleeps with the thumb up**: the
+  perception thread neither captures nor detects until the look is armed (or the desk
+  has no controller and no latch key, when it runs as before), and arming asks for the
+  output under the gaze first; the tree verdict marks controls in the meantime, so the
+  highlight is not waiting on the detector. **A scroll borrows the pointer**: Wayland
+  delivers wheel motion to the surface under the pointer and nowhere else, so an edge
+  scroll still has to put the pointer in the surface, but it now remembers where the
+  pointer was and puts it back when the scroll stops, unless something else moved it
+  meanwhile. **A commit lands on what is marked**: the highlight's centre, whatever the
+  snap engine's own pick or the pointer's place; the refine point still outranks it,
+  and with nothing marked the engine's pick is clicked as before. The controller's
+  held/idle arbitration against the mouse (gyro thresholds, a six-second window) is
+  gone: the thumb is the intent, and nothing gaze-side moves the pointer otherwise.
 - **The tree outranks the recogniser.** Once per place the eyes settle, the session asks
   the accessibility tree what is there (`verify.rs`, on `gaze-clicks`'s tree thread,
   polled, never blocking). A control it names (`link`, `push button`, `entry`, ...) is

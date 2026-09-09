@@ -74,6 +74,8 @@ pub enum Redetect {
 pub struct Perception {
     redetect : Sender<Redetect>,
     stop     : Arc<AtomicBool>,
+    /// While set the thread neither captures nor detects; the last element list stands.
+    paused   : Arc<AtomicBool>,
     join     : Option<JoinHandle<()>>,
 }
 
@@ -142,12 +144,14 @@ impl Perception {
         let (ready_tx, ready_rx)       = mpsc::channel();
         let (redetect_tx, redetect_rx) = crossbeam_channel::unbounded();
 
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop   = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
 
         let join = thread::Builder::new()
             .name("gaze-perception".to_string())
             .spawn({
-                let stop = Arc::clone(&stop);
+                let stop   = Arc::clone(&stop);
+                let paused = Arc::clone(&paused);
 
                 move || {
                     let started = connect(&config);
@@ -166,7 +170,7 @@ impl Perception {
                         }
                     };
 
-                    run(config, capture, detector, store, redetect_rx, stop);
+                    run(config, capture, detector, store, redetect_rx, stop, paused);
                 }
             })
             .context("spawning the perception thread")?;
@@ -178,8 +182,16 @@ impl Perception {
         Ok(Perception {
             redetect : redetect_tx,
             stop     : stop,
+            paused   : paused,
             join     : Some(join),
         })
+    }
+
+    /// Stops capturing and detecting until unpaused, from the next pass. The element
+    /// list published so far stands, stale or not; the caller that resumes usually
+    /// forces a redetect in the same breath. Idle costs one atomic load per period.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
     }
 
     /// Asks for a detection on every output on the next pass, regardless of the frame diff.
@@ -237,6 +249,7 @@ fn run(
     store    : Arc<ElementStore>,
     redetect : Receiver<Redetect>,
     stop     : Arc<AtomicBool>,
+    paused   : Arc<AtomicBool>,
 )
 {
     let mut capture = capture;
@@ -245,6 +258,13 @@ fn run(
 
     while !stop.load(Ordering::Relaxed) {
         let pass_start = Instant::now();
+
+        // Paused: no capture, no detection, requests queue up for the resume.
+        if paused.load(Ordering::Relaxed) {
+            thread::sleep(config.period);
+
+            continue;
+        }
 
         // Drain the whole channel: several requests between passes still mean one pass.
         let mut forced_all = false;

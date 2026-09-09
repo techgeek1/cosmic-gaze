@@ -44,7 +44,7 @@ use gaze_snap::{FilterStack, FixationState, Filtered, SnapEngine};
 use tracing::{debug, error, info, warn};
 
 use crate::cli::{Args, Provider};
-use crate::daydream::{Daydream, DaydreamConfig, Owner, parse_axes};
+use crate::daydream::{Daydream, DaydreamConfig, parse_axes};
 use crate::edge_scroll::{APPROACH_FRACTION, Action as EdgeAction, EdgeScroller, Eyes, Scrollable};
 use crate::feedback::{self, ClickFeed, Press};
 use crate::keys::LatchKeys;
@@ -348,7 +348,6 @@ pub fn run(args: &Args) -> Result<()> {
     // box is where the content was.
     let mut last_hidden                      = false;
     let mut last_blocked                     = false;
-    let mut last_owner  : Option<Owner>      = None;
     // The pointer look's state apart from position, so a change in what is near
     // repaints even when the eyes have not moved.
     let mut last_pointer : Option<(bool, Option<u64>)> = None;
@@ -364,6 +363,16 @@ pub fn run(args: &Args) -> Result<()> {
     // scroller. `--overlay-always` arms the look for the whole run without doing that.
     let mut pad_down    = false;
     let mut latched     = false;
+    // Where the pointer was before an edge scroll warped it into the surface; it goes
+    // back there when the scroll stops, so scrolling by eye leaves the pointer alone.
+    let mut parked      : Option<GlobalPx> = None;
+    // The centre of the element the overlay is marking, as of the last sample. A commit
+    // lands on it: what is highlighted is what is selected.
+    let mut marked      : Option<GlobalPx> = None;
+    // Whether the perception thread is capturing and detecting. Off while the eyes are
+    // only reading or scrolling, since no box is wanted then and the detector is the
+    // hot part of the session.
+    let mut perceiving  = true;
     // Whether push-to-talk is forwarded down right now, so an exit mid-hold releases it.
     let mut ptt_down    = false;
     let mut samples     = 0u64;
@@ -420,12 +429,19 @@ pub fn run(args: &Args) -> Result<()> {
                     // A refined point is spent by the commit, whether or not it clicked.
                     // The pointer was steered by eye through relative motion, so where
                     // the compositor says it is beats where the deltas add up to.
-                    let at = refined.take().map(|r| {
-                        injector
-                            .as_mut()
-                            .and_then(|i| i.last_known_position().ok().flatten())
-                            .unwrap_or_else(|| r.point())
-                    });
+                    //
+                    // No refine: the marked element, whose highlight is the promise that
+                    // a commit lands on it, wherever the pointer and the snap engine's
+                    // own pick are. Nothing marked: the engine's pick.
+                    let at = refined
+                        .take()
+                        .map(|r| {
+                            injector
+                                .as_mut()
+                                .and_then(|i| i.last_known_position().ok().flatten())
+                                .unwrap_or_else(|| r.point())
+                        })
+                        .or(marked);
 
                     let clicked = commit(
                         &mut engine,
@@ -636,15 +652,6 @@ pub fn run(args: &Args) -> Result<()> {
         // filter still runs so the fixation state is current when the lock lifts.
         let locked = refined.is_some_and(|r| r.engaged);
 
-        // The pointer is the controller's while it is held and the mouse has been idle since
-        // it was picked up. The mouse takes over the moment it moves, and a controller lying
-        // on the desk gives it up; either way gaze keeps showing where it is, but moves
-        // nothing until the controller is used again.
-        let owner = daydream
-            .as_ref()
-            .map(|d| d.owner(clicks.as_ref().and_then(ClickFeed::last_mouse_input)));
-        let held  = owner.is_none_or(|o| o == Owner::Controller);
-
         // Thumb down or latched: the eyes are pointing. Thumb up: they are reading, and
         // may scroll. One or the other, never both, so a scroll never fights a refine
         // and a control in the band never holds a scroll off.
@@ -655,7 +662,7 @@ pub fn run(args: &Args) -> Result<()> {
         let (scrolling, zone) = match edge.as_mut() {
             Some((scroller, surfaces)) => {
                 let was               = scroller.scrolling();
-                let quiet             = input || !held;
+                let quiet             = input;
                 let (stopped, surface) = edge_scroll(
                     scroller,
                     surfaces,
@@ -665,6 +672,7 @@ pub fn run(args: &Args) -> Result<()> {
                     &filtered,
                     gaze,
                     quiet,
+                    &mut parked,
                 );
 
                 if scroller.scrolling() && !was {
@@ -762,6 +770,27 @@ pub fn run(args: &Args) -> Result<()> {
         let aim   = target.as_ref().map(|t| t.point).or(gaze);
         let armed = args.overlay_always || input;
 
+        // The detector runs only while its boxes can be wanted: the eyes are pointing,
+        // or nothing on this desk can say when they are (no controller, no latch key).
+        // Resuming asks for the output under the gaze first, so the thumb landing sees
+        // fresh boxes within one detection rather than a full pass.
+        let want_boxes = armed || (daydream.is_none() && latch_keys.is_none());
+
+        if want_boxes != perceiving {
+            perceiving = want_boxes;
+
+            perception.set_paused(!perceiving);
+
+            if perceiving {
+                match gaze.and_then(|g| output_at(&geometry, g)) {
+                    Some(name) => perception.force_redetect_output(name),
+                    None       => perception.force_redetect(),
+                }
+            }
+
+            debug!(on = perceiving, "perception");
+        }
+
         if let Some(v) = verifier.as_mut() {
             let settled = matches!(filtered.state, FixationState::Fixating { .. });
 
@@ -827,8 +856,10 @@ pub fn run(args: &Args) -> Result<()> {
         let pointer_key = pointer.map(|p| (p.near, p.target.map(|t| t.id)));
         let armed_now   = pointer.is_some();
 
+        marked = pointer.and_then(|p| p.target).map(|t| t.rect.center());
+
         if moved || target_id != last_target || hidden != last_hidden || blocked != last_blocked
-            || owner != last_owner || pointer_key != last_pointer || armed_now != last_armed
+            || pointer_key != last_pointer || armed_now != last_armed
             || zone != last_zone
         {
             let state = {
@@ -841,8 +872,6 @@ pub fn run(args: &Args) -> Result<()> {
                         truth      : if args.show_truth { source.truth() } else { None },
                         label      : Some(match (scrolling, hidden, retarget_block) {
                             _ if refined.is_some_and(|r| r.engaged) => "refine".to_string(),
-                            _ if owner == Some(Owner::Mouse)  => "mouse".to_string(),
-                            _ if owner == Some(Owner::Nobody) => "controller down".to_string(),
                             (true, _, _)        => "edge scroll".to_string(),
                             (false, true, _)    => "redetecting".to_string(),
                             (false, false, Some(_)) => "move eyes to retarget".to_string(),
@@ -869,7 +898,6 @@ pub fn run(args: &Args) -> Result<()> {
             last_zone    = zone;
             last_hidden  = hidden;
             last_blocked = blocked;
-            last_owner   = owner;
 
             if overlay.set(state).is_err() {
                 reason = "the overlay thread exited";
@@ -888,7 +916,6 @@ pub fn run(args: &Args) -> Result<()> {
         // the pointer is not.
         if args.focus_follows_gaze
             && !locked
-            && held
             && let FixationState::Fixating { since_s } = filtered.state
             && filtered.sample.t_s - since_s >= args.focus_dwell_s
             && focus_done != Some(since_s)
@@ -1259,10 +1286,14 @@ fn scroll_under_gaze(
 /// already there: the wheel goes to the surface under the pointer, and the user's pointer
 /// is wherever they left it. Units then go out as high-resolution wheel motion without
 /// moving the pointer again, so gaze jitter during the scroll does not drag it about.
+/// Where it was is kept in `parked`, and the stop puts it back there if nothing else has
+/// moved it since, so a scroll by eye borrows the pointer rather than taking it. (Wayland
+/// delivers wheel motion to the surface under the pointer and nowhere else, so borrowing
+/// it is the least the scroll can do without compositor help.)
 ///
-/// `quiet` (the eyes are pointing: a thumb on the pad or the latch on, or the mouse has
-/// the pointer) shows the scroller no surface and no eyes, which stops a running scroll
-/// and arms nothing, without the gaze ever reaching it.
+/// `quiet` (the eyes are pointing: a thumb on the pad or the latch on) shows the
+/// scroller no surface and no eyes, which stops a running scroll and arms nothing,
+/// without the gaze ever reaching it.
 #[allow(clippy::too_many_arguments)]
 fn edge_scroll(
     scroller : &mut EdgeScroller,
@@ -1273,6 +1304,7 @@ fn edge_scroll(
     filtered : &Filtered,
     gaze     : Option<GlobalPx>,
     quiet    : bool,
+    parked   : &mut Option<GlobalPx>,
 )
     -> (bool, Option<Scrollable>)
 {
@@ -1321,6 +1353,8 @@ fn edge_scroll(
             );
 
             if !inside {
+                *parked = pointer;
+
                 do_warp(
                     injector.as_deref_mut(),
                     warper,
@@ -1351,6 +1385,30 @@ fn edge_scroll(
 
         EdgeAction::Stop => {
             info!(units = scroller.units, "edge scroll stop");
+
+            // The pointer goes home if it is still where the start put it; moved since
+            // (the mouse took it), it is the user's and stays.
+            if let Some(home) = parked.take() {
+                let pointer = pointer_position(injector.as_deref_mut(), warper);
+                let lent    = warper.last_point();
+                let untouched = match (pointer, lent) {
+                    (Some(p), Some(l)) => (p.x - l.x).hypot(p.y - l.y) <= RESUME_NEAR_PX,
+                    (None, _)          => true,
+                    _                  => false,
+                };
+
+                if untouched {
+                    do_warp(
+                        injector,
+                        warper,
+                        home,
+                        filtered.sample.sigma_deg,
+                        None,
+                        WarpReason::EdgeScrollReturn,
+                        Instant::now(),
+                    );
+                }
+            }
 
             true
         }

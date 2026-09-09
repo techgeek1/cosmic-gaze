@@ -31,6 +31,8 @@ pub enum WarpReason {
     Focus,
     /// An edge scroll started with the pointer outside the surface it has to land on.
     EdgeScroll,
+    /// That edge scroll stopped and the pointer goes back to where it was borrowed from.
+    EdgeScrollReturn,
     /// The controller's refine gesture began: the pointer goes to the snap point so the
     /// hand can take it from there.
     Refine,

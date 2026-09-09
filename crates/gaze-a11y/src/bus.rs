@@ -659,13 +659,24 @@ pub const MIN_CLIP_PX: f64 = 120.0;
 ///
 /// Horizontal overflow is ignored: a carousel is not what a vertical wheel moves. A clip
 /// shorter than [`MIN_CLIP_PX`] is skipped for the next one up, see there.
+///
+/// Nodes without real extents are left out of the chain before pairing: Firefox reports
+/// some structural nodes at `-1x-1` (a `section` between YouTube's page and its
+/// document, 2026-09-09), and one of those taken as a child put "content" 106 px above
+/// a document that was at the top of its page, so the upper band offered a scroll up
+/// that did not exist and the real overflow below was never reached.
 pub fn clip_surface(chain: &[Node]) -> Option<Surface> {
-    for pair in chain.windows(2) {
+    let placed : Vec<&Node> = chain
+        .iter()
+        .filter(|n| n.rect.is_some_and(|r| r.w > 0.0 && r.h > 0.0))
+        .collect();
+
+    for pair in placed.windows(2) {
         let (Some(child), Some(parent)) = (pair[0].rect, pair[1].rect) else {
             continue;
         };
 
-        if parent.h < MIN_CLIP_PX || parent.w <= 0.0 {
+        if parent.h < MIN_CLIP_PX {
             continue;
         }
 
@@ -791,6 +802,29 @@ mod tests {
         assert_eq!(surface.clip.role, "panel");
         assert_eq!(surface.viewport, Rect { x: 381.0, y: 248.0, w: 898.0, h: 1296.0 });
         assert_eq!(surface.content.h, 4305.0);
+    }
+
+    /// YouTube in Firefox at the top of the page: a `-1x-1` section between the page and
+    /// the document is not content, so the surface is the document with everything
+    /// below and nothing above.
+    #[test]
+    fn a_node_without_extents_is_not_overflowing_content() {
+        // `gaze-a11y-cli chain 1500,900 --window YouTube`, 2026-09-09, leaf first.
+        let chain = vec![
+            boxed("panel"       , 1283.0, 307.0, 1271.0,  715.0),
+            boxed("section"     , 1283.0, 307.0, 1271.0,  715.0),
+            boxed("landmark"    , 1283.0, 307.0, 1271.0, 4780.0),
+            boxed("section"     , 1283.0, 307.0, 1271.0, 4780.0),
+            boxed("section"     , 1283.0, 251.0, 1271.0, 4836.0),
+            boxed("section"     , 1262.0, 145.0,   -1.0,   -1.0),
+            boxed("document web", 1283.0, 251.0, 1271.0, 1343.0),
+        ];
+
+        let surface = clip_surface(&chain).expect("the page overflows the document");
+
+        assert_eq!(surface.clip.role, "document web");
+        assert_eq!(surface.content, Rect { x: 1283.0, y: 251.0, w: 1271.0, h: 4836.0 });
+        assert!(surface.content.y >= surface.viewport.y, "nothing above: at the top of the page");
     }
 
     #[test]
