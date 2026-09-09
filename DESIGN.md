@@ -1201,6 +1201,15 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   engine's 2° snap radius; the dot and highlight are now gated on `--near-deg` (0.8°)
   while the engine keeps `--snap-deg` (2°), so a commit past the gate lands unmarked.
   The dot now holds one weight while shown; the highlight sits 1 px outside the box.
+  Two edge cases from the same session were the recogniser's kinds, not the overlay: on
+  Discord it called the short last line of a message a `Button` at 0.9 (marked) and the
+  channel list `Text` (unmarked). Pixels cannot settle either, so the pointer look now
+  asks the accessibility tree once per place the eyes settle (`gaze-proto/src/verify.rs`,
+  on the tree thread, polled) and takes its answer over the recogniser's: Discord
+  answers `list item` 880x71 for the message row and `link` 286x32 for the channel, and
+  a control taller than 56 px and wider than 240 is treated as text, so the row is not
+  marked and the channel is, with the tree's box. Firefox answered nothing on a Reddit
+  tab at the same time; unexplained, and that page runs on the recogniser meanwhile.
 
 ## 11. Open questions
 

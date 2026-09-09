@@ -49,6 +49,7 @@ use crate::perception::{ElementStore, Perception, PerceptionConfig};
 use crate::score::{Scoreboard, classify};
 use crate::source::{Control, GazeSource, Refine};
 use crate::surface::SurfaceCache;
+use crate::verify::{Verdict, Verifier};
 use crate::warp::{WARP_COOLDOWN, WarpReason, Warper};
 
 /// How far the filtered gaze point must move before the overlay is repainted. Below this
@@ -265,6 +266,12 @@ pub fn run(args: &Args) -> Result<()> {
         .scale(Box::new(geometry.clone()))
         .radius_deg(args.snap_deg)
         .build();
+
+    // --- a11y verdicts ---
+
+    // What the application says the eyes are on, for the pointer look; its own tree
+    // thread, since the edge scroller's exists only with `--edge-scroll`.
+    let mut verifier = (!args.no_a11y).then(Verifier::spawn);
 
     // --- edge scrolling ---
 
@@ -680,19 +687,49 @@ pub fn run(args: &Args) -> Result<()> {
         // being within `--near-deg` of the element: the engine will snap from further
         // out than that, but a highlight on an element the eyes are nowhere near reads
         // as the overlay guessing, not the eyes aiming.
+        //
+        // The tree, when it answers, outranks the recogniser: a control it names is
+        // marked with its own box, and text it names is not marked whatever the
+        // recogniser called it.
+        let aim = target.as_ref().map(|t| t.point).or(gaze);
+
+        if let Some(v) = verifier.as_mut() {
+            let settled = matches!(filtered.state, FixationState::Fixating { .. });
+
+            v.update(aim.filter(|_| settled && !locked));
+        }
+
         let pointer = gaze.map(|g| {
             let refining = refined.filter(|r| r.engaged);
             let close    = |c: &gaze_snap::Candidate| {
                 c.distance_deg <= args.near_deg && worth_marking(&elements[c.index], args)
             };
+            let verdict  = match (&verifier, aim) {
+                (Some(v), Some(p)) => v.verdict(p),
+                _                  => Verdict::Unknown,
+            };
+            let holding  = match (&verifier, aim) {
+                (Some(v), Some(p)) => v.holding(p),
+                _                  => false,
+            };
+
+            let (near, target) = match verdict {
+                Verdict::Control { id, rect, .. } => (true, Some(Target { id: id, rect: rect })),
+                Verdict::Static                   => (false, None),
+                Verdict::Unknown if holding       => (engine.ranked().any(close), None),
+                Verdict::Unknown                  => (
+                    engine.ranked().any(close),
+                    target
+                        .as_ref()
+                        .filter(|t| engine.ranked().any(|c| c.id == t.element.id && close(c)))
+                        .map(|t| Target { id: t.element.id, rect: t.element.bbox }),
+                ),
+            };
 
             Pointer {
                 gaze   : refining.map_or(g, |r| r.point()),
-                near   : refining.is_some() || engine.ranked().any(close),
-                target : target
-                    .as_ref()
-                    .filter(|t| !hidden && engine.ranked().any(|c| c.id == t.element.id && close(c)))
-                    .map(|t| Target { id: t.element.id, rect: t.element.bbox }),
+                near   : refining.is_some() || near,
+                target : target.filter(|_| !hidden),
             }
         });
 
@@ -836,6 +873,9 @@ pub fn run(args: &Args) -> Result<()> {
         edge_units      = edge.as_ref().map(|(e, _)| e.units),
         surfaces_asked  = edge.as_ref().map(|(_, s)| s.asked),
         surfaces_found  = edge.as_ref().map(|(_, s)| s.found),
+        a11y_asked      = verifier.as_ref().map(|v| v.asked),
+        a11y_controls   = verifier.as_ref().map(|v| v.controls),
+        a11y_statics    = verifier.as_ref().map(|v| v.statics),
         daydream_reports = daydream.as_ref().map(|d| d.reports),
         cpu_percent     = ?cpu_percent,
         "session summary"

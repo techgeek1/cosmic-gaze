@@ -32,6 +32,15 @@ thread presents it on its own clock (`present.rs`). Rules:
   doing something), a 3 px inflation of the highlight (the boxes read as bigger than
   their widgets, worst on Discord and Reddit), and showing the highlight anywhere in
   the snap radius (a box on an element the eyes are nowhere near reads as guessing).
+- **The tree outranks the recogniser.** Once per place the eyes settle, the session asks
+  the accessibility tree what is there (`verify.rs`, on `gaze-clicks`'s tree thread,
+  polled, never blocking). A control it names (`link`, `push button`, `entry`, ...) is
+  marked with the tree's own box; text, a heading or nothing actionable is never marked
+  whatever the recogniser called it; a control taller than 56 px and wider than 240 is
+  a row or a picture and is treated as text. No answer (an application off the bus)
+  leaves the recogniser's kind in charge. Found on Discord 2026-09-09: the recogniser
+  called a message's last line a `Button` at 0.9 and the channel list `Text`; the tree
+  says `list item` 880x71 and `link` 286x32. `--no-a11y` turns this off.
 - **Theme** from cosmic-config (`com.system76.CosmicTheme.{Mode,Dark,Light}`), watched,
   so an accent change in cosmic-settings is picked up live. Stock COSMIC colours when
   there is no theme to read.
@@ -44,7 +53,9 @@ the frame the screen would show.
 Not done here, on purpose: easing the dot's position (it would add lag to a channel that
 already feels heavy), and any caption in the pointer look. Still open: the detector's
 own boxes on web content are looser than the widgets they mark, which the 1 px inflation
-does not fix; that is a `gaze-detect` question.
+does not fix and the tree fixes only where it answers; and Firefox answered nothing on a
+Reddit tab on 2026-09-09 while Discord answered everything, so web content in Firefox
+runs on the recogniser until that is understood.
 
 ## U2. Daemon (`gazed`)
 

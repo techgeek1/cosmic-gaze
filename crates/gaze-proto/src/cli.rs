@@ -249,6 +249,14 @@ pub struct Args {
     #[arg(long, default_value_t = 2.0)]
     pub snap_deg: f64,
 
+    /// Do not ask the accessibility tree what the eyes are on. Asked, the tree's answer
+    /// outranks the recogniser's kind for the pointer look: a control it names is marked
+    /// with its own box, text it names is never marked. Applications off the bus
+    /// (Chromium and Electron without accessibility forced on, see gaze-a11y's README)
+    /// fall back to the recogniser either way.
+    #[arg(long)]
+    pub no_a11y: bool,
+
     /// Let the pointer look mark text elements (OCR words, labels) as well as controls.
     /// Off, a target that is text gets no highlight and no dot, so a page of prose stays
     /// unmarked while it is read; a commit on an OCR word still lands, unmarked.

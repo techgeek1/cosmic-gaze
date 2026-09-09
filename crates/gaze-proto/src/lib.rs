@@ -38,6 +38,7 @@ pub mod perception;
 pub mod score;
 pub mod session;
 pub mod source;
+pub mod verify;
 pub mod warp;
 
 pub use cli::{Args, Provider};
