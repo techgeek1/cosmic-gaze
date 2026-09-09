@@ -20,8 +20,18 @@ thread presents it on its own clock (`present.rs`). Rules:
   the near gate lands on an unmarked element, which is the price of not marking guesses.
 - **The dot** is 8 px in the desktop accent with a one-pixel halo in black or white,
   whichever the accent is further from, so it survives a white page and a dark window.
-  It fades in and out (60 ms in, 140 ms out) rather than popping, and holds one weight
-  while shown.
+  It fades in and out (60 ms in, 200 ms out) rather than popping, holds one weight while
+  shown, and stays up for a linger (`--pointer-linger-s`, 0.3 s) after nothing is near,
+  with the near gate itself closing at 1.5x the distance it opens at, so the edge of the
+  gate does not blink it.
+- **The dot moves on a critically damped spring** stepped at the display's frame rate
+  (`--pointer-settle-s`, 0.2 s to close 95% of a step), the VR laser-pointer treatment:
+  continuous velocity between the tracker's 33 Hz samples, no overshoot, drift followed
+  at the same pace as everything else. An invisible dot is placed on the gaze before it
+  fades in, never swept in from where it was hidden. With the overlay doing the
+  smoothing, the filter stack's one-euro cutoff for the tracker went from 0.3 Hz (a
+  half-second lag on drift, which read as weight) to 1 Hz; its job is now only to keep
+  the snap point from jittering.
 - **The highlight** is a rounded rectangle 1 px outside the element, corner radius from
   the theme's small radius, accent stroke with halo, 12% accent fill. It crossfades from
   element to element instead of jumping, which also hides the flicker between two

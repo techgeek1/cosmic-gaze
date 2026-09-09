@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use gaze_core::{DesktopGeometry, Element, ElementKind, GazeSample, GlobalPx};
 use gaze_inject::{Button as InjectButton, Injector, Key};
-use gaze_overlay::{Overlay, OverlayState, Pointer, Target};
+use gaze_overlay::{Overlay, OverlayState, Pointer, PointerStyle, Target};
 use gaze_provider_et5::{ClickFeedback, ClickVia};
 use gaze_provider_synthetic::to_jsonl_line;
 use gaze_snap::{FilterStack, FixationState, Filtered, SnapEngine};
@@ -55,6 +55,9 @@ use crate::warp::{WARP_COOLDOWN, WarpReason, Warper};
 /// How far the filtered gaze point must move before the overlay is repainted. Below this
 /// the ring would jitter in place and cost a frame per sample for no visible change.
 const OVERLAY_MOVE_PX: f64 = 2.0;
+
+/// The near gate's closing distance as a multiple of its opening one (`--near-deg`).
+const NEAR_HYSTERESIS: f64 = 1.5;
 
 /// Capture passes per second on the perception thread. Capture is ~35 ms per ultrawide, so
 /// this leaves the cores to the detector and the gaze loop.
@@ -176,7 +179,11 @@ pub fn run(args: &Args) -> Result<()> {
 
     // --- overlay ---
 
-    let (overlay, overlay_join) = Overlay::spawn().context("spawning the overlay")?;
+    let (overlay, overlay_join) = Overlay::spawn_styled(PointerStyle {
+        settle_s : args.pointer_settle_s,
+        linger_s : args.pointer_linger_s,
+    })
+    .context("spawning the overlay")?;
 
     // --- injector ---
 
@@ -251,9 +258,14 @@ pub fn run(args: &Args) -> Result<()> {
     // every sample as a saccade, so the one-euro smoother never engages and the marker
     // shows the raw jitter. Webcam mode measures velocity over a longer window and raises
     // the threshold; explicit flags override either preset.
+    //
+    // The tracker's one-euro cutoff was 0.3 Hz, the gaze value from the literature, until
+    // 2026-09-09: inside a fixation that follows a drifting eye with a half-second lag,
+    // which read as weight. The overlay now smooths the dot on its own spring, so the
+    // stack's job is only to keep the snap point from jittering, and 1 Hz does that.
     let (velocity_deg_s, window_s, min_cutoff_hz, beta) = match args.provider {
         Provider::Webcam => (80.0, 0.10, 0.6, 0.02),
-        _                => (30.0, 0.02, 0.3, 0.30),
+        _                => (30.0, 0.02, 1.0, 0.30),
     };
     let mut filter = FilterStack::create()
         .scale(Box::new(geometry.clone()))
@@ -701,8 +713,14 @@ pub fn run(args: &Args) -> Result<()> {
 
         let pointer = gaze.map(|g| {
             let refining = refined.filter(|r| r.engaged);
+            // Hysteresis on the near gate: it opens at `--near-deg` and closes at half
+            // as much again, so a gaze sitting at the edge does not flicker the dot.
+            let reach    = match last_pointer {
+                Some((true, _)) => args.near_deg * NEAR_HYSTERESIS,
+                _               => args.near_deg,
+            };
             let close    = |c: &gaze_snap::Candidate| {
-                c.distance_deg <= args.near_deg && worth_marking(&elements[c.index], args)
+                c.distance_deg <= reach && worth_marking(&elements[c.index], args)
             };
             let verdict  = match (&verifier, aim) {
                 (Some(v), Some(p)) => v.verdict(p),

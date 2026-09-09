@@ -1210,6 +1210,13 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   a control taller than 56 px and wider than 240 is treated as text, so the row is not
   marked and the channel is, with the tree's box. Firefox answered nothing on a Reddit
   tab at the same time; unexplained, and that page runs on the recogniser meanwhile.
+  The weight was the filter: the tracker's one-euro cutoff of 0.3 Hz followed a drifting
+  eye with a half-second lag inside a fixation while saccades landed raw, and the
+  contrast read as drag. The dot now rides a critically damped spring in the overlay,
+  stepped at frame rate (settle 0.2 s, `--pointer-settle-s`), and the stack's cutoff is
+  1 Hz; the spring is where the smoothing lives, the stack only steadies the snap point.
+  The dot also blinked at the edge of the near gate; it now lingers 0.3 s after nothing
+  is near and the gate closes at 1.5x the distance it opens at.
 
 ## 11. Open questions
 

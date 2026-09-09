@@ -131,7 +131,7 @@ pub struct Args {
     pub filter_window_s: Option<f64>,
 
     /// One-euro minimum cutoff, Hz. Lower is smoother and laggier during fixations.
-    /// Default 0.3 (tracker) or 0.6 (webcam).
+    /// Default 1.0 (tracker) or 0.6 (webcam).
     #[arg(long)]
     pub filter_min_cutoff_hz: Option<f64>,
 
@@ -248,6 +248,16 @@ pub struct Args {
     /// more wrong elements.
     #[arg(long, default_value_t = 2.0)]
     pub snap_deg: f64,
+
+    /// How long the pointer dot takes to settle on a new gaze point, seconds. The dot
+    /// follows the gaze on a critically damped spring stepped at the display's frame
+    /// rate; shorter is more responsive and passes more of the tracker's jitter.
+    #[arg(long, default_value_t = 0.2)]
+    pub pointer_settle_s: f64,
+
+    /// How long the pointer dot stays up after nothing clickable is near, seconds.
+    #[arg(long, default_value_t = 0.3)]
+    pub pointer_linger_s: f64,
 
     /// Do not ask the accessibility tree what the eyes are on. Asked, the tree's answer
     /// outranks the recogniser's kind for the pointer look: a control it names is marked

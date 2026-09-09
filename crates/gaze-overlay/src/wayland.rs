@@ -42,7 +42,7 @@ use gaze_core::Rect;
 use crate::draw::{self, PixelBox};
 use crate::error::OverlayError;
 use crate::mapping::OutputMapping;
-use crate::present::Presenter;
+use crate::present::{PointerStyle, Presenter};
 use crate::state::OverlayState;
 use crate::theme::{Theme, ThemeWatch};
 
@@ -98,6 +98,11 @@ impl Overlay {
     /// `zwlr_layer_shell_v1` or `wl_shm`. Outputs that appear later are picked up by the
     /// event loop, so an empty output list is not an error.
     pub fn connect() -> Result<Overlay, OverlayError> {
+        Overlay::connect_styled(PointerStyle::default())
+    }
+
+    /// [`Overlay::connect`] with the pointer look's tunables.
+    pub fn connect_styled(style: PointerStyle) -> Result<Overlay, OverlayError> {
         let conn                   = Connection::connect_to_env()?;
         let (globals, event_queue) = registry_queue_init(&conn)?;
         let qh                     = event_queue.handle();
@@ -119,7 +124,7 @@ impl Overlay {
             qh             : qh,
             surfaces       : Vec::new(),
             state          : OverlayState::default(),
-            presenter      : Presenter::new(Theme::cosmic()),
+            presenter      : Presenter::new(Theme::cosmic(), style),
             theme_watch    : ThemeWatch::start(),
             clock          : Instant::now(),
         };
@@ -170,12 +175,19 @@ impl Overlay {
     pub fn spawn()
         -> Result<(OverlayHandle, std::thread::JoinHandle<()>), OverlayError>
     {
+        Overlay::spawn_styled(PointerStyle::default())
+    }
+
+    /// [`Overlay::spawn`] with the pointer look's tunables.
+    pub fn spawn_styled(style: PointerStyle)
+        -> Result<(OverlayHandle, std::thread::JoinHandle<()>), OverlayError>
+    {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
         let join = std::thread::Builder::new()
             .name(NAMESPACE.to_string())
             .spawn(move || {
-                let mut overlay = match Overlay::connect() {
+                let mut overlay = match Overlay::connect_styled(style) {
                     Ok(o)  => o,
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));

@@ -1,10 +1,14 @@
 //! The pointer look: how a [`Pointer`] intent becomes a dot and a highlight over time.
 //!
 //! The producer says what is where; this decides how it looks from one frame to the
-//! next. The dot fades in as the gaze reaches something clickable and out as it leaves,
-//! and the highlight crossfades from one element to the next instead of jumping.
-//! Everything is driven by a clock the caller advances, so it runs on the overlay
-//! thread's frame callbacks and can be stepped by hand in a test.
+//! next. The dot follows the gaze on a critically damped spring stepped at the display's
+//! frame rate, so it moves with continuous velocity between the tracker's 33 Hz samples
+//! instead of stepping, the way a VR laser pointer is smoothed: no overshoot, a settling
+//! time to tune, and drift followed at the same pace as everything else. It fades in as
+//! the gaze reaches something clickable and out, after a linger, as it leaves, and the
+//! highlight crossfades from one element to the next instead of jumping. Everything is
+//! driven by a clock the caller advances, so it runs on the overlay thread's frame
+//! callbacks and can be stepped by hand in a test.
 //!
 //! The look is deliberately quiet. Every choice here is about not putting motion or
 //! colour next to text the user is reading: the raw gaze point is never marked, and the
@@ -13,7 +17,7 @@
 //! and taken out again: at 33 Hz the trail read as a rendering bug, and a dot that
 //! changed weight while the eyes held still looked like it was doing something.
 
-use gaze_core::Rect;
+use gaze_core::{GlobalPx, Rect};
 use tiny_skia::Pixmap;
 
 use crate::draw::{self, Item, PixelBox};
@@ -52,18 +56,51 @@ pub const FADE_IN_S: f64 = 0.06;
 
 /// Time constant of a fade out, seconds. Slower than the fade in so a highlight moving
 /// to a neighbour reads as sliding, not blinking.
-pub const FADE_OUT_S: f64 = 0.14;
+pub const FADE_OUT_S: f64 = 0.2;
+
+/// Spring position error below which the dot is at rest, logical pixels. Under a
+/// quarter pixel nothing moves on screen, so frames stop.
+const REST_PX: f64 = 0.25;
+
+/// Spring speed below which the dot is at rest, logical pixels per second.
+const REST_PX_S: f64 = 2.0;
 
 /// Alpha below which a fade is finished and the item stops being drawn.
 const ALPHA_EPSILON: f32 = 1.0 / 255.0;
 
+/// The tunable parts of the pointer look, chosen by the producer at spawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointerStyle {
+    /// How long the dot takes to settle on a new gaze point, seconds: the time for a
+    /// critically damped spring to close 95% of a step. Shorter is more responsive and
+    /// passes more of the tracker's jitter through.
+    pub settle_s : f64,
+    /// How long the dot stays up after nothing clickable is near any more, seconds. The
+    /// near gate flickers at its edge; without a linger the dot would blink with it.
+    pub linger_s : f64,
+}
+
+impl Default for PointerStyle {
+    fn default() -> Self {
+        PointerStyle { settle_s: 0.2, linger_s: 0.3 }
+    }
+}
+
 /// Presents the pointer look. One per overlay; see the module docs.
 pub struct Presenter {
     theme  : Theme,
+    style  : PointerStyle,
     /// The last intent observed. `None` after the producer took the pointer down.
     intent : Option<Pointer>,
     /// The dot's opacity.
     dot    : Fade,
+    /// The dot's position on its spring, and its velocity, logical pixels. `None`
+    /// until the first intent; reset onto the goal whenever the dot is invisible, so
+    /// it never sweeps in from wherever it was last hidden.
+    spring : Option<Spring>,
+    /// When `near` last went false, if it is still false. The dot fades once this is
+    /// older than the linger.
+    away_s : Option<f64>,
     /// Every highlight still visible: the current target fading in, and any previous
     /// ones fading out behind it.
     boxes  : Vec<Highlight>,
@@ -85,15 +122,26 @@ struct Highlight {
     fade   : Fade,
 }
 
+/// A critically damped spring in two dimensions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Spring {
+    pos  : GlobalPx,
+    vel  : (f64, f64),
+    goal : GlobalPx,
+}
+
 // --- Presenter ---
 
 impl Presenter {
     /// A presenter showing nothing, drawing in `theme`.
-    pub fn new(theme: Theme) -> Presenter {
+    pub fn new(theme: Theme, style: PointerStyle) -> Presenter {
         Presenter {
             theme  : theme,
+            style  : style,
             intent : None,
             dot    : Fade { alpha: 0.0, goal: 0.0 },
+            spring : None,
+            away_s : None,
             boxes  : Vec::new(),
             now_s  : 0.0,
         }
@@ -115,6 +163,7 @@ impl Presenter {
         let Some(p) = pointer else {
             self.intent   = None;
             self.dot.goal = 0.0;
+            self.away_s   = None;
 
             for h in &mut self.boxes {
                 h.fade.goal = 0.0;
@@ -123,8 +172,22 @@ impl Presenter {
             return;
         };
 
-        // The dot: shown near something clickable, and not otherwise.
-        self.dot.goal = if p.near { DOT_ALPHA } else { 0.0 };
+        // The dot: shown near something clickable, and taken down a linger after
+        // nothing is (the fade itself is decided in `step`, which has the clock).
+        if p.near {
+            self.away_s   = None;
+            self.dot.goal = DOT_ALPHA;
+        }
+        else if self.away_s.is_none() {
+            self.away_s = Some(self.now_s);
+        }
+
+        // The spring: aim at the new point. An invisible dot is put straight there, so
+        // it appears where the eyes are rather than sweeping in from where it was.
+        match &mut self.spring {
+            Some(spring) if self.dot.alpha > 0.0 => spring.goal = p.gaze,
+            _ => self.spring = Some(Spring { pos: p.gaze, vel: (0.0, 0.0), goal: p.gaze }),
+        }
 
         // The highlight: the current target heads for full, everything else for zero.
         // A target already on the list (fading out after a brief switch away, say) is
@@ -156,7 +219,16 @@ impl Presenter {
         let dt = (now_s - self.now_s).max(0.0);
 
         self.now_s = now_s;
+
+        if self.away_s.is_some_and(|t| now_s - t >= self.style.linger_s) {
+            self.dot.goal = 0.0;
+        }
+
         self.dot.step(dt);
+
+        if let Some(spring) = &mut self.spring {
+            spring.step(dt, self.style.settle_s);
+        }
 
         for h in &mut self.boxes {
             h.fade.step(dt);
@@ -167,9 +239,13 @@ impl Presenter {
         self.active()
     }
 
-    /// True while a fade is in progress.
+    /// True while a fade is in progress, the dot is still moving on its spring, or a
+    /// linger is running out.
     pub fn active(&self) -> bool {
-        !self.dot.settled() || self.boxes.iter().any(|h| !h.fade.settled())
+        !self.dot.settled()
+            || self.boxes.iter().any(|h| !h.fade.settled())
+            || (self.dot.alpha > 0.0 && self.spring.is_some_and(|s| !s.at_rest()))
+            || (self.away_s.is_some() && self.dot.goal > 0.0)
     }
 
     /// True when nothing is drawn and nothing is about to be.
@@ -213,8 +289,8 @@ impl Presenter {
             return items;
         }
 
-        if let Some(p) = self.intent {
-            let (cx, cy) = map.buffer(p.gaze);
+        if let (Some(_), Some(spring)) = (self.intent, self.spring) {
+            let (cx, cy) = map.buffer(spring.pos);
 
             items.push(Item::Marker {
                 cx         : cx,
@@ -250,6 +326,11 @@ impl Presenter {
         self.dot.alpha
     }
 
+    /// Where the dot is drawn right now, on its spring. `None` before the first intent.
+    pub fn dot_at(&self) -> Option<GlobalPx> {
+        self.spring.map(|s| s.pos)
+    }
+
     /// The highlights currently visible with their alphas, oldest first.
     pub fn highlights(&self) -> impl Iterator<Item = (Target, f32)> + '_ {
         self.boxes.iter().map(|h| (h.target, h.fade.alpha))
@@ -278,6 +359,51 @@ impl Fade {
     }
 }
 
+// --- Spring ---
+
+impl Spring {
+    /// Advances the spring by `dt` seconds towards its goal, critically damped, settling
+    /// 95% of a step in `settle_s`.
+    ///
+    /// The closed form (position and velocity both scaled by `exp(-w dt)`) is exact for
+    /// a constant goal over the step, so it is stable at any frame interval, including
+    /// the 200 ms the overlay allows itself when a frame callback never comes.
+    fn step(&mut self, dt: f64, settle_s: f64) {
+        if dt <= 0.0 {
+            return;
+        }
+
+        // A critically damped step response reaches 95% at about 4.75 / w.
+        let w = 4.75 / settle_s.max(1e-3);
+        let e = (-w * dt).exp();
+
+        let axis = |x: f64, v: f64, goal: f64| {
+            let dx   = x - goal;
+            let temp = (v + w * dx) * dt;
+
+            (goal + (dx + temp) * e, (v - w * temp) * e)
+        };
+
+        let (x, vx) = axis(self.pos.x, self.vel.0, self.goal.x);
+        let (y, vy) = axis(self.pos.y, self.vel.1, self.goal.y);
+
+        self.pos = GlobalPx { x: x, y: y };
+        self.vel = (vx, vy);
+
+        if self.at_rest() {
+            self.pos = self.goal;
+            self.vel = (0.0, 0.0);
+        }
+    }
+
+    /// True when the spring is close enough to its goal, and slow enough, that nothing
+    /// visible would change by stepping it.
+    fn at_rest(&self) -> bool {
+        (self.pos.x - self.goal.x).hypot(self.pos.y - self.goal.y) < REST_PX
+            && self.vel.0.hypot(self.vel.1) < REST_PX_S
+    }
+}
+
 // --- Internals ---
 
 /// Grows a rectangle by `by` on every side.
@@ -289,12 +415,14 @@ fn inflate(r: Rect, by: f64) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use gaze_core::GlobalPx;
-
     use super::*;
 
     fn map() -> OutputMapping {
         OutputMapping::new("DP-1", Rect { x: 0.0, y: 0.0, w: 1000.0, h: 600.0 }, 1)
+    }
+
+    fn presenter() -> Presenter {
+        Presenter::new(Theme::fallback(), PointerStyle::default())
     }
 
     fn pointer(x: f64, near: bool, target: Option<u64>) -> Pointer {
@@ -325,7 +453,7 @@ mod tests {
     /// Nothing near, nothing drawn: a gaze wandering over prose leaves the screen alone.
     #[test]
     fn the_dot_is_hidden_away_from_interactive_elements() {
-        let mut p = Presenter::new(Theme::fallback());
+        let mut p = presenter();
 
         p.observe(Some(&pointer(100.0, false, None)));
         run(&mut p, 0.5);
@@ -335,10 +463,10 @@ mod tests {
     }
 
     /// The dot fades in near a target and the highlight comes up with it; the dot's
-    /// weight does not change afterwards.
+    /// weight does not change afterwards, and a settled look asks for no frames.
     #[test]
     fn the_dot_appears_near_a_target_at_one_weight() {
-        let mut p = Presenter::new(Theme::fallback());
+        let mut p = presenter();
 
         p.observe(Some(&pointer(100.0, true, Some(1))));
 
@@ -352,11 +480,89 @@ mod tests {
         assert!(!p.active(), "a settled look asks for no frames");
     }
 
+    /// A blink of the near gate does not blink the dot: it stays up through the linger
+    /// and only fades once nothing has been near for that long.
+    #[test]
+    fn the_dot_lingers_through_a_gap_in_near() {
+        let mut p = presenter();
+
+        p.observe(Some(&pointer(100.0, true, None)));
+        run(&mut p, 0.5);
+
+        p.observe(Some(&pointer(100.0, false, None)));
+        run(&mut p, 0.1);
+
+        assert_eq!(p.dot_alpha(), DOT_ALPHA, "still up inside the linger");
+
+        p.observe(Some(&pointer(100.0, true, None)));
+        run(&mut p, 0.5);
+
+        assert_eq!(p.dot_alpha(), DOT_ALPHA, "near again, never faded");
+
+        p.observe(Some(&pointer(100.0, false, None)));
+        run(&mut p, p.style.linger_s + 1.0);
+
+        assert!(p.is_idle(), "gone once nothing was near for the linger");
+    }
+
+    /// The dot follows a moved gaze without overshoot and comes to rest on it, and an
+    /// invisible dot appears on the new point rather than sweeping in.
+    #[test]
+    fn the_dot_springs_to_the_gaze_without_overshoot() {
+        let mut p = presenter();
+
+        p.observe(Some(&pointer(100.0, true, None)));
+        run(&mut p, 0.5);
+        p.observe(Some(&pointer(400.0, true, None)));
+
+        let mut last_x = 100.0;
+        let mut t      = p.now_s;
+
+        for _ in 0..60 {
+            t += 1.0 / 60.0;
+            p.step(t);
+
+            let x = p.dot_at().unwrap().x;
+
+            assert!(x >= last_x - 1e-6 && x <= 400.0 + 1e-6, "monotone, no overshoot: {x}");
+            last_x = x;
+        }
+
+        assert!((last_x - 400.0).abs() < 1.0, "settled within a second: {last_x}");
+        assert!(!p.active());
+
+        // Hidden, then shown somewhere else: no sweep.
+        p.observe(Some(&pointer(400.0, false, None)));
+        run(&mut p, 2.0);
+        p.observe(Some(&pointer(50.0, true, None)));
+
+        assert_eq!(p.dot_at().unwrap().x, 50.0);
+    }
+
+    /// The spring closes 95% of a step in its settle time.
+    #[test]
+    fn the_spring_settles_in_its_settle_time() {
+        let mut s = Spring {
+            pos  : GlobalPx { x: 0.0, y: 0.0 },
+            vel  : (0.0, 0.0),
+            goal : GlobalPx { x: 100.0, y: 0.0 },
+        };
+
+        let mut t = 0.0;
+
+        while t < 0.2 {
+            s.step(1.0 / 144.0, 0.2);
+            t += 1.0 / 144.0;
+        }
+
+        assert!((s.pos.x - 95.0).abs() < 2.0, "{}", s.pos.x);
+    }
+
     /// Moving from one element to the next crossfades: for a while both are drawn, the
     /// old one fading out behind the new one, and then only the new one is left.
     #[test]
     fn a_new_target_crossfades_from_the_old_one() {
-        let mut p = Presenter::new(Theme::fallback());
+        let mut p = presenter();
 
         p.observe(Some(&pointer(100.0, true, Some(1))));
         run(&mut p, 0.5);
@@ -375,7 +581,7 @@ mod tests {
 
         assert_eq!(items.iter().filter(|i| matches!(i, Item::RoundBox { .. })).count(), 2);
 
-        run(&mut p, 1.0);
+        run(&mut p, 1.5);
 
         assert_eq!(p.highlights().map(|(t, _)| t.id).collect::<Vec<_>>(), vec![2]);
     }
@@ -384,7 +590,7 @@ mod tests {
     /// idle means it stops asking for frames.
     #[test]
     fn taking_the_pointer_down_fades_out_and_goes_idle() {
-        let mut p = Presenter::new(Theme::fallback());
+        let mut p = presenter();
 
         p.observe(Some(&pointer(100.0, true, Some(1))));
         run(&mut p, 0.5);
@@ -393,7 +599,7 @@ mod tests {
         assert!(p.step(p.now_s + 0.01), "fading out");
         assert!(!p.scene(&map()).is_empty());
 
-        run(&mut p, 1.0);
+        run(&mut p, 1.5);
 
         assert!(p.is_idle());
         assert!(!p.active());
@@ -404,7 +610,7 @@ mod tests {
     /// id without restarting its fade.
     #[test]
     fn a_target_that_moves_keeps_its_fade() {
-        let mut p = Presenter::new(Theme::fallback());
+        let mut p = presenter();
 
         p.observe(Some(&pointer(100.0, true, Some(1))));
         run(&mut p, 0.5);

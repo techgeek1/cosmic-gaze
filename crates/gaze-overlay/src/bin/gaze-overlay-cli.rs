@@ -21,7 +21,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use gaze_core::{GlobalPx, Rect};
-use gaze_overlay::{Overlay, OverlayState, Pointer, Presenter, Target, Theme, render};
+use gaze_overlay::{Overlay, OverlayState, Pointer, PointerStyle, Presenter, Target, Theme, render};
 
 /// How often the animation pushes a new state. The overlay paces its own drawing off
 /// frame callbacks, so pushing faster than the display refreshes only coalesces.
@@ -155,7 +155,7 @@ fn render_frames(dir: &Path, at: f64, look: Look) -> anyhow::Result<()> {
     let (state, presenter) = match look {
         Look::Debug   => (frame_at(&desk, at), None),
         Look::Pointer => {
-            let mut presenter = Presenter::new(Theme::cosmic());
+            let mut presenter = Presenter::new(Theme::cosmic(), PointerStyle::default());
             let mut t         = 0.0;
 
             while t <= at {
