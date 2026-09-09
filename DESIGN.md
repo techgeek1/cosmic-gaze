@@ -1244,7 +1244,15 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   the ancestor chain fits it and there is no single overflowing child to find. Each
   ancestor now carries a sampled span of its first and last two placed children, and
   the overflow test reads the union of the chain child and that span (740 to 3024 for
-  the list); the probe went from 8 to 10 ms.
+  the list); the probe went from 8 to 10 ms. The span then invented one: the 4770 px
+  page section has its masthead 56 px above it, and as a "clip" its top band covered
+  the video and it had nothing below to scroll. A parent taller than the window is
+  content, not a viewport, and a total overflow under 48 px is overlap; both are
+  skipped. Two pointer rules from the same session: an edge scroll now warps the
+  pointer to the gaze point every time, since a pointer merely inside the page may be
+  over the mix list and the wheel goes to the innermost scroller under it; and a refine
+  anchors on the marked element when there is one, because a pad press moves the thumb
+  enough to begin a refine, and the click it ends in must start from what is marked.
 
 ## 11. Open questions
 

@@ -502,9 +502,12 @@ pub fn run(args: &Args) -> Result<()> {
                         refined = None;
                     }
 
-                    // The snap point if there is one, else the gaze itself: the fine
-                    // channel is also how an unlabelled target gets clicked.
-                    let anchor = engine.current().map(|t| t.point).or(last_gaze);
+                    // The marked element if there is one (the highlight is the promise,
+                    // and a pad press moves the thumb enough to begin a refine, so the
+                    // press must start from what is marked), else the snap point, else
+                    // the gaze itself: the fine channel is also how an unlabelled
+                    // target gets clicked.
+                    let anchor = marked.or(engine.current().map(|t| t.point)).or(last_gaze);
 
                     match anchor {
                         Some(anchor) => {
@@ -1282,10 +1285,11 @@ fn scroll_under_gaze(
 /// this sample, which the caller turns into a re-detection, and the surface the scroller
 /// was shown, which the caller draws the zone on.
 ///
-/// A start puts the pointer inside the surface first, at the gaze point, unless it is
-/// already there: the wheel goes to the surface under the pointer, and the user's pointer
-/// is wherever they left it. Units then go out as high-resolution wheel motion without
-/// moving the pointer again, so gaze jitter during the scroll does not drag it about.
+/// A start puts the pointer at the gaze point first, every time: the wheel goes to the
+/// innermost scroller under the pointer, and a pointer merely inside the surface may be
+/// over a nested one (YouTube's mix list inside its page, which then ate the page's
+/// scroll). Units then go out as high-resolution wheel motion without moving the pointer
+/// again, so gaze jitter during the scroll does not drag it about.
 /// Where it was is kept in `parked`, and the stop puts it back there if nothing else has
 /// moved it since, so a scroll by eye borrows the pointer rather than taking it. (Wayland
 /// delivers wheel motion to the surface under the pointer and nowhere else, so borrowing
@@ -1336,7 +1340,6 @@ fn edge_scroll(
             let surface  = surface.expect("a start comes from a surface");
             let viewport = surface.viewport;
             let pointer  = pointer_position(injector.as_deref_mut(), warper);
-            let inside   = pointer.is_some_and(|p| viewport.contains(p));
 
             info!(
                 dir   = ?dir,
@@ -1347,24 +1350,21 @@ fn edge_scroll(
                 h     = %format_args!("{:.0}", viewport.h),
                 above = %format_args!("{:.0}", surface.above_px),
                 below = %format_args!("{:.0}", surface.below_px),
-                warp  = !inside,
                 live  = injector.is_some(),
                 "edge scroll start",
             );
 
-            if !inside {
-                *parked = pointer;
+            *parked = pointer;
 
-                do_warp(
-                    injector.as_deref_mut(),
-                    warper,
-                    point,
-                    filtered.sample.sigma_deg,
-                    None,
-                    WarpReason::EdgeScroll,
-                    Instant::now(),
-                );
-            }
+            do_warp(
+                injector.as_deref_mut(),
+                warper,
+                point,
+                filtered.sample.sigma_deg,
+                None,
+                WarpReason::EdgeScroll,
+                Instant::now(),
+            );
 
             false
         }

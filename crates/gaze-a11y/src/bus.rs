@@ -351,7 +351,7 @@ impl A11y {
     {
         let started = Instant::now();
         let chain   = self.ancestors(p, window)?;
-        let surface = clip_surface(&chain);
+        let surface = clip_surface(&chain, window.rect.h);
 
         debug!(depth = chain.len(), found = surface.is_some(),
                ms = started.elapsed().as_secs_f64() * 1000.0, "scroll surface");
@@ -670,6 +670,11 @@ const OVERFLOW_SLACK_PX: f64 = 1.0;
 /// How many children from each end of a node are measured for its span.
 const SPAN_SAMPLE: usize = 2;
 
+/// Total overflow, above plus below, under which a parent is not a scroll surface: a
+/// sticky masthead laid out 56 px above the section that contains it is overlap, not
+/// something to scroll, and a page with this little to scroll is not worth the pointer.
+const MIN_OVERFLOW_PX: f64 = 48.0;
+
 /// A clipping node shorter than this is not a scroll viewport, and the walk continues
 /// past it. A table cell whose glyphs overhang it, a one-line label taller than its row:
 /// these overflow their parent by the geometric test too, and taking the first of them
@@ -697,14 +702,18 @@ pub const MIN_CLIP_PX: f64 = 120.0;
 /// A parent whose child on the chain fits is also tested against its sampled children
 /// span ([`Node::span`]): a list whose rows are its direct children overflows by its
 /// first and last rows, never by the row under the point. The content reported is then
-/// the union of the chain child and the span.
+/// the union of the chain child and the span. Two things keep the span from inventing
+/// surfaces: a parent taller than the window (`window_h`) is content, not a viewport,
+/// however its children sit in it (YouTube's 4770 px page section had a masthead 56 px
+/// above it and was taken for a clip whose top band covered the video), and an overflow
+/// under [`MIN_OVERFLOW_PX`] in total is overlap, not scrolling.
 ///
 /// Nodes without real extents are left out of the chain before pairing: Firefox reports
 /// some structural nodes at `-1x-1` (a `section` between YouTube's page and its
 /// document, 2026-09-09), and one of those taken as a child put "content" 106 px above
 /// a document that was at the top of its page, so the upper band offered a scroll up
 /// that did not exist and the real overflow below was never reached.
-pub fn clip_surface(chain: &[Node]) -> Option<Surface> {
+pub fn clip_surface(chain: &[Node], window_h: f64) -> Option<Surface> {
     let placed : Vec<&Node> = chain
         .iter()
         .filter(|n| n.rect.is_some_and(|r| r.w > 0.0 && r.h > 0.0))
@@ -715,15 +724,17 @@ pub fn clip_surface(chain: &[Node]) -> Option<Surface> {
             continue;
         };
 
-        if parent.h < MIN_CLIP_PX {
+        if parent.h < MIN_CLIP_PX || parent.h > window_h + OVERFLOW_SLACK_PX {
             continue;
         }
 
-        let content = pair[1].span.map_or(child, |span| union(child, span));
-        let above   = content.y < parent.y - OVERFLOW_SLACK_PX;
-        let below   = content.y + content.h > parent.y + parent.h + OVERFLOW_SLACK_PX;
+        let content  = pair[1].span.map_or(child, |span| union(child, span));
+        let above_px = (parent.y - content.y).max(0.0);
+        let below_px = ((content.y + content.h) - (parent.y + parent.h)).max(0.0);
+        let above    = above_px > OVERFLOW_SLACK_PX;
+        let below    = below_px > OVERFLOW_SLACK_PX;
 
-        if above || below {
+        if (above || below) && above_px + below_px >= MIN_OVERFLOW_PX {
             return Some(Surface {
                 clip     : pair[1].clone(),
                 viewport : parent,
@@ -848,7 +859,7 @@ mod tests {
             boxed("landmark" , 381.0,   248.0, 898.0, 1346.0),
         ];
 
-        let surface = clip_surface(&chain).expect("the list overflows the panel");
+        let surface = clip_surface(&chain, 1440.0).expect("the list overflows the panel");
 
         assert_eq!(surface.clip.role, "panel");
         assert_eq!(surface.viewport, Rect { x: 381.0, y: 248.0, w: 898.0, h: 1296.0 });
@@ -876,11 +887,37 @@ mod tests {
             spanned("section", 2188.0, 1046.0, 350.0, 4031.0, 1522.0, 5077.0),
         ];
 
-        let surface = clip_surface(&chain).expect("the rows overflow the list");
+        let surface = clip_surface(&chain, 1428.0).expect("the rows overflow the list");
 
         assert_eq!(surface.viewport, Rect { x: 2189.0, y: 1149.0, w: 348.0, h: 356.0 });
         assert_eq!(surface.content.y, 740.0);
         assert_eq!(surface.content.y + surface.content.h, 3024.0);
+    }
+
+    /// The video on the same page, with spans: the 4770 px page section has a masthead
+    /// 56 px above it in its span, and is neither a viewport (taller than the window)
+    /// nor overflowed enough; the document below it is the surface.
+    #[test]
+    fn a_section_taller_than_the_window_is_not_a_viewport() {
+        // `gaze-a11y-cli chain 1500,900 --window YouTube`, 2026-09-09, leaf first.
+        let spanned = |role: &str, x: f64, y: f64, w: f64, h: f64, top: f64, bottom: f64| Node {
+            span : Some(Rect { x: x, y: top, w: w, h: bottom - top }),
+            ..boxed(role, x, y, w, h)
+        };
+        let chain = vec![
+            boxed  ("panel"       , 1283.0, 307.0, 1271.0,  715.0),
+            spanned("section"     , 1283.0, 307.0, 1271.0,  715.0, 307.0, 1022.0),
+            spanned("landmark"    , 1283.0, 307.0, 1271.0, 4770.0, 307.0, 5077.0),
+            spanned("section"     , 1283.0, 307.0, 1271.0, 4770.0, 251.0, 5077.0),
+            spanned("section"     , 1283.0, 251.0, 1271.0, 4826.0, 307.0, 5077.0),
+            spanned("section"     , 1262.0, 145.0,   -1.0,   -1.0, 251.0, 5077.0),
+            boxed  ("document web", 1283.0, 251.0, 1271.0, 1343.0),
+        ];
+
+        let surface = clip_surface(&chain, 1428.0).expect("the page overflows the document");
+
+        assert_eq!(surface.clip.role, "document web");
+        assert_eq!(surface.viewport.h, 1343.0);
     }
 
     /// YouTube in Firefox at the top of the page: a `-1x-1` section between the page and
@@ -899,7 +936,7 @@ mod tests {
             boxed("document web", 1283.0, 251.0, 1271.0, 1343.0),
         ];
 
-        let surface = clip_surface(&chain).expect("the page overflows the document");
+        let surface = clip_surface(&chain, 1428.0).expect("the page overflows the document");
 
         assert_eq!(surface.clip.role, "document web");
         assert_eq!(surface.content, Rect { x: 1283.0, y: 251.0, w: 1271.0, h: 4836.0 });
@@ -921,7 +958,7 @@ mod tests {
             boxed("frame"       , 1285.0,   166.0, 1269.0,  1428.0),
         ];
 
-        let surface = clip_surface(&chain).expect("the landmark overflows the document");
+        let surface = clip_surface(&chain, 1428.0).expect("the landmark overflows the document");
 
         assert_eq!(surface.clip.role, "document web");
         assert_eq!(surface.viewport.h, 1343.0);
@@ -935,7 +972,7 @@ mod tests {
             boxed("frame"  ,   0.0,   0.0, 800.0, 600.0),
         ];
 
-        assert_eq!(clip_surface(&fits), None);
+        assert_eq!(clip_surface(&fits, 600.0), None);
 
         // A row of cards wider than its strip: horizontal overflow only.
         let carousel = vec![
@@ -945,7 +982,7 @@ mod tests {
             boxed("frame"  ,   0.0,   0.0,  800.0, 600.0),
         ];
 
-        assert_eq!(clip_surface(&carousel), None);
+        assert_eq!(clip_surface(&carousel, 600.0), None);
     }
 
     #[test]
@@ -961,7 +998,7 @@ mod tests {
             boxed("frame"       , 1285.0,   166.0, 1269.0,  1428.0),
         ];
 
-        let surface = clip_surface(&chain).expect("the table overflows the document");
+        let surface = clip_surface(&chain, 1428.0).expect("the table overflows the document");
 
         assert_eq!(surface.clip.role, "document web");
         assert_eq!(surface.content.h, 9000.0);
