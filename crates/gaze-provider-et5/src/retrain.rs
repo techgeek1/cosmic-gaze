@@ -125,7 +125,7 @@ use gaze_overlay::{OverlayHandle, OverlayState};
 use crate::blob::{CalibrationResult, body, body_sha256_hex, decode_trailer};
 use crate::calibration::HealthStop;
 use crate::device::{Device, DeviceError};
-use crate::gaze::Et5Frame;
+use crate::gaze::{Et5Frame, GAZE_HZ};
 use crate::record::{BLACK, WHITE};
 use crate::sweep::{
     FALLBACK_PX_PER_DEG, SweepError, SweepKey, desk_to_sensor, median, plane_corners,
@@ -145,16 +145,21 @@ pub const AREA_H_MM: f64 = 340.0;
 /// still lands on the panel.
 const POINT_FRACTIONS: [f64; 3] = [0.05, 0.5, 0.95];
 
-/// Frames the acceptance gate looks back over. Talon's window; at 133 Hz it is about
-/// nine tenths of a second.
-pub const GATE_WINDOW: usize = 120;
+/// How far back the acceptance gate looks, seconds. Talon's 120 frames, which were
+/// 1.33 s on the 4C's 90 Hz stream; the ET5 streams gaze at [`GAZE_HZ`], so the
+/// count is derived from the time rather than copied.
+pub const GATE_WINDOW_S: f64 = 1.33;
 
-/// How many of [`GATE_WINDOW`] must name the target before it is accepted.
-pub const GATE_MIN_HITS: usize = 60;
+/// How long the target must have been the nearest one within the window, seconds.
+/// Talon's 60 of 120 frames: half the window.
+pub const GATE_HOLD_S: f64 = 0.67;
 
-/// Wall-clock cap on the gate's window, seconds. Frames older than this are dropped
-/// whatever the frame count says, so a dropout cannot leave stale samples voting.
-pub const GATE_WINDOW_S: f64 = 2.0;
+/// Frames the acceptance gate looks back over: [`GATE_WINDOW_S`] at [`GAZE_HZ`].
+pub const GATE_WINDOW: usize = (GATE_WINDOW_S * GAZE_HZ) as usize;
+
+/// How many of [`GATE_WINDOW`] must name the target before it is accepted:
+/// [`GATE_HOLD_S`] at [`GAZE_HZ`].
+pub const GATE_MIN_HITS: usize = (GATE_HOLD_S * GAZE_HZ) as usize;
 
 /// Default nag interval, seconds. A point that has not tripped the gate by then says
 /// so and keeps waiting; nothing is ever skipped without the operator asking.

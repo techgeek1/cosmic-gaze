@@ -95,10 +95,19 @@ nottobii keeps one session across its whole init; nothing observed here needs th
 `gaze-et5-cli` (see `--help`):
 
 - `info [--seconds S] [--no-blob]` — upload the saved eye model (a replugged tracker is
-  back on its factory default and streams nothing), print the declared display area, then
-  one line a second: rate, tracked share per eye, eye origin, and its azimuth/elevation off
-  the sensor axis with gauges, plus distance. The mount-aiming loop; `--seconds 0` runs
-  until Ctrl-C.
+  back on its factory default and streams nothing), print the declared display area and
+  the device's stream rates, then one line a second: rate, tracked share per eye, eye
+  origin, and its azimuth/elevation off the sensor axis with gauges, plus distance. The
+  mount-aiming loop; `--seconds 0` runs until Ctrl-C. The rate is always 33 Hz: the
+  ET5's camera runs at 132 Hz and the firmware publishes every fourth frame (the device
+  reports `(132, 33)` for op 0x672, and `frame_counter` advances four per notification).
+  That is Tobii's specification for this unit, not a mode; the tracked share is the
+  health signal.
+- `op <opcode> [--u32 N | --hex "..."] [--seconds S]` — send one raw opcode and print
+  the response as hex and a best-effort TLV walk, optionally watching the stream rate
+  afterwards. The probe for opcodes the typed API does not cover; nottobii's and Talon's
+  maps name many more than this crate sends. Read-only queries are safe to run
+  unattended; anything else is an experiment.
 - `dump --seconds 10 --jsonl out.jsonl` — decoded frames plus desk intersection.
 - `set-display-area` — declare the display plane (defaults: the 237x148 mm small
   panel with the tracker centred on its top edge).
@@ -151,7 +160,7 @@ nottobii keeps one session across its whole init; nothing observed here needs th
   logged by the real run.
 
   **The gate is Talon's.** A point is fed to the device once the firmware's own gaze
-  has named it as the nearest of the round's targets for 60 of the last 120 frames
+  has named it as the nearest of the round's targets for 22 of the last 43 frames (Talon's 60 of 120 were at the 4C's 90 Hz; the same 0.67 s of 1.33 s at the ET5's 33 Hz)
   (capped at 2 s) — no accuracy test, because during a retrain the model reporting the
   gaze is the one being replaced. A round with one target therefore accepts on any 60
   frames that carry a gaze point at all. `--accept-deg` adds the old ellipse back on

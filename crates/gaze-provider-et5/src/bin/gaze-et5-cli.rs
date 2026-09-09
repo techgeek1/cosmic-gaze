@@ -96,8 +96,9 @@ enum Command {
     /// sensor frame, and where that origin sits in the sensor's field as azimuth
     /// (positive right) and elevation (positive up) off its axis plus distance, with
     /// a gauge for each angle. Aim the mount so both angles sit near zero and the
-    /// distance lands in the tracker's 450 to 950 mm range; the frame rate rises and
-    /// the tracked share goes to 100% as it does.
+    /// distance lands in the tracker's 450 to 950 mm range; the tracked share goes
+    /// to 100% as it does. The rate stays at 33 Hz whatever the aim: that is the
+    /// ET5's gaze rate (its camera runs at 132 Hz and publishes every fourth frame).
     ///
     /// A replugged tracker is back on its factory-default eye model and streams
     /// nothing at any aim, so this uploads the saved blob the way the provider does
@@ -115,6 +116,28 @@ enum Command {
         /// Do not upload anything; run on the model in the flash.
         #[arg(long)]
         no_blob : bool,
+    },
+
+    /// Send one raw opcode and print the response bytes with a best-effort TLV walk.
+    /// The probe for opcodes the typed API does not cover (Talon and nottobii name
+    /// far more than this crate sends). Payload shortcuts: `--u32 N` sends one bare
+    /// u32 field, `--hex ..` sends exact bytes, neither sends an empty payload.
+    Op {
+        /// Opcode, hex (`0x672`) or decimal.
+        #[arg(value_parser = parse_u32_auto)]
+        op      : u32,
+
+        /// Send one bare u32 field `[2][4][N]` as the payload.
+        #[arg(long, value_parser = parse_u32_auto, conflicts_with = "hex")]
+        u32     : Option<u32>,
+
+        /// Send exactly these bytes (hex, spaces allowed) as the payload.
+        #[arg(long)]
+        hex     : Option<String>,
+
+        /// Watch the gaze stream for this long afterwards and report its rate.
+        #[arg(long, default_value_t = 0.0)]
+        seconds : f64,
     },
 
     /// Stream decoded frames: JSONL to a file, one summary line per second to stderr.
@@ -548,6 +571,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Info { seconds, blob, no_blob } => info(seconds, &blob, no_blob),
+        Command::Op { op, u32, hex, seconds } => raw_op(op, u32, hex.as_deref(), seconds),
         Command::Dump { seconds, jsonl }    => dump(&cli.config, seconds, jsonl.as_deref()),
         Command::SetDisplayArea { w, h, ox, oy, z } => {
             set_display_area(DisplayRect { w_mm: w, h_mm: h, ox_mm: ox, oy_mm: oy, z_mm: z })
@@ -673,6 +697,137 @@ fn load_tracker_pitch(path: &std::path::Path) -> f64 {
 
 // --- Commands ---
 
+/// Parses `0x..` hex or decimal.
+fn parse_u32_auto(s: &str) -> std::result::Result<u32, String> {
+    let parsed = {
+        match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            Some(h) => u32::from_str_radix(h, 16),
+            None    => s.parse::<u32>(),
+        }
+    };
+
+    parsed.map_err(|e| format!("{s:?}: {e}"))
+}
+
+/// Parses a hex byte string, ignoring whitespace.
+fn parse_hex_bytes(s: &str) -> Result<Vec<u8>> {
+    let clean: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    if !clean.len().is_multiple_of(2) {
+        bail!("odd number of hex digits");
+    }
+
+    (0..clean.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&clean[i..i + 2], 16).map_err(Into::into))
+        .collect()
+}
+
+/// Prints one TLV field per line as far as the payload parses, then the tail as hex.
+fn walk_tlv(payload: &[u8]) {
+    let mut pos = 0usize;
+
+    while payload.len() - pos >= 5 {
+        let t    = payload[pos];
+        let size = u32::from_be_bytes([payload[pos + 1], payload[pos + 2], payload[pos + 3], payload[pos + 4]]) as usize;
+
+        if payload.len() - pos - 5 < size {
+            break;
+        }
+
+        let v = &payload[pos + 5..pos + 5 + size];
+
+        let shown = {
+            match (t, size) {
+                (2, 4)    => format!("u32 {}", u32::from_be_bytes([v[0], v[1], v[2], v[3]])),
+                (3, 4)    => format!("q16 {}", i32::from_be_bytes([v[0], v[1], v[2], v[3]]) as f64 / 65536.0),
+                (4, 8)    => format!("q42 {}", gaze_provider_et5::ttp::q42_decode(i64::from_be_bytes(v.try_into().unwrap()))),
+                (5, 4)    => format!("tag {:#x}", u32::from_be_bytes([v[0], v[1], v[2], v[3]])),
+                (6, 8)    => format!("s64 {}", i64::from_be_bytes(v.try_into().unwrap())),
+                (0x17, _) => format!("array {}", hex_string(v)),
+                _         => hex_string(v),
+            }
+        };
+
+        println!("  +{pos:3} type {t:#04x} size {size:3}: {shown}");
+        pos += 5 + size;
+    }
+
+    if pos < payload.len() {
+        println!("  +{pos:3} tail: {}", hex_string(&payload[pos..]));
+    }
+}
+
+/// Space-separated lowercase hex.
+fn hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+fn raw_op(op: u32, bare_u32: Option<u32>, hex: Option<&str>, seconds: f64) -> Result<()> {
+    let payload = {
+        match (bare_u32, hex) {
+            (Some(v), _)    => {
+                let mut p = vec![0x02];
+                p.extend_from_slice(&4u32.to_be_bytes());
+                p.extend_from_slice(&v.to_be_bytes());
+                p
+            }
+            (None, Some(h)) => parse_hex_bytes(h)?,
+            (None, None)    => Vec::new(),
+        }
+    };
+
+    let mut device = Device::connect().context("connecting to the ET5")?;
+
+    println!("op {op:#x} payload [{}]", hex_string(&payload));
+
+    match device.raw_request(op, &payload) {
+        Ok(resp) => {
+            println!("response {} bytes: {}", resp.len(), hex_string(&resp));
+            if resp.len() >= 2 {
+                println!("  status {:#04x} {:#04x}", resp[0], resp[1]);
+                walk_tlv(&resp[2..]);
+            }
+        }
+        Err(e)   => println!("no response: {e}"),
+    }
+
+    if seconds > 0.0 {
+        let rx = device.gaze_stream();
+        let mut counters: Vec<(u32, i64)> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs_f64(seconds);
+        let mut n = 0u32;
+
+        while Instant::now() < deadline {
+            if let Ok(f) = rx.recv_timeout(Duration::from_millis(100)) {
+                n += 1;
+                if let (Some(c), Some(t)) = (f.frame_counter, f.timestamp_us) {
+                    counters.push((c, t));
+                }
+            }
+        }
+
+        println!("stream: {n} frames in {seconds:.1} s = {:.1} Hz", f64::from(n) / seconds);
+
+        if counters.len() >= 2 {
+            let (c0, t0) = counters[0];
+            let (c1, t1) = counters[counters.len() - 1];
+            let ticks    = i64::from(c1.wrapping_sub(c0));
+            if ticks > 0 {
+                println!(
+                    "device counter: {ticks} ticks over {} delivered frames \
+                     (every {:.2}th), {:.0} us per tick = {:.1} Hz internal",
+                    counters.len() - 1,
+                    ticks as f64 / (counters.len() - 1) as f64,
+                    (t1 - t0) as f64 / ticks as f64,
+                    1e6 * ticks as f64 / (t1 - t0) as f64,
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn info(seconds: f64, blob: &std::path::Path, no_blob: bool) -> Result<()> {
     let upload = {
         if no_blob {
@@ -719,7 +874,7 @@ fn info(seconds: f64, blob: &std::path::Path, no_blob: bool) -> Result<()> {
 
             // A freshly booted device carries a degenerate ~4 mm default area, and
             // the firmware reports validity=4 for everything under it (measured:
-            // 34 Hz search-mode stream, illuminators on, zero detection at any
+            // the usual 33 Hz stream, illuminators on, zero detection at any
             // orientation). The real sessions declare a plane at startup; this
             // diagnostic must too, or it lies about a healthy tracker.
             let w = (area.tr_mm[0] - area.tl_mm[0]).abs();
@@ -735,9 +890,15 @@ fn info(seconds: f64, blob: &std::path::Path, no_blob: bool) -> Result<()> {
         Err(e)   => println!("display area unavailable: {e}"),
     }
 
-    // Per-second stats: search mode shows ~30-40 Hz with 0% tracked; a locked face
-    // runs 90+ Hz with most frames valid. The origin line is what pins down the
-    // mount pitch (see desk.toml); the angles say where the eyes sit in the field.
+    match device.frequencies() {
+        Ok((camera, gaze)) => println!("device rates: camera {camera} Hz, gaze {gaze} Hz"),
+        Err(e)             => println!("device rates unavailable: {e}"),
+    }
+
+    // Per-second stats: the rate is the device's constant 33 Hz whether or not a
+    // face is locked; the tracked share is the health signal. The origin line is
+    // what pins down the mount pitch (see desk.toml); the angles say where the eyes
+    // sit in the field.
     let rx       = device.gaze_stream();
     let forever  = seconds <= 0.0;
     let deadline = Instant::now() + Duration::from_secs_f64(seconds.max(0.0));
@@ -1791,21 +1952,22 @@ fn print_plan(
     match plan.tol_uv {
         None if config.manual => {
             println!("acceptance: manual — a pad click or `c` takes the point when the \
-                      vote names it in at least half of the last {} frames, Enter \
-                      forces it; nothing is accepted on the vote alone",
-                     retrain::GATE_WINDOW);
+                      vote names it in at least half of the last {} frames ({:.2}s), \
+                      Enter forces it; nothing is accepted on the vote alone",
+                     retrain::GATE_WINDOW, retrain::GATE_WINDOW_S);
         }
         None               => {
-            println!("acceptance: nearest-target vote only ({} of the last {} frames \
-                      within {:.0}s), no accuracy radius",
+            println!("acceptance: nearest-target vote only ({} of the last {} frames, \
+                      {:.2}s of {:.2}s), no accuracy radius",
                      retrain::GATE_MIN_HITS, retrain::GATE_WINDOW,
-                     retrain::GATE_WINDOW_S);
+                     retrain::GATE_HOLD_S, retrain::GATE_WINDOW_S);
         }
         Some((tol_u, tol_v)) => {
-            println!("acceptance: {} of the last {} frames within {:.0}s, and the \
+            println!("acceptance: {} of the last {} frames ({:.2}s of {:.2}s), and the \
                       median within {:.1} deg (uv {tol_u:.4} x {tol_v:.4})",
                      retrain::GATE_MIN_HITS, retrain::GATE_WINDOW,
-                     retrain::GATE_WINDOW_S, config.accept_deg.unwrap_or_default());
+                     retrain::GATE_HOLD_S, retrain::GATE_WINDOW_S,
+                     config.accept_deg.unwrap_or_default());
         }
     }
 
@@ -2255,10 +2417,11 @@ fn view(config: &std::path::Path, calibration: Option<&std::path::Path>, direct:
         cal.apply_poses(&mut scale_geometry);
     }
 
-    // Raw per-frame noise (~0.3 deg at 90 Hz) reads as ~27 deg/s of velocity, right
-    // at the default 30 deg/s fixation gate, so the smoother would flap on and off.
-    // A higher gate, a wider velocity window, and a heavier one-euro keep the marker
-    // steady; the snapping pipeline tunes its own stack separately.
+    // Raw per-frame jitter (~0.3 deg between 33 Hz frames, ~10 deg/s) plus the odd
+    // recovery frame kept tripping the default 30 deg/s fixation gate, so the
+    // smoother would flap on and off. A higher gate, a wider velocity window, and a
+    // heavier one-euro keep the marker steady; the snapping pipeline tunes its own
+    // stack separately.
     let mut filters = FilterStack::create()
         .scale(Box::new(scale_geometry))
         .velocity_threshold_deg_s(60.0)

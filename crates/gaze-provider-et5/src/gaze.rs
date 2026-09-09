@@ -20,6 +20,15 @@ use crate::ttp::{DisplayRect, TlvReader};
 /// Validity value for a tracked eye.
 pub const VALIDITY_OK: u32 = 0;
 
+/// The ET5's gaze stream rate, Hz. The camera runs at 132 Hz (`frame_counter`
+/// advances four per notification, `timestamp_us` 7552 per tick) and the firmware
+/// publishes every fourth frame; the device's own frequency report (op 0x672) says
+/// `(132, 33)`. Tobii's specification lists the same split: 133 Hz image sampling,
+/// 33 Hz gaze. It is a hardware rate, not a mode: every session recorded here has
+/// streamed at exactly this, tracked or not. The 90 Hz that earlier comments assumed
+/// was the 4C's rate.
+pub const GAZE_HZ: f64 = 33.0;
+
 /// One decoded gaze notification.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Et5Frame {
@@ -166,8 +175,8 @@ pub fn filtered_ray(frame: &Et5Frame, area: &DisplayRect) -> Option<(DVec3, DVec
 /// weight and sets the scale on which jitter differences start to matter.
 const JITTER_FLOOR_DEG: f64 = 0.2;
 
-/// EMA rate for the per-eye jitter and offset estimates. Settles in well under a
-/// second at 90 Hz.
+/// EMA rate for the per-eye jitter and offset estimates. A twenty-sample time
+/// constant, six tenths of a second at [`GAZE_HZ`].
 const FUSION_ALPHA: f64 = 0.05;
 
 /// Inter-eye disagreement, degrees, past which one eye is lying (measured up to 10

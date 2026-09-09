@@ -88,7 +88,8 @@ fn a_written_click_session_loads_back_as_click_rows() {
 
     let t_press = 10.0;
 
-    // 90 Hz over the whole window, the way the device streams.
+    // A dense stream over the whole window (denser than the ET5's 33 Hz; the
+    // aggregation is count-gated, so more frames only makes the test stricter).
     let window: Vec<TimedFrame> = (0..144)
         .map(|i| frame(t_press - 1.2 + f64::from(i) / 90.0, 0.5, 0.5))
         .collect();
@@ -161,8 +162,8 @@ fn a_written_click_session_loads_back_as_click_rows() {
         assert_eq!(row.to_csv().split(',').count(), CSV_COLUMNS.len());
     }
 
-    // The window is 700 ms of a 90 Hz stream, so the stop is well past the minimum
-    // for an aggregated row.
+    // The window holds 700 ms of a 90 Hz stream, so the stop is well past the
+    // minimum for an aggregated row.
     assert_eq!(rows.iter().filter(|r| r.is_mean).count(), 1);
 
     // The target is on the panel that was clicked, not on the tracker's own display.

@@ -82,6 +82,11 @@ pub const OP_CAL_RETRIEVE: u32 = 0x44c;
 /// Upload a previously downloaded calibration blob.
 pub const OP_CAL_APPLY: u32 = 0x456;
 
+/// Read the stream rates: a pair of u32, camera frames per second and gaze frames per
+/// second (`(132, 33)` on the ET5). Read-only; nothing found sets it, and the ET5's
+/// 33 Hz gaze is its specification, not a mode.
+pub const OP_GET_FREQUENCIES: u32 = 0x672;
+
 /// Query which realm (privilege domain) guards the calibration ops.
 pub const OP_QUERY_REALM: u32 = 0x640;
 
@@ -185,6 +190,13 @@ pub fn envelope_out(ttp: &[u8]) -> Vec<u8> {
     out.extend_from_slice(ttp);
 
     out
+}
+
+/// Builds an enveloped request frame for an arbitrary opcode and payload. The probe
+/// path for opcodes nothing here understands yet; production callers use the typed
+/// builders below.
+pub fn raw_command(seq: u32, op: u32, payload: &[u8]) -> Vec<u8> {
+    command(seq, op, payload)
 }
 
 /// Builds an enveloped request frame in one step.
@@ -299,6 +311,28 @@ pub fn decode_display_area(payload: &[u8]) -> Option<DisplayArea> {
     let bl = r.read_point3().ok()?;
 
     Some(DisplayArea { tl_mm: tl, tr_mm: tr, bl_mm: bl })
+}
+
+/// Builds get_frequencies.
+pub fn get_frequencies(seq: u32) -> Vec<u8> {
+    command(seq, OP_GET_FREQUENCIES, &[])
+}
+
+/// Decodes a get_frequencies response: prolog tag, then camera and gaze rates.
+pub fn decode_frequencies(payload: &[u8]) -> Option<(u32, u32)> {
+    if payload.len() < 2 {
+        return None;
+    }
+
+    let mut r = TlvReader::new(payload);
+    r.pos = 2;
+
+    r.read_prolog_tag().ok()?;
+
+    let camera = r.read_u32().ok()?;
+    let gaze   = r.read_u32().ok()?;
+
+    Some((camera, gaze))
 }
 
 /// Builds query_realm.

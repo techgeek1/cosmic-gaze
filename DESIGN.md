@@ -1149,6 +1149,24 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   for the direct display disabled it, so single-eye frames (the common case at an edge)
   had no surface to land on. The mount itself reads 8° low in elevation and 33 Hz even
   when fully tracked; both to be revisited after the tilt is set.
+- 2026-09-09, **The 33 Hz was never a mount problem: it is the ET5's gaze rate.** Every
+  session on disk, old mount and new, streams at exactly 33.1 Hz (median 30.2 ms), and
+  `frame_counter` advances by four per notification with `timestamp_us` at 7552 µs per
+  tick, so the camera runs at 132.4 Hz and the firmware publishes one frame in four.
+  The device says so itself: op 0x672 (nottobii's `FREQUENCIES_GET`) answers `(132, 33)`
+  and 0x686 lists that as the only pair; the guessed set opcodes (0x668, 0x67c) change
+  nothing. Tobii's specification for this unit reads the same way, 133 Hz image sampling
+  and 33 Hz gaze (search-engine summary of the Help Center specifications page, which
+  blocks fetching; treat as probable, not quoted). The 90 Hz that the code assumed was
+  the 4C's rate. Consequences fixed: the retrain gate was "60 of the last 120 frames"
+  capped at 2 s, which at 33 Hz meant naming the target for 1.8 s of the last 2 s, three
+  times Talon's hold; it is now 0.67 s of 1.33 s (22 of 43 frames) derived from
+  `GAZE_HZ`. The other rate-cited constants (fusion EMA, click-window minimum, lag gap,
+  channel depth) were harmless at the true rate and only their comments changed. `info`
+  now prints the device's rates and no longer promises that the rate rises with aim.
+  Stream 0x500 is "gaze"; the device also lists 0x501 image, 0x504 presence, 0x508
+  image_collection, 0x50e primary_camera_image, and 6000-6004 algodbg / is5_sync_stream
+  / log / custom (op 0x4b0). Nothing here subscribes to any of them.
 
 ## 11. Open questions
 

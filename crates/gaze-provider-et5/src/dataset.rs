@@ -44,9 +44,10 @@ use crate::ttp::DisplayArea;
 /// How far back the lagged head features look, seconds.
 pub const HEAD_LAG_S: f64 = 0.300;
 
-/// Largest gap between the wanted lag time and the frame actually found, seconds. One
-/// dropped frame at 90 Hz is 11 ms and two is 22, so 60 ms tolerates a short dropout and
-/// refuses to call a frame from the other side of a blink a head measurement.
+/// Largest gap between the wanted lag time and the frame actually found, seconds. At
+/// the ET5's 33 Hz the nearest frame is normally within 15 ms and one dropped frame
+/// puts it 30 ms off, so 60 ms tolerates a short dropout and refuses to call a frame
+/// from the other side of a blink a head measurement.
 const HEAD_LAG_GAP_S: f64 = 0.060;
 
 /// Minimum frames a stop needs before it contributes an aggregated (median) row.

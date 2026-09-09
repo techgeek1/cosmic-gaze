@@ -69,8 +69,8 @@ const CAL_BLOB_TIMEOUT: Duration = Duration::from_secs(60);
 /// Timeout for cal_point_add2d, during which the device collects samples.
 const CAL_POINT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Gaze channel depth. At 133 Hz this is ~2 s of backlog; when a consumer stalls
-/// longer, the oldest frames are dropped so it resumes on fresh data.
+/// Gaze channel depth. At the ET5's 33 Hz this is ~8 s of backlog; when a consumer
+/// stalls longer, the oldest frames are dropped so it resumes on fresh data.
 const GAZE_CHANNEL_DEPTH: usize = 256;
 
 /// Response channel depth. Only one request is ever in flight, so this only needs to
@@ -228,6 +228,14 @@ impl Device {
         ttp::decode_display_area(&payload).ok_or(DeviceError::BadResponse("display_area"))
     }
 
+    /// The device's stream rates: camera frames per second and published gaze frames
+    /// per second. `(132, 33)` on the ET5.
+    pub fn frequencies(&mut self) -> Result<(u32, u32), DeviceError> {
+        let payload = self.request(ttp::get_frequencies, REQUEST_TIMEOUT)?;
+
+        ttp::decode_frequencies(&payload).ok_or(DeviceError::BadResponse("frequencies"))
+    }
+
     /// Declares an axis-aligned display plane. Persists on the device across power
     /// cycles. Fire and forget on the wire; read back with `display_area` to confirm.
     pub fn set_display_area(&mut self, rect: DisplayRect) -> Result<(), DeviceError> {
@@ -344,6 +352,13 @@ impl Device {
     /// unknown, so nothing may depend on it.
     pub fn cal_point_suggestion(&mut self) -> Result<Vec<u8>, DeviceError> {
         self.request(ttp::cal_point_suggestion, REQUEST_TIMEOUT)
+    }
+
+    /// Sends an arbitrary opcode with a caller-built payload and returns the raw
+    /// response payload, status prefix included. For probing opcodes the typed API
+    /// does not cover; nothing in a session path may depend on it.
+    pub fn raw_request(&mut self, op: u32, payload: &[u8]) -> Result<Vec<u8>, DeviceError> {
+        self.request(|seq| ttp::raw_command(seq, op, payload), REQUEST_TIMEOUT)
     }
 
     /// Fits and commits the eye model from the collected points, closes the session,

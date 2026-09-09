@@ -128,8 +128,9 @@ const CLICK_LOOKBACK_S: f64 = 0.4;
 /// latency between a press on the bus and the call that attributes it.
 const RAY_HISTORY_S: f64 = 1.5;
 
-/// Fewest rays a click needs in its window to count. At 133 Hz the window holds about
-/// fifty; a window this thin means the eyes were untracked for most of it.
+/// Fewest rays a click needs in its window to count. At the ET5's 33 Hz the window
+/// holds about thirteen; a window this thin means the eyes were untracked for most
+/// of it.
 const CLICK_MIN_RAYS: usize = 3;
 
 // --- Provider ---
