@@ -144,6 +144,10 @@ pub struct Node {
     pub name : String,
     /// Extents in global logical pixels, when the object has a `Component`.
     pub rect : Option<Rect>,
+    /// The union of this node's children's extents, sampled from the first and last
+    /// few placed children, global logical pixels. Only [`A11y::ancestors`] fills it;
+    /// a hit never needs it. `None` when it was not asked for or nothing is placed.
+    pub span : Option<Rect>,
 }
 
 /// What the tree said is at a point.
@@ -330,7 +334,11 @@ impl A11y {
                 break;
             };
 
-            chain.push(self.node(&pb, &pp, mode, origin, window)?);
+            let mut parent = self.node(&pb, &pp, mode, origin, window)?;
+
+            parent.span = self.span(&pb, &pp, mode, origin, window);
+
+            chain.push(parent);
         }
 
         Ok(chain)
@@ -483,7 +491,30 @@ impl A11y {
             role : role,
             name : self.name(bus, path).unwrap_or_default(),
             rect : self.extents(bus, path, mode.atspi()).map(|e| origin.to_global(e, window)),
+            span : None,
         })
+    }
+
+    /// The union of the first and last [`SPAN_SAMPLE`] placed children's extents. A
+    /// scroll container whose rows are its direct children (YouTube's mix list) has no
+    /// single overflowing child for the chain to find; its rows above and below the one
+    /// under the point are where the overflow is, and its first and last children are
+    /// the far ends of it. Sampling both ends costs a `GetChildren` and a few extents
+    /// per ancestor instead of one per row.
+    fn span(&self, bus: &str, path: &str, mode: CoordMode, origin: FrameOrigin, window: &Toplevel)
+        -> Option<Rect>
+    {
+        let kids = self.children(bus, path).ok()?;
+        let n    = kids.len();
+
+        let head = kids.iter().take(SPAN_SAMPLE);
+        let tail = kids.iter().skip(n.max(SPAN_SAMPLE) - SPAN_SAMPLE).skip_while(|_| n <= SPAN_SAMPLE);
+
+        head.chain(tail)
+            .filter_map(|(b, p)| self.extents(b, p, mode.atspi()))
+            .map(|e| origin.to_global(e, window))
+            .filter(|r| r.w > 0.0 && r.h > 0.0)
+            .reduce(union)
     }
 
     /// Climbs from `leaf` to the nearest actionable ancestor-or-self.
@@ -636,6 +667,9 @@ impl A11y {
 /// the integer extents it reports.
 const OVERFLOW_SLACK_PX: f64 = 1.0;
 
+/// How many children from each end of a node are measured for its span.
+const SPAN_SAMPLE: usize = 2;
+
 /// A clipping node shorter than this is not a scroll viewport, and the walk continues
 /// past it. A table cell whose glyphs overhang it, a one-line label taller than its row:
 /// these overflow their parent by the geometric test too, and taking the first of them
@@ -660,6 +694,11 @@ pub const MIN_CLIP_PX: f64 = 120.0;
 /// Horizontal overflow is ignored: a carousel is not what a vertical wheel moves. A clip
 /// shorter than [`MIN_CLIP_PX`] is skipped for the next one up, see there.
 ///
+/// A parent whose child on the chain fits is also tested against its sampled children
+/// span ([`Node::span`]): a list whose rows are its direct children overflows by its
+/// first and last rows, never by the row under the point. The content reported is then
+/// the union of the chain child and the span.
+///
 /// Nodes without real extents are left out of the chain before pairing: Firefox reports
 /// some structural nodes at `-1x-1` (a `section` between YouTube's page and its
 /// document, 2026-09-09), and one of those taken as a child put "content" 106 px above
@@ -680,19 +719,30 @@ pub fn clip_surface(chain: &[Node]) -> Option<Surface> {
             continue;
         }
 
-        let above = child.y < parent.y - OVERFLOW_SLACK_PX;
-        let below = child.y + child.h > parent.y + parent.h + OVERFLOW_SLACK_PX;
+        let content = pair[1].span.map_or(child, |span| union(child, span));
+        let above   = content.y < parent.y - OVERFLOW_SLACK_PX;
+        let below   = content.y + content.h > parent.y + parent.h + OVERFLOW_SLACK_PX;
 
         if above || below {
             return Some(Surface {
                 clip     : pair[1].clone(),
                 viewport : parent,
-                content  : child,
+                content  : content,
             });
         }
     }
 
     None
+}
+
+/// The smallest rectangle holding both.
+fn union(a: Rect, b: Rect) -> Rect {
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let x1 = (a.x + a.w).max(b.x + b.w);
+    let y1 = (a.y + a.h).max(b.y + b.h);
+
+    Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
 }
 
 pub fn is_actionable(role: &str) -> bool {
@@ -779,6 +829,7 @@ mod tests {
             role : role.to_string(),
             name : String::new(),
             rect : Some(Rect { x: x, y: y, w: w, h: h }),
+            span : None,
         }
     }
 
@@ -802,6 +853,34 @@ mod tests {
         assert_eq!(surface.clip.role, "panel");
         assert_eq!(surface.viewport, Rect { x: 381.0, y: 248.0, w: 898.0, h: 1296.0 });
         assert_eq!(surface.content.h, 4305.0);
+    }
+
+    /// YouTube's mix list in Firefox: the rows are direct children of the 356 px clip, so
+    /// the row under the point fits it and only the sampled span of its siblings (740 to
+    /// 3024) says it scrolls. The taller containers above it hold their children.
+    #[test]
+    fn a_list_whose_rows_are_its_children_overflows_by_its_span() {
+        // `gaze-a11y-cli chain 2300,1200 --window YouTube`, 2026-09-09, leaf first.
+        let spanned = |role: &str, x: f64, y: f64, w: f64, h: f64, top: f64, bottom: f64| Node {
+            span : Some(Rect { x: x, y: top, w: w, h: bottom - top }),
+            ..boxed(role, x, y, w, h)
+        };
+        let chain = vec![
+            boxed  ("section", 2213.0, 1156.0, 100.0,   56.0),
+            spanned("section", 2213.0, 1156.0, 100.0,   56.0, 1156.0, 1212.0),
+            spanned("section", 2189.0, 1156.0, 300.0,   62.0, 1156.0, 1218.0),
+            spanned("link"   , 2189.0, 1156.0, 300.0,   62.0, 1156.0, 1218.0),
+            spanned("section", 2189.0, 1152.0, 348.0,   70.0, 1156.0, 1218.0),
+            spanned("section", 2189.0, 1149.0, 348.0,  356.0,  740.0, 3024.0),
+            spanned("section", 2188.0, 1046.0, 350.0,  460.0, 1047.0, 1505.0),
+            spanned("section", 2188.0, 1046.0, 350.0, 4031.0, 1522.0, 5077.0),
+        ];
+
+        let surface = clip_surface(&chain).expect("the rows overflow the list");
+
+        assert_eq!(surface.viewport, Rect { x: 2189.0, y: 1149.0, w: 348.0, h: 356.0 });
+        assert_eq!(surface.content.y, 740.0);
+        assert_eq!(surface.content.y + surface.content.h, 3024.0);
     }
 
     /// YouTube in Firefox at the top of the page: a `-1x-1` section between the page and

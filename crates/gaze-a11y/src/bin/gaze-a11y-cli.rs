@@ -145,7 +145,11 @@ fn chain(points: &[GlobalPx], forced: Option<&str>) -> Result<()> {
                 format!("({:.0},{:.0}) {:.0}x{:.0} bottom {:.0}", r.x, r.y, r.w, r.h, r.y + r.h)
             });
 
-            println!("  {depth:2} {:<16} {rect}  {:?}", n.role, truncate(&n.name, 40));
+            let span = n.span.map_or(String::new(), |s| {
+                format!("  children {:.0}..{:.0}", s.y, s.y + s.h)
+            });
+
+            println!("  {depth:2} {:<16} {rect}  {:?}{span}", n.role, truncate(&n.name, 40));
         }
     }
 

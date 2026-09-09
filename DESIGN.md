@@ -1239,7 +1239,12 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   page in Firefox offered a scroll up at the top of the page and none down: a
   `section` with `-1x-1` extents sits between the page and the document, and taken as
   the document's child it "overflowed" 106 px above it. Nodes without extents are now
-  left out before the overflow test (`gaze-a11y`).
+  left out before the overflow test (`gaze-a11y`). Its mix list was missed for the
+  opposite reason: the rows are direct children of the 356 px clip, so the one row on
+  the ancestor chain fits it and there is no single overflowing child to find. Each
+  ancestor now carries a sampled span of its first and last two placed children, and
+  the overflow test reads the union of the chain child and that span (740 to 3024 for
+  the list); the probe went from 8 to 10 ms.
 
 ## 11. Open questions
 

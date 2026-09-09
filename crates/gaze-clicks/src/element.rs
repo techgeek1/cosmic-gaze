@@ -689,6 +689,7 @@ mod tests {
             role : role.into(),
             name : name.into(),
             rect : Some(Rect { x: bbox.0, y: bbox.1, w: bbox.2, h: bbox.3 }),
+            span : None,
         };
 
         Hit {

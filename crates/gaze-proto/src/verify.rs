@@ -349,6 +349,7 @@ mod tests {
             role : role.into(),
             name : "x".into(),
             rect : rect,
+            span : None,
         }
     }
 
