@@ -76,6 +76,17 @@
 //! reporting a direction can still be taught. Nothing times out; a point that will not
 //! settle nags until the operator takes it (Enter), skips it (`s`), or aborts (`q`).
 //!
+//! # Manual acceptance
+//!
+//! The vote knows the reported gaze is *near* the target; it cannot know the user has
+//! settled on it, and on a single-target round it trips on the first sixty frames
+//! that carry any gaze at all. With a commit channel in hand (the Daydream pad, or
+//! `c`) the ambiguity goes away: under `RetrainConfig::manual` nothing is accepted
+//! until the user says so, and the vote becomes the sanity check on the click rather
+//! than the decision. A click while the vote names another target is refused with a
+//! warning, so a stray press cannot feed the firmware a wrong point. Enter still
+//! forces, `s` still skips, and the dwell fallback stays off: the user is the fallback.
+//!
 //! # The point cap
 //!
 //! The device's calibration store is a FIFO. The 2026-08-28 11:56 run fed eighteen
@@ -203,8 +214,10 @@ const HEALTH_DWELL_S: f64 = 1.0;
 /// the end. The rest is the saccade and the lock-on.
 const HEALTH_MEDIAN_S: f64 = 0.6;
 
-/// Health-grid resolution per axis.
-const HEALTH_STEPS: usize = 3;
+/// Default health-check stops per axis. Four gives sixteen stops: enough for the
+/// correction field fitted from them afterwards to hold out a cell and still fit a
+/// quadratic, at sixteen seconds of dwelling.
+pub const HEALTH_STEPS: usize = 4;
 
 /// Mid grey: the health check runs on neither pupil extreme, so its numbers describe
 /// an ordinary screen rather than the training conditions.
@@ -253,6 +266,12 @@ pub struct RetrainConfig {
     /// Ask the device what point it would like after each round and log the answer.
     /// Exploratory: nothing depends on the reply.
     pub suggest           : bool,
+    /// Accept a point only on `SweepKey::Commit` (or Enter): the vote checks the
+    /// click instead of deciding, and the dwell fallback is off. See "Manual
+    /// acceptance" in the module docs.
+    pub manual            : bool,
+    /// Health-check stops per axis (`n` by `n`), at least 2.
+    pub health_steps      : usize,
 }
 
 impl Default for RetrainConfig {
@@ -269,6 +288,8 @@ impl Default for RetrainConfig {
             apply_from_round  : 1,
             min_points        : MIN_POINTS,
             suggest           : false,
+            manual            : false,
+            health_steps      : HEALTH_STEPS,
         }
     }
 }
@@ -765,11 +786,13 @@ fn accept_tolerance_uv(
 // --- Outcome ---
 
 /// Which rule decided a target. Kept as one enum rather than a pile of booleans so
-/// the ceremony summary can count the four cases without any of them overlapping.
+/// the ceremony summary can count the cases without any of them overlapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointOutcome {
     /// The nearest-target vote carried it. The ordinary case.
     Gate,
+    /// The user committed it (pad click or `c`) and the vote agreed.
+    Clicked,
     /// The device reported no gaze at all, so both eyes tracked for [`DWELL_S`]
     /// carried it instead.
     Dwell,
@@ -791,6 +814,7 @@ impl PointOutcome {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Gate    => "added",
+            Self::Clicked => "clicked",
             Self::Dwell   => "dwell",
             Self::Forced  => "forced",
             Self::Skipped => "SKIPPED",
@@ -837,6 +861,8 @@ pub struct RoundSummary {
     pub background : Background,
     /// Targets the vote carried.
     pub gate       : usize,
+    /// Targets the user clicked in, vote agreeing.
+    pub clicked    : usize,
     /// Targets the dwell fallback carried.
     pub dwell      : usize,
     /// Targets the operator forced in.
@@ -852,7 +878,7 @@ pub struct RoundSummary {
 impl RoundSummary {
     /// Targets fed to the device in this round, however they were decided.
     pub fn accepted(&self) -> usize {
-        self.gate + self.dwell + self.forced
+        self.gate + self.clicked + self.dwell + self.forced
     }
 }
 
@@ -1057,10 +1083,11 @@ pub fn run_retrain(
 /// refuses to commit still says what it saw.
 fn log_summary(summaries: &[RoundSummary]) {
     for (number, summary) in summaries.iter().enumerate() {
-        info!("round {}/{} {} ({}): {} accepted ({} gate, {} dwell, {} forced), \
-               {} skipped, {}",
+        info!("round {}/{} {} ({}): {} accepted ({} gate, {} clicked, {} dwell, \
+               {} forced), {} skipped, {}",
               number + 1, summaries.len(), summary.name, summary.background.name(),
-              summary.accepted(), summary.gate, summary.dwell, summary.forced,
+              summary.accepted(), summary.gate, summary.clicked, summary.dwell,
+              summary.forced,
               summary.skipped,
               if summary.applied { "applied" } else { "not applied" });
     }
@@ -1120,6 +1147,7 @@ fn run_round(
         name       : round.name,
         background : round.background,
         gate       : 0,
+        clicked    : 0,
         dwell      : 0,
         forced     : 0,
         skipped    : 0,
@@ -1139,6 +1167,7 @@ fn run_round(
 
         match result.outcome {
             PointOutcome::Gate    => summary.gate    += 1,
+            PointOutcome::Clicked => summary.clicked += 1,
             PointOutcome::Dwell   => summary.dwell   += 1,
             PointOutcome::Forced  => summary.forced  += 1,
             PointOutcome::Skipped => summary.skipped += 1,
@@ -1233,6 +1262,7 @@ fn run_point(
     let mut dwell_since : Option<f64> = None;
     let mut dwell_armed = false;
     let mut forced      = false;
+    let mut clicked     = false;
     let mut next_status = STATUS_S;
     let mut next_nag    = config.point_timeout_s;
 
@@ -1248,6 +1278,8 @@ fn run_point(
                 // The operator can see the dot and the user; when the gate will not
                 // trip but the fixation is plainly good, Enter takes the point.
                 Ok(SweepKey::Advance) => forced = true,
+                // The user says they are on it; the vote below gets to disagree.
+                Ok(SweepKey::Commit)  => clicked = true,
                 Err(_)                => {}
             }
         }
@@ -1286,13 +1318,30 @@ fn run_point(
             return Ok(tally.result(index, PointOutcome::Forced, verdict.hits, now));
         }
 
-        if verdict.accepted {
+        if clicked {
+            clicked = false;
+
+            // A click is the decision; the vote is the check. Naming this target for
+            // at least half the window is a low bar on purpose: the model reporting
+            // the gaze is the one being replaced, so all it can refuse is a click
+            // taken while plainly looking at another target of this round.
+            if verdict.hits > 0 && verdict.hits * 2 >= samples.len() {
+                return Ok(tally.result(index, PointOutcome::Clicked, verdict.hits, now));
+            }
+
+            warn!("click refused at {name}: the reported gaze names this target in {}/{} \
+                   recent frames; look at the dot and click again (Enter forces it)",
+                  verdict.hits, samples.len());
+        }
+
+        if verdict.accepted && !config.manual {
             return Ok(tally.result(index, PointOutcome::Gate, verdict.hits, now));
         }
 
         // The device has answered nothing for long enough that waiting on the gate is
-        // waiting on something that is not coming.
-        if !dwell_armed && tally.gaze == 0 && now >= config.gaze_timeout_s {
+        // waiting on something that is not coming. Under manual acceptance the user
+        // is the fallback.
+        if !config.manual && !dwell_armed && tally.gaze == 0 && now >= config.gaze_timeout_s {
             dwell_armed = true;
 
             warn!("no gaze reported in {now:.1}s at this target ({}/{} frames had both \
@@ -1318,16 +1367,22 @@ fn run_point(
         if now >= next_nag {
             next_nag = now + config.point_timeout_s;
 
-            warn!("still waiting on {name}: Enter adds it now, s skips, q aborts");
+            match config.manual {
+                true  => warn!("still waiting on {name}: click when you are on it, Enter \
+                                forces it, s skips, q aborts"),
+                false => warn!("still waiting on {name}: Enter adds it now, s skips, q aborts"),
+            }
         }
 
         // Keep the caption alive with the gate's own progress: a user who cannot tell
         // whether the tracker sees them has no way to fix their posture.
         let live = {
-            match dwell_armed {
-                true  => format!("{label} [no gaze — hold still, {}/{} eyes]",
-                                 tally.eyes, tally.frames),
-                false => format!("{label} [{}/{}]", verdict.hits, gate.min_hits),
+            match (config.manual, dwell_armed) {
+                (true, _)      => format!("{label} [click when settled; {}/{} on it]",
+                                          verdict.hits, samples.len()),
+                (false, true)  => format!("{label} [no gaze — hold still, {}/{} eyes]",
+                                          tally.eyes, tally.frames),
+                (false, false) => format!("{label} [{}/{}]", verdict.hits, gate.min_hits),
             }
         };
 
@@ -1428,12 +1483,13 @@ pub fn run_health(
 
     set_overlay_background(Some(NEUTRAL));
 
-    let mut stops = Vec::with_capacity(HEALTH_STEPS * HEALTH_STEPS);
+    let steps     = config.health_steps.max(2);
+    let mut stops = Vec::with_capacity(steps * steps);
 
-    for row in 0..HEALTH_STEPS {
-        for col in 0..HEALTH_STEPS {
-            let fu = col as f64 / (HEALTH_STEPS - 1) as f64;
-            let fv = row as f64 / (HEALTH_STEPS - 1) as f64;
+    for row in 0..steps {
+        for col in 0..steps {
+            let fu = col as f64 / (steps - 1) as f64;
+            let fv = row as f64 / (steps - 1) as f64;
 
             // The same 5%..95% inset as the training points: a stop on the very edge
             // of the rectangle measures the overshoot, not the model.
@@ -1443,9 +1499,8 @@ pub fn run_health(
                 + (POINT_FRACTIONS[2] - POINT_FRACTIONS[0]) * fv);
 
             let px    = out.uv_to_px(u, v);
-            let index = row * HEALTH_STEPS + col + 1;
-            let label = format!("health check {index}/{} — eyes on the dot",
-                                HEALTH_STEPS * HEALTH_STEPS);
+            let index = row * steps + col + 1;
+            let label = format!("health check {index}/{} — eyes on the dot", steps * steps);
 
             show_target(overlay, px, &label)?;
 
@@ -1698,9 +1753,9 @@ fn wait(duration_s: f64, frames_rx: &Receiver<Et5Frame>, keys: Option<&Receiver<
 
         if let Some(keys) = keys {
             match keys.try_recv() {
-                Ok(SweepKey::Quit)                     => return Err(SweepError::Aborted),
-                Ok(SweepKey::Advance | SweepKey::Skip) => return Ok(()),
-                Err(_)                                 => {}
+                Ok(SweepKey::Quit) => return Err(SweepError::Aborted),
+                Ok(SweepKey::Advance | SweepKey::Commit | SweepKey::Skip) => return Ok(()),
+                Err(_)             => {}
             }
         }
 

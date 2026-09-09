@@ -11,3 +11,6 @@ toml       = { workspace = true }
 thiserror  = { workspace = true }
 rand       = { workspace = true }
 rand_distr = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

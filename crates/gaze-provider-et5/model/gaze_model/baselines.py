@@ -102,6 +102,10 @@ class GlobalQuadraticHead:
 
     def fit(self, df_train: pd.DataFrame) -> "GlobalQuadraticHead":
         X = self._design(df_train)
+        # A click session has monocular frames, whose head columns are NaN; impute
+        # with the training median the way the kernel model does.
+        self._impute = np.nan_to_num(np.nanmedian(X, axis=0), nan=0.0)
+        X = np.where(np.isnan(X), self._impute, X)
         self._mean = X.mean(axis=0)
         self._std = X.std(axis=0)
         self._std[self._std < 1e-9] = 1.0
@@ -111,5 +115,6 @@ class GlobalQuadraticHead:
 
     def predict(self, df_test: pd.DataFrame) -> np.ndarray:
         X = self._design(df_test)
+        X = np.where(np.isnan(X), self._impute, X)
         Xs = (X - self._mean) / self._std
         return self.ridge_.predict(Xs)

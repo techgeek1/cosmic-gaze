@@ -290,6 +290,10 @@ impl InjectBackend for RelativeInjector {
         }
     }
 
+    fn move_by(&mut self, dx: i32, dy: i32) -> Result<()> {
+        Self::emit_rel(&mut self.device, dx, dy)
+    }
+
     fn click(&mut self, button: Button) -> Result<()> {
         let code = button_code(button);
 
@@ -305,6 +309,24 @@ impl InjectBackend for RelativeInjector {
                 dy * WHEEL_HI_RES_PER_CLICK,
             )),
         ];
+
+        self.device.emit(&events).map_err(InjectError::Emit)
+    }
+
+    fn wheel(&mut self, clicks: i32, hi_res: i32) -> Result<()> {
+        let mut events = Vec::with_capacity(2);
+
+        if clicks != 0 {
+            events.push(InputEvent::from(RelativeAxisEvent::new(RelativeAxisCode::REL_WHEEL, clicks)));
+        }
+
+        if hi_res != 0 {
+            events.push(InputEvent::from(RelativeAxisEvent::new(RelativeAxisCode::REL_WHEEL_HI_RES, hi_res)));
+        }
+
+        if events.is_empty() {
+            return Ok(());
+        }
 
         self.device.emit(&events).map_err(InjectError::Emit)
     }

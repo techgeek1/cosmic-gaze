@@ -32,7 +32,8 @@ use glam::DVec3;
 use serde::Deserialize;
 use gaze_core::{DesktopGeometry, GlobalPx, OutputGeometry};
 
-use crate::gaze::{Et5Frame, VALIDITY_OK, combined_ray};
+use crate::gaze::{Et5Frame, combined_ray};
+use crate::model::{Features, or_nan};
 use crate::record::{CLICK_PHASE, ClickRecord, SessionEnd, SessionMeta};
 use crate::sweep::{
     FALLBACK_PX_PER_DEG, RaySample, StopWindow, TimedFrame, TrajPoint, desk_to_sensor,
@@ -48,7 +49,7 @@ pub const HEAD_LAG_S: f64 = 0.300;
 /// refuses to call a frame from the other side of a blink a head measurement.
 const HEAD_LAG_GAP_S: f64 = 0.060;
 
-/// Minimum frames a stop needs before it contributes an aggregated mean row.
+/// Minimum frames a stop needs before it contributes an aggregated (median) row.
 const STOP_MIN_FRAMES: usize = 5;
 
 // --- Rows ---
@@ -154,6 +155,17 @@ pub struct Row {
     /// covariate a passive session gets in place of a driven background. NaN for a
     /// non-click row.
     pub crop_luma       : f64,
+    /// Where a click's element came from: `tree`, `vision`, `caret` or `trainer`.
+    /// Empty for a non-click row and for click files written before it was recorded.
+    pub source          : String,
+    /// The posture the trainer had asked for on a trainer click. Empty otherwise.
+    pub posture         : String,
+    /// The trainer's task index on a trainer click, so tasks can be held out whole.
+    /// NaN otherwise.
+    pub trainer_task    : f64,
+    /// 1 when a trainer click landed on the step's target, 0 when it landed on some
+    /// other widget. NaN otherwise.
+    pub trainer_hit     : f64,
 }
 
 /// The CSV header, in the order [`Row::to_csv`] writes the fields.
@@ -181,6 +193,7 @@ pub const CSV_COLUMNS: &[&str] = &[
     "origin_raw_r_x_mm", "origin_raw_r_y_mm", "origin_raw_r_z_mm",
     "residual_yaw_deg_combined", "residual_pitch_deg_combined",
     "element_kind", "element_w_px", "element_h_px", "crop_luma",
+    "source", "posture", "trainer_task", "trainer_hit",
 ];
 
 /// How many leading columns are the Phase C harness's shared schema.
@@ -438,6 +451,13 @@ pub fn rows(session: &Session, geometry: &DesktopGeometry) -> Vec<Row> {
                 row.element_w_px = click.element.bbox.w;
                 row.element_h_px = click.element.bbox.h;
                 row.crop_luma    = click.crop_luma;
+                row.source       = click.source.clone().unwrap_or_default();
+
+                if let Some(tag) = &click.trainer {
+                    row.posture      = tag.posture.clone();
+                    row.trainer_task = tag.task as f64;
+                    row.trainer_hit  = f64::from(u8::from(tag.hit));
+                }
             }
 
             rows.push(row);
@@ -571,6 +591,10 @@ impl Row {
         push(&mut fields, self.element_w_px);
         push(&mut fields, self.element_h_px);
         push(&mut fields, self.crop_luma);
+        fields.push(self.source.clone());
+        fields.push(self.posture.clone());
+        push(&mut fields, self.trainer_task);
+        push(&mut fields, self.trainer_hit);
 
         fields.join(",")
     }
@@ -585,17 +609,17 @@ impl Row {
 
 /// Head state of one frame: what the 300 ms lookback carries forward.
 #[derive(Clone, Copy, Debug, Default)]
-struct Head {
+pub struct Head {
     /// Calibrated left eye position.
-    cal_l : Option<DVec3>,
+    pub cal_l : Option<DVec3>,
     /// Calibrated right eye position.
-    cal_r : Option<DVec3>,
+    pub cal_r : Option<DVec3>,
     /// Pre-calibration left eye position.
-    raw_l : Option<DVec3>,
+    pub raw_l : Option<DVec3>,
     /// Pre-calibration right eye position.
-    raw_r : Option<DVec3>,
+    pub raw_r : Option<DVec3>,
     /// Right minus left calibrated eye origin.
-    inter : Option<DVec3>,
+    pub inter : Option<DVec3>,
 }
 
 // --- Head ---
@@ -604,7 +628,7 @@ impl Head {
     /// Extracts the head state a frame reports. Origins are kept whatever the validity
     /// flag says only when the flag agrees: an untracked eye's last position is stale by
     /// an unknown amount and is not a measurement.
-    fn of(frame: &Et5Frame) -> Self {
+    pub fn of(frame: &Et5Frame) -> Self {
         let raw_l = frame.left_valid().then_some(frame.eye_origin_raw_l_mm).flatten();
         let raw_r = frame.right_valid().then_some(frame.eye_origin_raw_r_mm).flatten();
         let cal_l = frame.left_valid().then_some(frame.eye_origin_l_mm).flatten();
@@ -669,7 +693,7 @@ impl RawRecord {
 /// This is `gaze::filtered_ray` for a three-corner plane rather than an axis-aligned
 /// rect: normalised coordinates run from the top-left corner, so the point is
 /// `tl + nx (tr - tl) + ny (bl - tl)`.
-fn firmware_ray(frame: &Et5Frame, area: &DisplayArea) -> Option<(DVec3, DVec3)> {
+pub fn firmware_ray(frame: &Et5Frame, area: &DisplayArea) -> Option<(DVec3, DVec3)> {
     let [nx, ny] = frame.gaze_2d_norm?;
 
     // The firmware reports (-1, -1) for an invalid combined gaze and clamps to the area
@@ -747,43 +771,9 @@ pub fn local_yaw_pitch_deg(dir: DVec3, reference: DVec3) -> (f64, f64) {
     )
 }
 
-/// One eye's gaze direction against the tracker axis, or NaNs when the eye was not
-/// tracked.
-///
-/// The axis points tracker to eye and a gaze ray points eye to screen, so they face
-/// opposite ways by construction: the direction is negated first, the same negation
-/// `DesktopGeometry::off_axis_deg` applies, so a gaze near the tracker reads as a small
-/// yaw and pitch rather than as a 180 degree wraparound.
-fn eye_angles(
-    valid  : bool,
-    origin : Option<[f64; 3]>,
-    target : Option<[f64; 3]>,
-    axis   : DVec3,
-)
-    -> (f64, f64)
-{
-    let missing = (f64::NAN, f64::NAN);
-
-    if !valid {
-        return missing;
-    }
-
-    let (Some(o), Some(t)) = (origin, target) else {
-        return missing;
-    };
-
-    let delta = DVec3::from_array(t) - DVec3::from_array(o);
-
-    if delta.length_squared() < 1.0 {
-        return missing;
-    }
-
-    local_yaw_pitch_deg(-delta, axis)
-}
-
 /// The head state 300 ms before `t_s`: the latest sample at or before that time, or
 /// nothing when the nearest one is further away than the gap tolerance.
-fn lagged_head(heads: &[(f64, Head)], t_s: f64) -> Head {
+pub fn lagged_head(heads: &[(f64, Head)], t_s: f64) -> Head {
     let want = t_s - HEAD_LAG_S;
 
     let i = {
@@ -859,12 +849,9 @@ fn build_row(
         }
     };
 
-    let (dir_l_yaw_deg, dir_l_pitch_deg) = eye_angles(
-        frame.left_valid(), frame.eye_origin_l_mm, frame.gaze_3d_l_mm, axis,
-    );
-    let (dir_r_yaw_deg, dir_r_pitch_deg) = eye_angles(
-        frame.right_valid(), frame.eye_origin_r_mm, frame.gaze_3d_r_mm, axis,
-    );
+    // The same assembly the runtime uses on a live frame, so a row and a frame cannot
+    // disagree about what a feature is.
+    let f = Features::of_frame(frame, &lagged, axis, sample.dir).values;
 
     Row {
         session_id          : session.meta.session_id.clone(),
@@ -874,23 +861,23 @@ fn build_row(
         session_phase       : session_phase.to_string(),
         t_s                 : sample.t_s,
         is_mean             : false,
-        origin_l_mm         : or_nan(head.cal_l),
-        origin_r_mm         : or_nan(head.cal_r),
+        origin_l_mm         : [f[0], f[1], f[2]],
+        origin_r_mm         : [f[3], f[4], f[5]],
         origin_raw_l_mm     : or_nan(head.raw_l),
         origin_raw_r_mm     : or_nan(head.raw_r),
-        dir_l_yaw_deg       : dir_l_yaw_deg,
-        dir_l_pitch_deg     : dir_l_pitch_deg,
-        dir_r_yaw_deg       : dir_r_yaw_deg,
-        dir_r_pitch_deg     : dir_r_pitch_deg,
-        inter_mm            : or_nan(head.inter),
-        pupil_l_mm          : pupil(frame.left_valid(), frame.pupil_l_mm),
-        pupil_r_mm          : pupil(frame.right_valid(), frame.pupil_r_mm),
-        valid_l             : validity(frame.validity_l),
-        valid_r             : validity(frame.validity_r),
-        angle_axis_deg      : (-sample.dir).angle_between(axis).to_degrees(),
-        lag_origin_l_mm     : or_nan(lagged.cal_l),
-        lag_origin_r_mm     : or_nan(lagged.cal_r),
-        lag_inter_mm        : or_nan(lagged.inter),
+        dir_l_yaw_deg       : f[6],
+        dir_l_pitch_deg     : f[7],
+        dir_r_yaw_deg       : f[8],
+        dir_r_pitch_deg     : f[9],
+        inter_mm            : [f[10], f[11], f[12]],
+        pupil_l_mm          : f[13],
+        pupil_r_mm          : f[14],
+        valid_l             : f[15],
+        valid_r             : f[16],
+        angle_axis_deg      : f[17],
+        lag_origin_l_mm     : [f[18], f[19], f[20]],
+        lag_origin_r_mm     : [f[21], f[22], f[23]],
+        lag_inter_mm        : [f[24], f[25], f[26]],
         target_mm           : target_mm,
         residual_yaw_deg    : residual_yaw_deg,
         residual_pitch_deg  : residual_pitch_deg,
@@ -902,21 +889,36 @@ fn build_row(
         element_w_px        : f64::NAN,
         element_h_px        : f64::NAN,
         crop_luma           : f64::NAN,
+        source              : String::new(),
+        posture             : String::new(),
+        trainer_task        : f64::NAN,
+        trainer_hit         : f64::NAN,
     }
 }
 
-/// The aggregated row for a stop: every numeric field averaged over the frames that
-/// reported it, NaN where none did. Labels come from the first row.
+/// The aggregated row for a stop: every numeric field is the median over the frames
+/// that reported it, NaN where none did. Labels come from the first row.
+///
+/// A median rather than a mean (the flag is still `is_mean`, the schema's name for
+/// the one-per-stop row): a click window holds the frames of the eye's arrival and
+/// departure as well as the fixation, and on the 2026-09-04 sessions the mean's
+/// per-click residual sat 0.15 degrees above the median's, all of it saccade frames
+/// the saccade gate did not catch.
 fn mean_row(rows: &[Row]) -> Row {
     let mut mean = rows[0].clone();
 
     let avg = |f: &dyn Fn(&Row) -> f64| {
-        let (sum, n) = rows.iter()
-            .map(f)
-            .filter(|v| v.is_finite())
-            .fold((0.0, 0usize), |(s, n), v| (s + v, n + 1));
+        let mut values: Vec<f64> = rows.iter().map(f).filter(|v| v.is_finite()).collect();
 
-        if n == 0 { f64::NAN } else { sum / n as f64 }
+        if values.is_empty() {
+            return f64::NAN;
+        }
+
+        values.sort_by(f64::total_cmp);
+
+        let n = values.len();
+
+        if n % 2 == 1 { values[n / 2] } else { (values[n / 2 - 1] + values[n / 2]) * 0.5 }
     };
 
     let avg3 = |f: &dyn Fn(&Row) -> [f64; 3]| {
@@ -957,6 +959,8 @@ fn mean_row(rows: &[Row]) -> Row {
     mean.element_w_px        = avg(&|r| r.element_w_px);
     mean.element_h_px        = avg(&|r| r.element_h_px);
     mean.crop_luma           = avg(&|r| r.crop_luma);
+    mean.trainer_task        = avg(&|r| r.trainer_task);
+    mean.trainer_hit         = avg(&|r| r.trainer_hit);
 
     mean
 }
@@ -992,7 +996,7 @@ fn segment_of(segments: &[(f64, f64)], t_s: f64) -> Option<usize> {
 
 /// Every `.jsonl` file named by `paths`, expanding directories. Sorted within a
 /// directory so a run is reproducible.
-fn expand(paths: &[PathBuf]) -> Result<Vec<PathBuf>, DatasetError> {
+pub fn expand(paths: &[PathBuf]) -> Result<Vec<PathBuf>, DatasetError> {
     let mut files = Vec::new();
 
     for path in paths {
@@ -1019,28 +1023,6 @@ fn expand(paths: &[PathBuf]) -> Result<Vec<PathBuf>, DatasetError> {
     }
 
     Ok(files)
-}
-
-/// A vector's components, or NaNs when it is absent.
-fn or_nan(v: Option<DVec3>) -> [f64; 3] {
-    v.map(|v| v.to_array()).unwrap_or([f64::NAN; 3])
-}
-
-/// A pupil diameter, or NaN when the eye was not tracked. The device reports -1 for an
-/// untracked eye, which would otherwise look like a measurement.
-fn pupil(valid: bool, mm: Option<f64>) -> f64 {
-    match mm {
-        Some(v) if valid && v > 0.0 => v,
-        _                           => f64::NAN,
-    }
-}
-
-/// A validity flag as 1, 0, or NaN when the frame did not carry one.
-fn validity(v: Option<u32>) -> f64 {
-    match v {
-        Some(v) => f64::from(u8::from(v == VALIDITY_OK)),
-        None    => f64::NAN,
-    }
 }
 
 // --- Errors ---
@@ -1407,7 +1389,14 @@ mod tests {
                     "score" : 0.87,
                 },
                 "crop_luma"   : 0.21,
-                "frame_age_s" : 0.031,
+                // A trainer click: labelled without a capture, so no frame age. This
+                // is `null` on disk and once failed to parse, dropping the click.
+                "frame_age_s" : null,
+                "source"      : "trainer",
+                "trainer"     : {
+                    "task": 3, "step": 1, "hit": true,
+                    "posture": "lean-left", "theme": "dark",
+                },
             },
         }).to_string());
 
@@ -1459,6 +1448,10 @@ mod tests {
             assert!((row.element_w_px - 60.0).abs() < 1e-9);
             assert!((row.element_h_px - 24.0).abs() < 1e-9);
             assert!((row.crop_luma - 0.21).abs() < 1e-9);
+            assert_eq!(row.source , "trainer");
+            assert_eq!(row.posture, "lean-left");
+            assert!((row.trainer_task - 3.0).abs() < 1e-9);
+            assert!((row.trainer_hit  - 1.0).abs() < 1e-9);
         }
 
         // The target came off the stop's own display, not the meta line's. The two

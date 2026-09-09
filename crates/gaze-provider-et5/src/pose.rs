@@ -525,6 +525,7 @@ mod tests {
         OutputGeometry {
             name          : "TEST".into(),
             enabled       : true,
+            detect        : true,
             logical_x     : 0.0,
             logical_y     : 0.0,
             logical_w     : 1670.0,
@@ -544,6 +545,7 @@ mod tests {
         OutputGeometry {
             name          : "CURVED".into(),
             enabled       : true,
+            detect        : true,
             logical_x     : 0.0,
             logical_y     : 0.0,
             logical_w     : 2560.0,

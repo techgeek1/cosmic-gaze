@@ -1,0 +1,33 @@
+[package]
+name              = "gaze-trainer"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+gaze-core = { workspace = true }
+
+anyhow             = { workspace = true }
+clap               = { workspace = true }
+rand               = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# The same pin cosmic-term builds against on this machine, so the git checkout is
+# already local. No a11y: the trainer labels its own widgets and must not be on the
+# bus, or the collector would get two answers for one press.
+[dependencies.libcosmic]
+git              = "https://github.com/pop-os/libcosmic.git"
+rev              = "c1897c01aa8a25776ceadeddcb161bb59ccffd79"
+default-features = false
+features         = ["winit", "tokio", "wayland", "multi-window"]
+
+[[bin]]
+name = "gaze-trainer"
+path = "src/bin/gaze-trainer.rs"
+
+[lints.clippy]
+# The workspace style mandates explicit `Foo { x: x }` field syntax everywhere.
+redundant_field_names = "allow"

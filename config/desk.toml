@@ -1,6 +1,6 @@
 # Physical layout of the desk. World frame: origin at the ET5's camera, which is
-# clip-mounted centred under DP-1's bottom bezel (2026-08 pivot), +X right, +Y up,
-# +Z toward the user, mm.
+# clip-mounted centred under DP-2's bottom bezel (2026-09-09 remount; it lived under
+# DP-1 from the 2026-08 pivot until then), +X right, +Y up, +Z toward the user, mm.
 #
 # Values marked MEASURE are eyeballed from a photo (2026-08-25) and should be replaced
 # with tape-measure numbers. Phase 0 results are insensitive to a few cm either way.
@@ -8,22 +8,25 @@
 # Logical rects come from `cosmic-randr list` / `wayland-info -i wl_output` and must be
 # kept in sync with the compositor layout.
 
-# Desk-frame eye: the tracked origin (-38, 38, 714) rotated back out of the sensor
-# frame by tracker_pitch_deg.
-eye_mm     = [-38.0, 200.0, 687.0]
+# Desk-frame eye: the tracked origin rotated back out of the sensor frame by
+# tracker_pitch_deg. 2026-09-09 seated reading (-27, 6, 785) sensor mm with the eye
+# estimated 20 mm below the panel centre, i.e. 175 mm above the camera.
+eye_mm     = [-27.0, 175.0, 765.0]
 tracker_mm = [0.0, 0.0, 0.0]
 
 # The ET5's mount wedge pitches the sensor up at the face; it reports origins and
-# expects plane declarations in that tilted frame. Derived 2026-08-27: reported eye
-# y +38 at z 714 vs true eye level ~200 mm above the bar (panel middle) =>
-# sin(pitch) ~ (200 - 38) / 714 => ~13 deg. Re-derive after any remount:
-# `gaze-et5-cli info` prints the reported origin; pair it with a tape-measured eye
-# height above the bar.
-tracker_pitch_deg = 13.0
+# expects plane declarations in that tilted frame. Derived 2026-09-09 after the tilt
+# was set so the eye sits on the sensor axis: reported eye (y 6, z 785) vs an estimated
+# eye height of 175 mm above the camera (20 mm below the panel centre) =>
+# atan2(175, 765) - atan2(6, 785) => 12.4 deg. Re-derive after any remount or tilt:
+# `gaze-et5-cli info` prints the reported origin; pair it with the eye height above
+# the bar. (The 2026-08 DP-1 mount was 13.0 from y +38 at z 714 against ~200 mm.)
+tracker_pitch_deg = 12.4
 
 # LG 38GN950, 38" 21:10, 2300R. Main display, right of the seam.
 [[outputs]]
 name          = "DP-1"
+detect        = false                    # out of the tracker's reach since the remount
 logical_x     = 2559.0
 logical_y     = 0.0
 logical_w     = 3840.0
@@ -31,16 +34,17 @@ logical_h     = 1600.0
 physical_w_mm = 880.0
 physical_h_mm = 370.0
 radius_mm     = 2300.0
-# Estimated from device dimensions + mount photo (2026-08-27): bar ~25 mm left of the
-# panel centreline; active-area bottom ~22 mm above the camera (bezel + clip), so the
-# centre is 22 + 185 up; glass sits ~14 mm behind the camera face at the bottom edge,
-# plus ~13 mm of recline over the half height. Replace with tape-measure numbers if
-# accuracy at the edges ever matters more than a centimetre.
+# STALE: this is the pre-remount pose (bar under this panel; 25 mm right of the bar,
+# 207 up, 27 back). With the bar under DP-2 the panel sits to the right of the seam
+# and angled away, roughly 300 + 440 mm right and turned about -20 deg; only multi-
+# display ray mode would care. MEASURE if it ever does.
 position_mm   = [25.0, 207.0, -27.0]
-yaw_deg       = 0.0                      # bar clips parallel to the panel
-pitch_deg     = -4.0                     # slight recline, top away from the user
+yaw_deg       = 0.0
+pitch_deg     = -4.0
 
-# VIOTEK GNV27DB, 27" 16:9, 1500R. Left of the seam, angled in.
+# VIOTEK GNV27DB, 27" 16:9, 1500R. Left of the seam, angled in. The tracker's display
+# since the remount: the whole 600 mm panel sits inside the gaze envelope at the desk's
+# viewing distance, which the 880 mm ultrawide never did.
 [[outputs]]
 name          = "DP-2"
 logical_x     = 0.0
@@ -50,10 +54,15 @@ logical_h     = 1440.0
 physical_w_mm = 600.0
 physical_h_mm = 340.0
 radius_mm     = 1500.0
-# STALE: pre-pivot values in the old seam-origin frame; DP-2 is disabled in direct
-# mode, so these only matter if multi-display ray mode returns. Re-measure then.
-position_mm   = [-300.0, 170.0, -60.0]
-yaw_deg       = 20.0
+# Clip mount with the bar's top edge flush with the bottom of the bezel (2026-09-09):
+# bar assumed on the panel centreline; the camera sits ~8 mm below the bar's top edge
+# and the Viotek's bottom bezel is ~17 mm, so the active area starts ~25 mm above the
+# camera and the centre is 25 + 170 up; glass ~14 mm behind the camera face at the
+# bottom edge plus ~10 mm of recline over the half height. Estimates, not tape; the
+# retrain absorbs a centimetre either way, and `view --direct DP-2` shows the bias.
+position_mm   = [0.0, 195.0, -24.0]
+yaw_deg       = 0.0                      # bar clips parallel to the panel
+pitch_deg     = -4.0                     # slight recline, top away from the user
 
 # 11" 16:10 portable panel, flat, on the desk below the seam. 1920x1200 physical; the
 # compositor uses fractional scale ~1.15 so the logical size is 1670x1043 (wl_output.scale
@@ -61,6 +70,7 @@ yaw_deg       = 20.0
 # its top edge. Occasionally drops off the compositor's output list; keep enabled.
 [[outputs]]
 name          = "HDMI-A-1"
+detect        = false                    # out of the tracker's reach, and the log terminal lives here
 logical_x     = 1506.0
 logical_y     = 1600.0
 logical_w     = 1670.0

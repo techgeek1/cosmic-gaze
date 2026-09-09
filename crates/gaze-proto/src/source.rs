@@ -17,6 +17,7 @@
 //! ahead of it) varies per run rather than per variant.
 
 use std::path::PathBuf;
+use std::time::Instant;
 use anyhow::{Context, Result};
 use gaze_core::{DesktopGeometry, GazeSample, GlobalPx, NoiseModel};
 use gaze_provider_synthetic::{
@@ -26,7 +27,7 @@ use gaze_provider_synthetic::{
     ReplayProvider,
     SyntheticProvider,
 };
-use gaze_provider_et5::{Et5Calibration, Et5Provider};
+use gaze_provider_et5::{ClickFeedback, Et5Calibration, Et5Provider, OffsetParams, ResidualModel};
 use gaze_provider_webcam::{CameraPose, DEFAULT_SIGMA_DEG, SampleMeta, WebcamProvider};
 use tracing::{info, warn};
 
@@ -39,20 +40,56 @@ const DEFAULT_CALIBRATION_PATH : &str = "config/calibration.toml";
 /// Conventional ET5 calibration file, used when `--calibration` is not given.
 const DEFAULT_ET5_CALIBRATION_PATH : &str = "config/calibration-et5.toml";
 
+/// Conventional ET5 residual model, used when `--model` is not given.
+const DEFAULT_ET5_MODEL_PATH : &str = "config/model-et5.json";
+
 /// A discrete control the session acts on, whatever produced it.
 ///
 /// The mapping is fixed across providers: left commits, right exits, middle redetects, and
 /// the wheel scrolls. Only the device the events are read from changes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Control {
     /// Commit the currently snapped target.
     Commit,
+    /// Commit with the secondary button: a context menu where the primary would click.
+    Context,
     /// End the session.
     Exit,
     /// Force a detection pass on every output.
     Redetect,
     /// The wheel turned by this many whole detents, positive up.
     Wheel(i32),
+    /// The voice stack's push-to-talk key went down (`true`) or came back up. Forwarded
+    /// as F13 through the injector, nothing more: the voice stack owns what happens
+    /// while it is held.
+    PushToTalk {
+        /// Down when true, up when false.
+        down : bool,
+    },
+    /// The fine channel moved: the controller's thumb or wrist adjusting where the next
+    /// commit lands, relative to where gaze put it. See [`Refine`].
+    Refine(Refine),
+}
+
+/// The fine channel's gesture, as the session sees it.
+///
+/// A refine starts when the thumb lands on the controller's pad, moves the commit point
+/// by pixel deltas while it is down, and ends when it lifts. Where the gesture starts from
+/// is the session's business (the snap point if there is one, the gaze point otherwise),
+/// which is why the deltas are relative.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Refine {
+    /// The thumb landed: capture the anchor and put the pointer on it.
+    Begin,
+    /// Move the commit point by this much, in logical pixels.
+    Move {
+        /// Rightwards.
+        dx_px : f64,
+        /// Downwards.
+        dy_px : f64,
+    },
+    /// The thumb lifted. The refined point stands until the next commit or retarget.
+    End,
 }
 
 /// Running health of a webcam session, for the exit summary.
@@ -196,6 +233,25 @@ impl GazeSource {
         match self {
             GazeSource::Synthetic(provider) => Some(provider.truth()),
             _                               => None,
+        }
+    }
+
+    /// The clock real clicks must be stamped on to be attributed, when this source can
+    /// learn from them: the ET5 provider with a residual model loaded. `None` for every
+    /// other source, which is also the signal not to open the real mouse at all.
+    pub fn click_clock(&self) -> Option<Instant> {
+        match self {
+            GazeSource::Et5 { provider, .. } if provider.has_model() => Some(provider.started_at()),
+            _                                                         => None,
+        }
+    }
+
+    /// Hands a real click to the source's online offset. See
+    /// `Et5Provider::observe_click`; every other source ignores it.
+    pub fn observe_click(&mut self, px: GlobalPx, t_s: f64) -> Option<ClickFeedback> {
+        match self {
+            GazeSource::Et5 { provider, .. } => provider.observe_click(px, t_s),
+            _                                => None,
         }
     }
 
@@ -414,9 +470,39 @@ fn open_et5(args: &Args, geometry: &DesktopGeometry) -> Result<GazeSource> {
                (gaze-et5-cli calibrate fixes it)");
     }
 
+    let default_model = PathBuf::from(DEFAULT_ET5_MODEL_PATH);
+    let model_path    = args.model.clone()
+        .or_else(|| default_model.exists().then_some(default_model));
+
+    let model = {
+        match &model_path {
+            Some(path) => Some(ResidualModel::load(path)
+                .with_context(|| format!("loading {}", path.display()))?),
+            None       => None,
+        }
+    };
+
+    if model.is_none() {
+        info!("no residual model: the firmware's ray is used as is (gaze-et5-cli fit fits one)");
+    }
+
+    // A frozen offset is a gain of zero with nowhere to write: clicks are still
+    // attributed and logged, so a run can watch the leftovers without moving anything.
+    let (offset_path, offset_params) = {
+        if args.freeze_offset {
+            (None, OffsetParams { alpha: 0.0, ..OffsetParams::default() })
+        }
+        else {
+            (Some(args.offset.clone()), OffsetParams::default())
+        }
+    };
+
     let provider = Et5Provider::create()
         .geometry(geometry.clone())
         .calibration(calibration)
+        .model(model)
+        .offset_path(offset_path)
+        .offset_params(offset_params)
         .start()
         .context("starting the ET5 provider (tracker on the bus, nothing else holding it?)")?;
 
@@ -429,6 +515,9 @@ fn open_et5(args: &Args, geometry: &DesktopGeometry) -> Result<GazeSource> {
 
     info!(
         calibration = ?path.as_ref().map(|p| p.display().to_string()),
+        model       = ?model_path.as_ref().map(|p| p.display().to_string()),
+        offset      = %args.offset.display(),
+        frozen      = args.freeze_offset,
         device      = %buttons.path().display(),
         grabbed     = buttons.grabbed(),
         commits     = commit_note(buttons.grabbed()),

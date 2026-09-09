@@ -19,6 +19,7 @@
 //!   diff, check policy) and the firmware's per-point result table off its trailer.
 //! - [`retrain`]: the ceremony that writes the on-device eye model, once.
 //! - [`record`], [`dataset`]: recording sessions and the rows a model trains on.
+//! - [`model`], [`train`]: the residual model a frame runs through, and its fit.
 //! - [`triangulate`], [`pose`]: the plane pass geometry (ray-bundle intersection,
 //!   pose from points or rays).
 //! - [`provider`]: the `GazeProvider` implementation on top of it all.
@@ -29,11 +30,14 @@ pub mod dataset;
 pub mod device;
 pub mod field;
 pub mod gaze;
+pub mod model;
+pub mod offset;
 pub mod pose;
 pub mod provider;
 pub mod record;
 pub mod retrain;
 pub mod sweep;
+pub mod train;
 pub mod transport;
 pub mod triangulate;
 pub mod ttp;
@@ -42,5 +46,7 @@ pub use blob::{BlobCheck, BlobReport, CalibrationResult};
 pub use calibration::{Et5Calibration, HealthStop};
 pub use device::{ConnectOptions, Device, DeviceError};
 pub use gaze::Et5Frame;
+pub use model::{Features, ResidualModel};
+pub use offset::{ClickFeedback, OffsetParams, OnlineOffset};
 pub use provider::Et5Provider;
 pub use ttp::{DisplayArea, DisplayRect};

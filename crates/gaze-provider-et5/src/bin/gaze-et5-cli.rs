@@ -21,16 +21,21 @@ use gaze_provider_et5::blob::{
     decode_trailer, first_difference,
 };
 use gaze_provider_et5::calibration::{
-    CALIBRATION_FORMAT, Et5Calibration, OutputCalibration, OutputPose, VIRTUAL_AREA,
+    CALIBRATION_FORMAT, Et5Calibration, FieldFit, MIN_HEALTH_ROWS, OutputCalibration,
+    OutputPose, VIRTUAL_AREA,
 };
 use gaze_provider_et5::field::FieldMap;
 use gaze_provider_et5::device::{ConnectOptions, Device};
 use gaze_provider_et5::dataset;
 use gaze_provider_et5::gaze::combined_ray;
+use gaze_provider_et5::model::DEFAULT_MODEL_PATH;
+use gaze_provider_et5::train::{self, FitParams};
 use gaze_provider_et5::provider::Et5Provider;
 use gaze_provider_et5::record::{self, RecordConfig};
 use gaze_provider_et5::retrain::{self, RetrainConfig};
-use gaze_provider_et5::sweep::{self, SweepConfig, SweepError};
+use gaze_provider_et5::sweep::{self, SweepConfig, SweepError, SweepKey, desk_to_sensor, plane_corners};
+use gaze_daydream::{Button, Buttons, Controller};
+use crossbeam_channel::{Receiver, Sender};
 use gaze_provider_et5::ttp::{DisplayArea, DisplayRect};
 use gaze_provider_synthetic::GazeProvider;
 use gaze_snap::FilterStack;
@@ -44,6 +49,13 @@ const DEFAULT_BLOB_PATH: &str = "config/calibration-et5.bin";
 /// at, millimetres. The eye is not measured here, so this is the desk's nominal
 /// distance and the degrees are indicative, not the health check's numbers.
 const NOMINAL_VIEW_MM: f64 = 650.0;
+
+/// Half-width of the `info` gauges, degrees: a mark at either end means the eyes are
+/// this far off the sensor axis or further.
+const GAUGE_SPAN_DEG: f64 = 20.0;
+
+/// Cells on either side of the gauge's centre.
+const GAUGE_HALF_CELLS: i64 = 8;
 
 /// Directory archived passes accumulate in for pooled head-gain fits. Under
 /// `config/calibration*` so the standard gitignore covers it.
@@ -79,12 +91,30 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Connect, print the device display area, and stream per-second tracking
-    /// stats (rate, tracked %, median eye origin) — the mount-adjustment feedback
-    /// loop: tune the tilt until the rate is high and the origin lands sanely.
+    /// stats — the mount-adjustment feedback loop. Each line: frame rate, the share
+    /// of frames with either eye and with each eye, the median eye origin in the
+    /// sensor frame, and where that origin sits in the sensor's field as azimuth
+    /// (positive right) and elevation (positive up) off its axis plus distance, with
+    /// a gauge for each angle. Aim the mount so both angles sit near zero and the
+    /// distance lands in the tracker's 450 to 950 mm range; the frame rate rises and
+    /// the tracked share goes to 100% as it does.
+    ///
+    /// A replugged tracker is back on its factory-default eye model and streams
+    /// nothing at any aim, so this uploads the saved blob the way the provider does
+    /// on every connect, under the virtual plane. Pass `--no-blob` to look at
+    /// whatever the flash holds.
     Info {
-        /// How long to sample.
+        /// How long to sample; 0 runs until Ctrl-C.
         #[arg(long, default_value_t = 4.0)]
         seconds : f64,
+
+        /// The eye model to upload before sampling.
+        #[arg(long, default_value = DEFAULT_BLOB_PATH)]
+        blob    : PathBuf,
+
+        /// Do not upload anything; run on the model in the flash.
+        #[arg(long)]
+        no_blob : bool,
     },
 
     /// Stream decoded frames: JSONL to a file, one summary line per second to stderr.
@@ -159,11 +189,14 @@ enum Command {
 
     /// Retrain the on-device eye model: six gaze-gated rounds (centre, mid-edges,
     /// corners) on black and then white over a 600x340 mm training area, with
-    /// `cal_points_apply` after each round, followed by a 3x3 health check. The
+    /// `cal_points_apply` after each round, followed by a health check (4x4 by
+    /// default) that the client-side correction field is then fitted from. The
     /// session is seeded with the blob it is about to replace, so the rounds are
     /// collected through a working model. Writes the device's model and is meant to
-    /// be run once per mount. Keys: Enter forces the current point in, `s` skips it,
-    /// `q` aborts without committing.
+    /// be run once per mount. Keys: Enter forces the current point in, `c` commits it
+    /// (the vote checks it), `s` skips it, `q` aborts without committing. With
+    /// `--daydream` the controller's pad click commits, App skips and Home aborts,
+    /// and the gate no longer accepts on its own: every point is yours to take.
     Calibrate {
         /// Where the client-side calibration is written.
         #[arg(long, default_value = DEFAULT_CALIBRATION_PATH)]
@@ -228,6 +261,25 @@ enum Command {
         /// the raw reply. Exploratory; nothing depends on it.
         #[arg(long)]
         suggest : bool,
+
+        /// Take points from the Daydream controller: pad click commits (checked
+        /// against the gate's vote), App skips, Home aborts. Implies `--manual`.
+        #[arg(long)]
+        daydream : bool,
+
+        /// The controller's Bluetooth address, when more than one is paired.
+        #[arg(long, requires = "daydream")]
+        daydream_address : Option<String>,
+
+        /// Never accept a point on the gate's vote alone: only a commit (`c` or the
+        /// controller) or Enter takes one, and the dwell fallback is off.
+        #[arg(long)]
+        manual : bool,
+
+        /// Health-check stops per axis. The correction field is fitted from these,
+        /// so more is better up to patience: 4 is sixteen seconds.
+        #[arg(long, default_value_t = retrain::HEALTH_STEPS)]
+        health_grid : usize,
 
         /// Print the plane, the training area, the points, the seed decision and the
         /// round schedule, then exit. Touches neither the device nor the compositor.
@@ -295,6 +347,15 @@ enum Command {
         #[arg(long, default_value = "")]
         note : String,
 
+        /// Advance and skip from the Daydream controller as well: pad click advances,
+        /// App skips, Home ends the phase.
+        #[arg(long)]
+        daydream : bool,
+
+        /// The controller's Bluetooth address, when more than one is paired.
+        #[arg(long, requires = "daydream")]
+        daydream_address : Option<String>,
+
         /// Half-angle of the gaze cone the stop grid is laid inside, degrees.
         #[arg(long, default_value_t = record::CONE_MAX_DEG)]
         cone_deg : f64,
@@ -316,6 +377,52 @@ enum Command {
         dry_run : bool,
     },
 
+    /// Fit the residual model (PLAN-ET5 D2) from session files: leave-one-session-out
+    /// evaluation first, then a fit on everything, written as JSON for the provider.
+    /// Only sessions recorded under the calibration's device blob are used; the
+    /// firmware residual is that model's, and another blob's rows describe a
+    /// different device. Needs neither the device nor a compositor.
+    Fit {
+        /// Session files, or directories of them.
+        #[arg(long, num_args = 1.., default_value = DEFAULT_SESSIONS_DIR)]
+        sessions : Vec<PathBuf>,
+
+        /// Where the model goes.
+        #[arg(long, default_value = DEFAULT_MODEL_PATH)]
+        out : PathBuf,
+
+        /// Calibration whose device blob the sessions have to match.
+        #[arg(long, default_value = DEFAULT_CALIBRATION_PATH)]
+        calibration : PathBuf,
+
+        /// ARD length scale in standardised units.
+        #[arg(long, default_value_t = 2.0)]
+        length_scale : f64,
+
+        /// Ridge on the kernel weights.
+        #[arg(long, default_value_t = 3.0)]
+        ridge : f64,
+
+        /// Inducing points.
+        #[arg(long, default_value_t = 200)]
+        centers : usize,
+
+        /// Clicks with a firmware residual at or past this many degrees are not
+        /// trained on: those are look-away clicks, not calibration error.
+        #[arg(long, default_value_t = 8.0)]
+        cap_deg : f64,
+
+        /// Use every exported feature (head position, interocular vector, lagged
+        /// head) instead of the per-eye direction field. Worse held out on the
+        /// 2026-09-04 data; kept for the comparison.
+        #[arg(long)]
+        all_features : bool,
+
+        /// Evaluate and report without writing the model.
+        #[arg(long)]
+        dry_run : bool,
+    },
+
     /// Session-file utilities.
     Sessions {
         #[command(subcommand)]
@@ -328,11 +435,61 @@ enum Command {
         command : DatasetCommand,
     },
 
-    /// Draw the live gaze point on every display until interrupted.
-    View {
-        /// Client-side calibration to apply; omit for the raw mapping.
+    /// Run the health check alone against the committed model: upload the blob,
+    /// declare the trained plane, dwell on an n by n grid of stops, replace the
+    /// calibration's health table with the result and refit the correction field
+    /// from it. Sixteen seconds at the default grid; no retrain. Home or `q` aborts.
+    Health {
+        /// Where the calibration is read from and written back to.
+        #[arg(long, default_value = DEFAULT_CALIBRATION_PATH)]
+        calibration : PathBuf,
+
+        /// The eye model to upload before measuring.
+        #[arg(long, default_value = DEFAULT_BLOB_PATH)]
+        blob : PathBuf,
+
+        /// Stops per axis.
+        #[arg(long, default_value_t = retrain::HEALTH_STEPS)]
+        grid : usize,
+
+        /// Read the Daydream controller too, for Home to abort.
         #[arg(long)]
+        daydream : bool,
+
+        /// The controller's Bluetooth address, when more than one is paired.
+        #[arg(long, requires = "daydream")]
+        daydream_address : Option<String>,
+    },
+
+    /// Refit the direct display's correction field from the health stops already in
+    /// the calibration file, and write it back. What `calibrate` does at the end of
+    /// a ceremony, for a file written before it did or after editing the desk config.
+    /// Needs neither the device nor a compositor.
+    FitField {
+        /// The calibration to refit in place.
+        #[arg(long, default_value = DEFAULT_CALIBRATION_PATH)]
+        calibration : PathBuf,
+
+        /// Print the fit and exit without writing.
+        #[arg(long)]
+        dry_run     : bool,
+    },
+
+    /// Draw the live gaze point on every display until interrupted.
+    ///
+    /// Three mappings: `--calibration` applies a sweep's client-side fits; `--direct`
+    /// declares one display's configured plane to the firmware and draws its own 2D
+    /// output on that display, no client fit at all (the range check after a remount:
+    /// where the eyes can and cannot be followed, whatever the bias); neither is the
+    /// raw ray against the configured desk.
+    View {
+        /// Client-side calibration to apply.
+        #[arg(long, conflicts_with = "direct")]
         calibration : Option<PathBuf>,
+
+        /// Connector to declare and draw on directly, from the desk config's pose.
+        #[arg(long)]
+        direct      : Option<String>,
     },
 }
 
@@ -390,7 +547,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Info { seconds }           => info(seconds),
+        Command::Info { seconds, blob, no_blob } => info(seconds, &blob, no_blob),
         Command::Dump { seconds, jsonl }    => dump(&cli.config, seconds, jsonl.as_deref()),
         Command::SetDisplayArea { w, h, ox, oy, z } => {
             set_display_area(DisplayRect { w_mm: w, h_mm: h, ox_mm: ox, oy_mm: oy, z_mm: z })
@@ -417,6 +574,10 @@ fn main() -> Result<()> {
             apply_from_round,
             min_points,
             suggest,
+            daydream,
+            daydream_address,
+            manual,
+            health_grid,
             dry_run,
         } => calibrate(CalibrateArgs {
             config           : cli.config.clone(),
@@ -433,6 +594,10 @@ fn main() -> Result<()> {
             apply_from_round : apply_from_round,
             min_points       : min_points,
             suggest          : suggest,
+            daydream         : daydream,
+            daydream_address : daydream_address,
+            manual           : manual || daydream,
+            health_grid      : health_grid,
             dry_run          : dry_run,
         }),
         Command::Refit { readings, out }    => refit_cmd(&cli.config, &readings, &out),
@@ -445,16 +610,39 @@ fn main() -> Result<()> {
             display,
             out,
             note,
+            daydream,
+            daydream_address,
             cone_deg,
             grid,
             glasses,
             no_glasses,
             dry_run,
         } => record_cmd(&cli.config, minutes, &calibration, display, &out, note,
-                        cone_deg, &grid, glasses, no_glasses, dry_run),
+                        daydream, daydream_address.as_deref(), cone_deg, &grid, glasses,
+                        no_glasses, dry_run),
+        Command::Fit {
+            sessions, out, calibration, length_scale, ridge, centers, cap_deg,
+            all_features, dry_run,
+        } => {
+            let params = FitParams {
+                length_scale : length_scale,
+                ridge        : ridge,
+                centers      : centers,
+                cap_deg      : cap_deg,
+                ..if all_features { FitParams::all_features() } else { FitParams::position_field() }
+            };
+
+            fit_cmd(&cli.config, &sessions, &out, &calibration, &params, dry_run)
+        }
         Command::Sessions { command }       => sessions_cmd(&cli.config, command),
         Command::Dataset { command }        => dataset_cmd(&cli.config, command),
-        Command::View { calibration }       => view(&cli.config, calibration.as_deref()),
+        Command::Health { calibration, blob, grid, daydream, daydream_address } => {
+            health_cmd(&cli.config, &calibration, &blob, grid, daydream, daydream_address.as_deref())
+        }
+        Command::FitField { calibration, dry_run } => fit_field(&cli.config, &calibration, dry_run),
+        Command::View { calibration, direct } => {
+            view(&cli.config, calibration.as_deref(), direct.as_deref())
+        }
     }
 }
 
@@ -485,8 +673,38 @@ fn load_tracker_pitch(path: &std::path::Path) -> f64 {
 
 // --- Commands ---
 
-fn info(seconds: f64) -> Result<()> {
-    let mut device = Device::connect().context("connecting to the ET5")?;
+fn info(seconds: f64, blob: &std::path::Path, no_blob: bool) -> Result<()> {
+    let upload = {
+        if no_blob {
+            None
+        }
+        else {
+            match std::fs::read(blob) {
+                Ok(bytes) => Some(bytes),
+                Err(e)    => {
+                    println!("no eye model to upload ({}: {e}); running on the flash", blob.display());
+
+                    None
+                }
+            }
+        }
+    };
+
+    let mut device = match upload {
+        Some(bytes) => {
+            println!("uploading {} from {} (do not interrupt)", BlobReport::of(&bytes), blob.display());
+
+            Device::connect_with(ConnectOptions {
+                blob          : Some(bytes),
+                area          : Some(DisplayArea::from_rect(VIRTUAL_AREA)),
+                double_upload : false,
+                check         : BlobCheck::default(),
+            })
+            .context("connecting to the ET5 with the eye model")?
+        }
+        None => Device::connect().context("connecting to the ET5")?,
+    };
+
     println!("connected and handshaken");
 
     match device.display_area() {
@@ -519,14 +737,17 @@ fn info(seconds: f64) -> Result<()> {
 
     // Per-second stats: search mode shows ~30-40 Hz with 0% tracked; a locked face
     // runs 90+ Hz with most frames valid. The origin line is what pins down the
-    // mount pitch (see desk.toml).
+    // mount pitch (see desk.toml); the angles say where the eyes sit in the field.
     let rx       = device.gaze_stream();
-    let deadline = Instant::now() + Duration::from_secs_f64(seconds);
+    let forever  = seconds <= 0.0;
+    let deadline = Instant::now() + Duration::from_secs_f64(seconds.max(0.0));
 
-    while Instant::now() < deadline {
+    while forever || Instant::now() < deadline {
         let second  = Instant::now() + Duration::from_secs(1);
         let mut n       = 0u32;
         let mut valid   = 0u32;
+        let mut left_n  = 0u32;
+        let mut right_n = 0u32;
         let mut origins : Vec<[f64; 3]> = Vec::new();
 
         while Instant::now() < second {
@@ -543,42 +764,88 @@ fn info(seconds: f64) -> Result<()> {
             let l = frame.left_valid().then_some(frame.eye_origin_l_mm).flatten();
             let r = frame.right_valid().then_some(frame.eye_origin_r_mm).flatten();
 
-            if let (Some(l), Some(r)) = (l, r) {
-                origins.push([
+            left_n  += u32::from(l.is_some());
+            right_n += u32::from(r.is_some());
+
+            // One eye is enough to place the head; both is better.
+            match (l, r) {
+                (Some(l), Some(r)) => origins.push([
                     (l[0] + r[0]) * 0.5,
                     (l[1] + r[1]) * 0.5,
                     (l[2] + r[2]) * 0.5,
-                ]);
+                ]),
+                (Some(o), None) | (None, Some(o)) => origins.push(o),
+                (None, None)                      => {}
             }
         }
 
-        let med = |mut v: Vec<f64>| {
-            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            v[v.len() / 2]
-        };
+        let pct = |k: u32| 100.0 * f64::from(k) / f64::from(n.max(1));
 
-        let origin = {
+        let placement = {
             if origins.is_empty() {
-                "-".to_string()
+                "eye origin (sensor mm) -".to_string()
             }
             else {
+                let o = [
+                    median(origins.iter().map(|o| o[0]).collect()),
+                    median(origins.iter().map(|o| o[1]).collect()),
+                    median(origins.iter().map(|o| o[2]).collect()),
+                ];
+
+                let az_deg   = o[0].atan2(o[2]).to_degrees();
+                let el_deg   = o[1].atan2(o[2]).to_degrees();
+                let dist_mm  = (o[0] * o[0] + o[1] * o[1] + o[2] * o[2]).sqrt();
+
                 format!(
-                    "({:.0}, {:.0}, {:.0})",
-                    med(origins.iter().map(|o| o[0]).collect()),
-                    med(origins.iter().map(|o| o[1]).collect()),
-                    med(origins.iter().map(|o| o[2]).collect()),
+                    "eye origin (sensor mm) ({:.0}, {:.0}, {:.0})  az {:>+5.1}° {}  el {:>+5.1}° {}  dist {:>4.0} mm",
+                    o[0], o[1], o[2],
+                    az_deg, gauge(az_deg, GAUGE_SPAN_DEG),
+                    el_deg, gauge(el_deg, GAUGE_SPAN_DEG),
+                    dist_mm,
                 )
             }
         };
 
         println!(
-            "rate {:>3} Hz  tracked {:>3.0}%  eye origin (sensor mm) {origin}",
+            "rate {:>3} Hz  tracked {:>3.0}% (L {:>3.0}% R {:>3.0}%)  {placement}",
             n,
-            100.0 * valid as f64 / n.max(1) as f64,
+            pct(valid),
+            pct(left_n),
+            pct(right_n),
         );
     }
 
     Ok(())
+}
+
+/// Median of `v`; `v` must not be empty.
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
+
+/// A one-line gauge of `value` over `[-span, span]`: `[.......|#.......]`, the centre
+/// bar being zero and the mark clamped to the ends.
+fn gauge(value: f64, span: f64) -> String {
+    let cells = GAUGE_HALF_CELLS;
+    let pos   = ((value / span) * cells as f64).round() as i64;
+    let pos   = pos.clamp(-cells, cells);
+
+    let mut out = String::with_capacity((2 * cells + 3) as usize);
+
+    out.push('[');
+
+    for i in -cells..=cells {
+        out.push(match (i == pos, i == 0) {
+            (true, _)      => '#',
+            (false, true)  => '|',
+            (false, false) => '.',
+        });
+    }
+
+    out.push(']');
+
+    out
 }
 
 fn dump(config: &std::path::Path, seconds: f64, jsonl: Option<&std::path::Path>)
@@ -998,8 +1265,219 @@ struct CalibrateArgs {
     min_points       : usize,
     /// Query the point suggestion after each round.
     suggest          : bool,
+    /// Read the Daydream controller as a key source.
+    daydream         : bool,
+    /// Its address, when more than one is paired.
+    daydream_address : Option<String>,
+    /// Accept only on a commit or Enter.
+    manual           : bool,
+    /// Health-check stops per axis.
+    health_grid      : usize,
     /// Print the plan and exit.
     dry_run          : bool,
+}
+
+/// The keys a ceremony listens to: stdin always, and the Daydream controller when
+/// asked, both into one channel. On the controller the pad click commits, App skips
+/// and Home quits; there is no Advance, since Enter is the operator's override and a
+/// thumb should not have it.
+fn key_sources(daydream: bool, address: Option<&str>) -> Result<Receiver<SweepKey>> {
+    let (tx, rx) = crossbeam_channel::unbounded();
+
+    sweep::terminal_keys_into(tx.clone());
+
+    if daydream {
+        let controller = Controller::open(address).context("opening the Daydream controller")?;
+
+        println!("daydream controller {}: pad click commits, App skips, Home aborts",
+                 controller.address());
+
+        std::thread::Builder::new()
+            .name("daydream-keys".into())
+            .spawn(move || controller_keys(controller, tx))
+            .context("spawning the controller key thread")?;
+    }
+
+    Ok(rx)
+}
+
+/// Turns the controller's button press edges into sweep keys until the channel
+/// closes. Holds the controller for as long as it runs, so the link stays up.
+fn controller_keys(controller: Controller, tx: Sender<SweepKey>) {
+    let mut buttons = Buttons::default();
+
+    loop {
+        for report in controller.reports() {
+            for button in report.packet.buttons.pressed_since(buttons) {
+                let key = match button {
+                    Button::Click => Some(SweepKey::Commit),
+                    Button::App   => Some(SweepKey::Skip),
+                    Button::Home  => Some(SweepKey::Quit),
+                    _             => None,
+                };
+
+                if let Some(key) = key
+                    && tx.send(key).is_err()
+                {
+                    return;
+                }
+            }
+
+            buttons = report.packet.buttons;
+        }
+
+        std::thread::sleep(Duration::from_millis(8));
+    }
+}
+
+/// Prints what the health-check field fit decided, in degrees at the desk's nominal
+/// distance so it reads next to the health line.
+fn report_field_fit(fit: Option<FieldFit>, out: &gaze_core::OutputGeometry) {
+    let Some(fit) = fit else {
+        println!("correction field: not fitted (fewer than {MIN_HEALTH_ROWS} health stops)");
+
+        return;
+    };
+
+    // Normalised units are half the panel per axis, so one unit of rms is a different
+    // distance across and down; quote both rather than pretend to a single degree.
+    let mm = |rms: f64| format!("{:.0} mm across / {:.0} mm down",
+                                rms * out.physical_w_mm * 0.5, rms * out.physical_h_mm * 0.5);
+
+    if fit.score < fit.identity_rms {
+        println!("correction field: {:?} from {} health stops; rms {:.3} -> {:.3} held out \
+                  (one unit is {})",
+                 fit.degree, fit.rows, fit.identity_rms, fit.score, mm(1.0));
+    }
+    else {
+        println!("correction field: identity kept; no degree beat the raw model's rms of \
+                  {:.3} over {} health stops (that is {})",
+                 fit.identity_rms, fit.rows, mm(fit.identity_rms));
+    }
+}
+
+/// Measures the committed model on a fresh health grid and refits the field from it.
+fn health_cmd(
+    config      : &std::path::Path,
+    calibration : &std::path::Path,
+    blob        : &std::path::Path,
+    grid        : usize,
+    daydream    : bool,
+    address     : Option<&str>,
+)
+    -> Result<()>
+{
+    let geometry = load_geometry(config)?;
+    let mut cal  = Et5Calibration::load(calibration)
+        .with_context(|| format!("loading {}", calibration.display()))?;
+
+    let name = cal.device_output.clone().context("the calibration has no direct display")?;
+    let area = cal.device_area.context("the calibration has no trained plane")?;
+    let out  = geometry.outputs.iter()
+        .find(|o| o.name == name)
+        .with_context(|| format!("no output named {name} in the desk config"))?;
+
+    let bytes  = std::fs::read(blob).with_context(|| format!("reading {}", blob.display()))?;
+    let report = BlobReport::of(&bytes);
+
+    if cal.device_blob_sha256.as_deref() != Some(report.body_sha256.as_str()) {
+        bail!("{} is not the model {} was calibrated against ({} vs {:?})",
+              blob.display(), calibration.display(), report.short(), cal.device_blob_sha256);
+    }
+
+    let retrain_config = RetrainConfig {
+        display           : name.clone(),
+        tracker_pitch_deg : load_tracker_pitch(config),
+        health_steps      : grid.max(2),
+        ..RetrainConfig::default()
+    };
+
+    let plan = retrain::plan(&geometry, &retrain_config)
+        .map_err(|e| anyhow::anyhow!("planning the health grid: {e}"))?;
+
+    // The grid is laid out over the plan's training rectangle, so the file's plane
+    // and the plan's must agree or the stops would be measured against one plane
+    // and reported against another.
+    if plan.area != area {
+        bail!("the desk config now yields a different plane than {} was trained on; \
+               re-run calibrate rather than measuring across the two",
+              calibration.display());
+    }
+
+    println!("uploading {report} and declaring the trained plane (do not interrupt)");
+
+    let mut device = Device::connect_with(ConnectOptions {
+        blob          : Some(bytes),
+        area          : Some(area),
+        double_upload : false,
+        check         : BlobCheck::default(),
+    })
+    .context("connecting to the ET5 with the eye model")?;
+
+    let (overlay, join) = Overlay::spawn().context("spawning the overlay")?;
+    let keys = key_sources(daydream, address)?;
+
+    println!("health check: {} stops, a second each, eyes on the dot",
+             retrain_config.health_steps * retrain_config.health_steps);
+
+    let health = retrain::run_health(&mut device, &geometry, &overlay, Some(&keys),
+                                     &retrain_config, &plan);
+
+    overlay.stop();
+    let _ = join.join();
+
+    let health = health.map_err(|e| anyhow::anyhow!("health check did not finish: {e}"))?;
+
+    if let Some((rms, median)) = retrain::health_summary(&health) {
+        println!("health: {} stops, {rms:.2} deg rms, {median:.2} deg median", health.len());
+    }
+
+    cal.health = health;
+
+    report_field_fit(cal.fit_field_from_health(), out);
+
+    if let Some(kept) = retrain::keep_previous(calibration)? {
+        println!("previous calibration kept at {}", kept.display());
+    }
+
+    cal.save(calibration).with_context(|| format!("writing {}", calibration.display()))?;
+    println!("health and field written to {}", calibration.display());
+
+    Ok(())
+}
+
+/// Refits the field in an existing calibration file from its health stops.
+fn fit_field(config: &std::path::Path, calibration: &std::path::Path, dry_run: bool) -> Result<()> {
+    let geometry = load_geometry(config)?;
+    let mut cal  = Et5Calibration::load(calibration)
+        .with_context(|| format!("loading {}", calibration.display()))?;
+
+    let name = cal.device_output.clone().context("the calibration has no direct display")?;
+    let out  = geometry.outputs.iter()
+        .find(|o| o.name == name)
+        .with_context(|| format!("no output named {name} in the desk config"))?;
+
+    println!("{} health stops for {name}", cal.health.len());
+
+    let before = cal.output(&name).map(|e| e.field.clone());
+
+    report_field_fit(cal.fit_field_from_health(), out);
+
+    let after = cal.output(&name).map(|e| e.field.clone());
+
+    if dry_run {
+        println!("dry run: {} not written", calibration.display());
+    }
+    else if before == after {
+        println!("field unchanged; {} left as it was", calibration.display());
+    }
+    else {
+        cal.save(calibration)
+            .with_context(|| format!("writing {}", calibration.display()))?;
+        println!("field written to {}", calibration.display());
+    }
+
+    Ok(())
 }
 
 /// Runs the retrain ceremony, or prints its schedule under `--dry-run`.
@@ -1021,6 +1499,8 @@ fn calibrate(args: CalibrateArgs) -> Result<()> {
         apply_from_round  : args.apply_from_round,
         min_points        : args.min_points,
         suggest           : args.suggest,
+        manual            : args.manual,
+        health_steps      : args.health_grid.max(2),
     };
 
     let plan = retrain::plan(&geometry, &retrain_config)?;
@@ -1054,10 +1534,15 @@ fn calibrate(args: CalibrateArgs) -> Result<()> {
     let mut device = Device::connect().context("connecting to the ET5")?;
 
     let (overlay, join) = Overlay::spawn().context("spawning the overlay")?;
-    let keys = sweep::terminal_keys();
+    let keys = key_sources(args.daydream, args.daydream_address.as_deref())?;
 
-    println!("eyes on the dot and hold still until it moves. Enter forces the current \
-              point in, s skips it, q aborts (nothing is written).");
+    match args.manual {
+        true  => println!("eyes on the dot, settle, then click (or c) to take it. Enter \
+                           forces the current point in, s skips it, q aborts (nothing \
+                           is written)."),
+        false => println!("eyes on the dot and hold still until it moves. Enter forces the \
+                           current point in, s skips it, q aborts (nothing is written)."),
+    }
 
     let outcome = retrain::run_retrain(&mut device, &overlay, Some(&keys),
                                        &retrain_config, &plan, seed.seed.as_ref());
@@ -1123,10 +1608,10 @@ fn calibrate(args: CalibrateArgs) -> Result<()> {
     println!("ceremony summary:");
 
     for (number, round) in outcome.rounds.iter().enumerate() {
-        println!("  round {}/{} {:<9} ({:<5}) {} accepted ({} gate, {} dwell, {} \
-                  forced), {} skipped, {}",
+        println!("  round {}/{} {:<9} ({:<5}) {} accepted ({} gate, {} clicked, {} dwell, \
+                  {} forced), {} skipped, {}",
                  number + 1, outcome.rounds.len(), round.name, round.background.name(),
-                 round.accepted(), round.gate, round.dwell, round.forced,
+                 round.accepted(), round.gate, round.clicked, round.dwell, round.forced,
                  round.skipped,
                  if round.applied { "applied" } else { "not applied" });
     }
@@ -1139,7 +1624,8 @@ fn calibrate(args: CalibrateArgs) -> Result<()> {
 
     // The health check reads the model that was just committed. A failure here loses
     // numbers, not the retrain, so it never stops the files being written.
-    println!("health check: nine stops, a second each, eyes on the dot");
+    println!("health check: {} stops, a second each, eyes on the dot",
+             retrain_config.health_steps * retrain_config.health_steps);
 
     let health = {
         match retrain::run_health(&mut device, &geometry, &overlay, Some(&keys),
@@ -1239,8 +1725,8 @@ fn calibrate(args: CalibrateArgs) -> Result<()> {
                 pitch_deg   : out_geometry.pitch_deg,
                 roll_deg    : out_geometry.roll_deg,
             },
-            // No client-side correction: the firmware model is the whole mapping
-            // until the Phase D residual model lands.
+            // Replaced below by the field fitted from the health check, when it
+            // beats leaving the firmware's mapping alone.
             field          : FieldMap::identity(),
             pose_rms_deg   : 0.0,
             field_rms_norm : 0.0,
@@ -1249,6 +1735,10 @@ fn calibrate(args: CalibrateArgs) -> Result<()> {
         }],
         health             : health,
     };
+
+    let mut calibration = calibration;
+
+    report_field_fit(calibration.fit_field_from_health(), out_geometry);
 
     if let Some(kept) = retrain::keep_previous(out)? {
         println!("previous calibration kept at {}", kept.display());
@@ -1299,6 +1789,12 @@ fn print_plan(
     println!("seed: {}", seed.why);
 
     match plan.tol_uv {
+        None if config.manual => {
+            println!("acceptance: manual — a pad click or `c` takes the point when the \
+                      vote names it in at least half of the last {} frames, Enter \
+                      forces it; nothing is accepted on the vote alone",
+                     retrain::GATE_WINDOW);
+        }
         None               => {
             println!("acceptance: nearest-target vote only ({} of the last {} frames \
                       within {:.0}s), no accuracy radius",
@@ -1419,6 +1915,8 @@ fn record_cmd(
     display     : Option<String>,
     out         : &std::path::Path,
     note        : String,
+    daydream    : bool,
+    address     : Option<&str>,
     cone_deg    : f64,
     grid        : &str,
     glasses     : bool,
@@ -1487,11 +1985,11 @@ fn record_cmd(
     let mut device = Device::connect().context("connecting to the ET5")?;
 
     let (overlay, join) = Overlay::spawn().context("spawning the overlay")?;
-    let keys = sweep::terminal_keys();
+    let keys = key_sources(daydream, address)?;
 
     println!("record: eyes on the dot throughout. The screen goes black, then white; \
-              do what the caption says during the wander. Enter advances, s skips a \
-              stop, q ends the current phase early.");
+              do what the caption says during the wander. Enter (or the pad) advances, \
+              s (or App) skips a stop, q (or Home) ends the current phase early.");
 
     let outcome = record::run_record(&mut device, &geometry, area, &overlay, Some(&keys),
                                      &record_config, &desk);
@@ -1513,6 +2011,87 @@ fn record_cmd(
                   two different firmware models and should not be trained on",
                  outcome.blob_start.short(), outcome.blob_end.short());
     }
+
+    Ok(())
+}
+
+/// `fit`: rows from the sessions under the calibration's blob, a leave-one-session-out
+/// report, then the model fitted on all of them.
+fn fit_cmd(
+    config      : &std::path::Path,
+    sessions    : &[PathBuf],
+    out         : &std::path::Path,
+    calibration : &std::path::Path,
+    params      : &FitParams,
+    dry_run     : bool,
+)
+    -> Result<()>
+{
+    let geometry = load_geometry(config)?;
+
+    let wanted = Et5Calibration::load(calibration)
+        .with_context(|| format!("loading {}", calibration.display()))?
+        .device_blob_sha256
+        .context("the calibration names no device blob; retrain first")?;
+
+    // Keep the sessions under the calibration's blob and remember the pitch they
+    // were recorded under, which the provider needs to place the corrected ray.
+    let mut files = Vec::new();
+    let mut pitch = None;
+
+    for path in dataset::expand(sessions)? {
+        let session = dataset::Session::load(&path)?;
+
+        if session.meta.blob_sha256 != wanted {
+            println!("skipping {}: blob {} is not the calibration's {}",
+                     path.display(), &session.meta.blob_sha256[..8], &wanted[..8]);
+
+            continue;
+        }
+
+        match pitch {
+            None                             => pitch = Some(session.meta.tracker_pitch_deg),
+            Some(p) if p == session.meta.tracker_pitch_deg => {}
+            Some(p)                          => bail!(
+                "{} was recorded at {} degrees of tracker pitch, others at {p}",
+                path.display(), session.meta.tracker_pitch_deg,
+            ),
+        }
+
+        files.push(path);
+    }
+
+    let pitch = pitch.context("no session matches the calibration's blob")?;
+    let rows  = dataset::load_rows(&files, &geometry)?;
+    let sel   = train::select(&rows);
+
+    println!("{} session file(s), {} rows, {} training clicks (one row each, carets \
+              refused, cap {} deg at fit time)",
+             files.len(), rows.len(), sel.len(), params.cap_deg);
+    println!("features {:?}, explicit {:?}, length scale {}, ridge {}, centres {}",
+             params.features, params.explicit, params.length_scale, params.ridge,
+             params.centers);
+
+    let report = train::evaluate(&sel, params)?;
+
+    println!("leave-one-session-out, per-click residual (deg):");
+    println!("  firmware  p50 {:.2}  p90 {:.2}", report.firmware_p50_deg, report.firmware_p90_deg);
+    println!("  model     p50 {:.2}  p90 {:.2}", report.model_p50_deg   , report.model_p90_deg);
+
+    for (session, p50) in report.sessions.iter().zip(&report.per_session_p50) {
+        println!("  {session}: firmware {:.2} -> model {:.2}", p50[0], p50[1]);
+    }
+
+    if dry_run {
+        return Ok(());
+    }
+
+    let mut model = train::fit(&sel, params, Some(wanted), pitch)?;
+    model.report = Some(report);
+    model.save(out)?;
+
+    println!("model written to {} ({} centres, fade {:.3}..{:.3} deg^2)",
+             out.display(), model.centers(), model.var_fade_lo, model.var_fade_hi);
 
     Ok(())
 }
@@ -1653,14 +2232,17 @@ fn refit_cmd(config: &std::path::Path, readings: &std::path::Path, out: &std::pa
     Ok(())
 }
 
-fn view(config: &std::path::Path, calibration: Option<&std::path::Path>) -> Result<()> {
+fn view(config: &std::path::Path, calibration: Option<&std::path::Path>, direct: Option<&str>)
+    -> Result<()>
+{
     let geometry = load_geometry(config)?;
 
     let calibration = {
-        match calibration {
-            Some(path) => Some(Et5Calibration::load(path)
+        match (calibration, direct) {
+            (Some(path), _) => Some(Et5Calibration::load(path)
                 .with_context(|| format!("loading {}", path.display()))?),
-            None       => None,
+            (None, Some(name)) => Some(direct_calibration(&geometry, name, load_tracker_pitch(config))?),
+            (None, None)       => None,
         }
     };
 
@@ -1728,6 +2310,46 @@ fn view(config: &std::path::Path, calibration: Option<&std::path::Path>) -> Resu
     let _ = join.join();
 
     Ok(())
+}
+
+/// A calibration that is nothing but a plane: `name`'s configured pose, pitched into
+/// the sensor frame, as the direct-mode display, with no fits at all. Under it the
+/// provider declares that plane and maps the firmware's 2D output straight onto the
+/// display's logical rect, and disables every other output. The eye model in the
+/// flash is whatever it is; the point's bias is not the question this answers.
+fn direct_calibration(geometry: &DesktopGeometry, name: &str, tracker_pitch_deg: f64)
+    -> Result<Et5Calibration>
+{
+    let out = geometry.outputs.iter()
+        .find(|o| o.name == name)
+        .ok_or_else(|| anyhow::anyhow!("no output named {name} in the desk config"))?;
+
+    let desk = plane_corners(out);
+    let area = DisplayArea {
+        tl_mm : desk_to_sensor(desk.tl_mm, tracker_pitch_deg),
+        tr_mm : desk_to_sensor(desk.tr_mm, tracker_pitch_deg),
+        bl_mm : desk_to_sensor(desk.bl_mm, tracker_pitch_deg),
+    };
+
+    println!(
+        "direct on {name}: declaring tl=({:.0}, {:.0}, {:.0}) tr=({:.0}, {:.0}, {:.0}) \
+         bl=({:.0}, {:.0}, {:.0}) sensor mm",
+        area.tl_mm[0], area.tl_mm[1], area.tl_mm[2],
+        area.tr_mm[0], area.tr_mm[1], area.tr_mm[2],
+        area.bl_mm[0], area.bl_mm[1], area.bl_mm[2],
+    );
+
+    Ok(Et5Calibration {
+        format             : CALIBRATION_FORMAT,
+        created_unix_s     : Et5Calibration::now_unix_s(),
+        lag_s              : 0.0,
+        device_output      : Some(name.to_string()),
+        device_area        : Some(area),
+        device_blob_sha256 : None,
+        device_result      : None,
+        outputs            : Vec::new(),
+        health             : Vec::new(),
+    })
 }
 
 // --- Helpers ---

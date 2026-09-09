@@ -1,10 +1,14 @@
-//! gaze-inject: pointer warp, click, and scroll injection through `/dev/uinput`. See
+//! gaze-inject: pointer warp, click, scroll and forwarded-key injection through
+//! `/dev/uinput`. See
 //! `PLAN.md`'s `gaze-inject` contract for the shape this crate fills; the portal on this
 //! desk has no RemoteDesktop (ScreenCast only, see "Environment facts" in `PLAN.md`), so
 //! libei is not an option and uinput is the only path in.
 //!
 //! Two backends implement the same [`Injector`] API. The choice is explicit, never
-//! guessed: `gaze-inject-cli --backend abs|rel`, or [`Injector::create_with`].
+//! guessed: `gaze-inject-cli --backend abs|rel`, or [`Injector::create_with`]. Alongside
+//! either pointer device sits a keyboard-shaped one (`keys.rs`) for the keys the session
+//! forwards on behalf of something else: [`Key::F13`], the voice stack's push-to-talk,
+//! held from the controller.
 //!
 //! - [`Backend::Relative`] (the default): a `REL_X`/`REL_Y` mouse. Primary mode is
 //!   **closed-loop**: cosmic-comp 1.6.0 exposes cursor position through
@@ -59,10 +63,13 @@ use gaze_core::GlobalPx;
 
 mod abs;
 mod codes;
+mod keys;
 pub mod layout;
 mod rel;
 
 use abs::AbsoluteInjector;
+use codes::WHEEL_HI_RES_PER_CLICK;
+use keys::KeyInjector;
 pub use layout::{DeskLayout, OutputLayout};
 use rel::RelativeInjector;
 
@@ -76,6 +83,21 @@ pub enum Button {
     Left,
     Right,
     Middle,
+}
+
+/// A keyboard key the injector can hold and release on behalf of another program. Not a
+/// general keyboard: only the keys something on this desk listens for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    /// Push-to-talk for the voice stack, which is bound to F13 outside cosmic-gaze.
+    F13,
+}
+
+// --- Key ---
+
+impl Key {
+    /// Every key the device registers.
+    pub const ALL: [Key; 1] = [Key::F13];
 }
 
 /// Which uinput device shape [`Injector`] creates. See the module docs for what each one
@@ -101,11 +123,22 @@ trait InjectBackend {
     /// Moves the pointer to `p` (global logical px) without clicking.
     fn move_to(&mut self, p: GlobalPx) -> Result<()>;
 
+    /// Nudges the pointer by `(dx, dy)` counts as one mouse report, uncorrected: the
+    /// caller is a human steering by eye, and the closed loop's measure-and-correct
+    /// flurry would fight them.
+    fn move_by(&mut self, dx: i32, dy: i32) -> Result<()>;
+
     /// Presses and releases `button` at the pointer's current position.
     fn click(&mut self, button: Button) -> Result<()>;
 
     /// Scrolls by `dy` wheel clicks at the pointer's current position.
     fn scroll(&mut self, dy: i32) -> Result<()>;
+
+    /// Emits one wheel report at the pointer's current position: `clicks` on `REL_WHEEL`
+    /// and `hi_res` on `REL_WHEEL_HI_RES`, either of which may be zero and is then left
+    /// out. The two are the same motion at two resolutions, as a high-resolution mouse
+    /// reports it; the caller keeps them consistent.
+    fn wheel(&mut self, clicks: i32, hi_res: i32) -> Result<()>;
 
     /// Last known measured cursor position, if this backend can observe one. The default
     /// `None` covers the absolute backend and the relative backend's open-loop fallback,
@@ -122,6 +155,21 @@ trait InjectBackend {
 /// uses).
 pub struct Injector {
     backend : Box<dyn InjectBackend>,
+    /// The keyboard-shaped device for forwarded keys.
+    keys    : KeyInjector,
+    /// High-resolution wheel units emitted since the last whole click, so a stream of
+    /// fractional scrolls still produces the `REL_WHEEL` clicks a legacy consumer counts.
+    wheel   : WheelAccumulator,
+}
+
+/// Turns a stream of high-resolution wheel units into the whole clicks that accompany
+/// them. A real high-resolution mouse sends `REL_WHEEL_HI_RES` on every report and a
+/// `REL_WHEEL` click each time 120 units have gone by; this keeps that bookkeeping so a
+/// smooth gaze scroll looks like such a mouse to anything reading either axis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WheelAccumulator {
+    /// Units since the last click, always within `(-120, 120)`.
+    remainder : i32,
 }
 
 // --- Injector ---
@@ -143,7 +191,9 @@ impl Injector {
             Backend::Relative => Box::new(RelativeInjector::create(layout)?),
         };
 
-        Ok(Injector { backend: inner })
+        let keys = KeyInjector::create()?;
+
+        Ok(Injector { backend: inner, keys: keys, wheel: WheelAccumulator::default() })
     }
 
     /// Moves the pointer to `p` (global logical px) without clicking. For the closed-loop
@@ -152,6 +202,17 @@ impl Injector {
     /// always succeeds (or fails only on an I/O error).
     pub fn move_to(&mut self, p: GlobalPx) -> Result<()> {
         self.backend.move_to(p)
+    }
+
+    /// Nudges the pointer by `(dx, dy)` counts as a single relative report, no correction.
+    /// The compositor's pointer acceleration applies, so the pointer moves about that far;
+    /// read back where it landed with [`Injector::last_known_position`] when it matters.
+    pub fn move_by(&mut self, dx: i32, dy: i32) -> Result<()> {
+        if dx == 0 && dy == 0 {
+            return Ok(());
+        }
+
+        self.backend.move_by(dx, dy)
     }
 
     /// Moves the pointer to `p` and clicks `button`.
@@ -167,12 +228,48 @@ impl Injector {
         self.backend.scroll(dy)
     }
 
+    /// Scrolls by `units` high-resolution wheel units (120 per click, positive is up,
+    /// away from the user) at the pointer's current position, without moving it. For
+    /// continuous scrolling: the caller integrates a speed and hands over whatever whole
+    /// units have accrued each tick, and a `REL_WHEEL` click rides along every 120.
+    pub fn scroll_hi_res(&mut self, units: i32) -> Result<()> {
+        if units == 0 {
+            return Ok(());
+        }
+
+        let clicks = self.wheel.push(units);
+
+        self.backend.wheel(clicks, units)
+    }
+
+    /// Presses (`down`) or releases `key` on the keyboard-shaped device. The pointer is
+    /// untouched. Edges are the caller's to pair; a session that ends while a key is down
+    /// should release it, though the kernel releases everything held when the device
+    /// goes away.
+    pub fn key(&mut self, key: Key, down: bool) -> Result<()> {
+        self.keys.key(key, down)
+    }
+
     /// Last known measured cursor position, if the active backend can observe one (the
     /// closed-loop relative backend can; the open-loop fallback and the absolute backend
     /// cannot and return `Ok(None)`). Useful for confirming where a `move_to` actually
     /// landed without eyeballing it, e.g. `gaze-inject-cli --probe`.
     pub fn last_known_position(&mut self) -> Result<Option<GlobalPx>> {
         self.backend.last_known_position()
+    }
+}
+
+// --- WheelAccumulator ---
+
+impl WheelAccumulator {
+    /// Adds `units` and returns the whole clicks that crossed, carrying the rest.
+    pub fn push(&mut self, units: i32) -> i32 {
+        let total  = self.remainder + units;
+        let clicks = total / WHEEL_HI_RES_PER_CLICK;
+
+        self.remainder = total % WHEEL_HI_RES_PER_CLICK;
+
+        clicks
     }
 }
 
@@ -235,3 +332,27 @@ pub enum InjectError {
 
 /// Crate-local result alias; every fallible gaze-inject function returns this.
 pub type Result<T> = std::result::Result<T, InjectError>;
+
+// --- Tests ---
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_accumulator_clicks_once_per_120_units_and_carries_the_rest() {
+        let mut acc = WheelAccumulator::default();
+
+        // Reading down the page: negative units, a click every 120.
+        assert_eq!(acc.push(-50), 0);
+        assert_eq!(acc.push(-50), 0);
+        assert_eq!(acc.push(-50), -1);
+        assert_eq!(acc.remainder, -30);
+
+        // Reversing direction eats the remainder before it clicks the other way.
+        assert_eq!(acc.push(100), 0);
+        assert_eq!(acc.remainder, 70);
+        assert_eq!(acc.push(170), 2);
+        assert_eq!(acc.remainder, 0);
+    }
+}

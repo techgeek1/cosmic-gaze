@@ -1,4 +1,4 @@
-//! gaze-inject-cli: manual pointer/click/scroll injection through uinput, for exercising
+//! gaze-inject-cli: manual pointer/click/scroll/key injection through uinput, for exercising
 //! the gaze-inject crate against a live cosmic-comp session. See `PLAN.md`'s gaze-inject
 //! contract and `gaze_inject::Injector`'s doc comments for what each backend actually
 //! does once cosmic-comp gets hold of its events.
@@ -9,10 +9,14 @@ use std::time::Duration;
 
 use clap::{ArgGroup, Parser, ValueEnum};
 use gaze_core::GlobalPx;
-use gaze_inject::{Backend, Button, DeskLayout, Injector};
+use gaze_inject::{Backend, Button, DeskLayout, Injector, Key};
 
 /// Outputs `--probe` walks, in the order named in `PLAN.md`'s "Environment facts".
 const PROBE_OUTPUTS: [&str; 3] = ["DP-2", "DP-1", "HDMI-A-1"];
+
+/// How long `--key` holds the key down: long enough for a push-to-talk listener to see
+/// a hold rather than a bounce.
+const KEY_HOLD: Duration = Duration::from_millis(300);
 
 /// Pause between `--probe` moves: long enough for a human to look at the screen and note
 /// which monitor the cursor landed on before the next move happens (still useful for the
@@ -23,7 +27,7 @@ const PROBE_PAUSE: Duration = Duration::from_secs(3);
 #[command(author, version, about)]
 #[command(group(
     ArgGroup::new("action")
-        .args(["move_pos", "click", "scroll", "probe"])
+        .args(["move_pos", "click", "scroll", "smooth", "key", "probe"])
         .required(true)
 ))]
 struct Args {
@@ -53,8 +57,19 @@ struct Args {
 
     /// Moves the cursor to X Y and scrolls by DY wheel clicks (kernel REL_WHEEL
     /// convention: positive is up, away from the user).
-    #[arg(long, num_args = 3, value_names = ["X", "Y", "DY"])]
+    #[arg(long, num_args = 3, value_names = ["X", "Y", "DY"], allow_negative_numbers = true)]
     scroll: Option<Vec<f64>>,
+
+    /// Moves the cursor to X Y and scrolls by UNITS high-resolution wheel units (120 per
+    /// click, positive is up) as a stream of small reports over about a second, the way
+    /// the edge scroller does. Exercises the `REL_WHEEL_HI_RES` path on its own.
+    #[arg(long, num_args = 3, value_names = ["X", "Y", "UNITS"], allow_negative_numbers = true)]
+    smooth: Option<Vec<f64>>,
+
+    /// Presses KEY for 300 ms on the keyboard-shaped device and releases it, without
+    /// touching the pointer. `f13` is what the voice stack's push-to-talk listens for.
+    #[arg(long, value_enum)]
+    key: Option<KeyArg>,
 
     /// Walks the centre of every configured output, pausing 3 s between moves and
     /// printing which output it targets. With the relative backend's closed-loop tracker
@@ -76,6 +91,11 @@ enum ButtonArg {
     Left,
     Right,
     Middle,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum KeyArg {
+    F13,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -116,6 +136,32 @@ fn main() -> anyhow::Result<()> {
 
         injector.scroll(p, dy)?;
         println!("scrolled dy={dy} at ({:.1}, {:.1})", p.x, p.y);
+    }
+    else if let Some(xyz) = &args.smooth {
+        let p     = GlobalPx { x: xyz[0], y: xyz[1] };
+        let total = xyz[2].round() as i32;
+        let steps = 60;
+        let step  = total / steps;
+
+        injector.move_to(p)?;
+
+        for _ in 0..steps {
+            injector.scroll_hi_res(step)?;
+            std::thread::sleep(Duration::from_millis(16));
+        }
+
+        injector.scroll_hi_res(total - step * steps)?;
+        println!("smooth scrolled {total} hi-res units in {steps} reports at ({:.1}, {:.1})", p.x, p.y);
+    }
+    else if let Some(key) = args.key {
+        let key = match key {
+            KeyArg::F13 => Key::F13,
+        };
+
+        injector.key(key, true)?;
+        thread::sleep(KEY_HOLD);
+        injector.key(key, false)?;
+        println!("held {key:?} for {} ms", KEY_HOLD.as_millis());
     }
     else if args.probe {
         run_probe(&mut injector, &layout)?;

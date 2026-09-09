@@ -580,6 +580,7 @@ mod tests {
         OutputGeometry {
             name          : name.to_string(),
             enabled       : enabled,
+            detect        : true,
             logical_x     : x,
             logical_y     : y,
             logical_w     : w,

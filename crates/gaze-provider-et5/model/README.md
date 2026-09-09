@@ -53,6 +53,41 @@ uv run python run_all.py --readings a.jsonl --csv b.csv # mix both loaders
   per-session bias, the pupil regression, the variance/error correlation.
 - `run_all.py` — wires it all together and writes `out/report.md`.
 
+## Click sessions (2026-09-04)
+
+`loso_clicks.py export.csv` is the leave-one-session-out on the passive and trainer
+click sessions (`gaze-clicks`, `gaze-trainer`), one median row per click, carets
+dropped. It is the script behind DESIGN.md §10c's 2026-09-04 entry and the feature
+set `train.rs` fits (`FitParams::position_field`). Five sessions, 1184 clicks:
+
+| estimator | p50 deg | p90 deg | per-session p50 |
+|---|---|---|---|
+| firmware | 1.83 | 5.21 | 2.05 2.90 1.72 1.43 2.18 |
+| global offset | 1.67 | 4.95 | 2.75 2.51 1.08 0.92 1.93 |
+| per-session offset (oracle) | 1.49 | 4.71 | 1.94 2.65 0.89 0.87 1.91 |
+| kernel, per-eye directions (ls 2, ridge 3) | **1.44** | 4.47 | 2.85 2.64 1.26 0.98 1.34 |
+| kernel, all 27 features | 1.66 | 4.88 | 2.47 2.40 1.25 1.34 1.65 |
+| kernel per-eye + per-session offset (oracle) | 1.22 | 4.15 | 1.52 2.69 0.87 0.91 1.33 |
+| kernel per-eye + pupils in the kernel | 1.56 | 4.80 | 2.96 2.68 1.28 1.03 1.56 |
+| kernel per-eye, explicit pupil² added | 1.50 | 4.82 | 2.87 2.61 1.17 1.00 1.54 |
+| kernel per-eye, no pupil terms | 1.49 | 4.55 | 2.66 2.59 0.97 1.01 1.55 |
+| two per-eye kernels, valid-weighted mean | 1.46 | 4.49 | 2.85 2.68 1.26 1.00 1.44 |
+| firmware + **causal** online offset (a=0.1) | 1.38 | 4.75 | 1.79 2.73 0.93 0.91 1.86 |
+| kernel per-eye + **causal** online offset (a=0.1, clip 2°, gate 3°) | **1.20** | 4.24 | 1.58 2.57 0.86 0.92 1.38 |
+| same, ungated | 1.36 | 4.16 | 1.69 3.32 1.04 0.90 1.45 |
+
+The causal rows walk each held-out session's clicks in time order with the frozen
+model plus a running offset, the offset nudged after each click is scored; they are
+the D5 filter as built (`offset.rs`). The gain sweep 0.05–0.3 stays within 0.04° of
+the 1.20. `--sweep` adds the length-scale/ridge grid and the head and all-27 rows.
+
+`label_timing.py *-clicks.jsonl` reads the raw session files and reports the per-frame
+firmware residual against time-to-press, plus the per-click label under shifted windows
+and a last-stable-fixation pick: the residual is flat from −0.3 s to the press and the
+collector's window sits on the minimum (details in DESIGN.md §10c, 2026-09-04).
+
+`run_all.py --csv export.csv` still runs the frame-level pipeline on the same export.
+
 ## What every number means
 
 - **RMS / p50 / p90**: the post-correction angular error, degrees — `|actual_residual

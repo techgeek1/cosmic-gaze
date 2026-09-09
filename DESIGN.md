@@ -790,6 +790,366 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   (−84,+49) px → (−45,+109) px first-to-last third: real intra-session drift, visible
   for free, as hoped.
 
+- 2026-09-03, decision: **a real application as the third label source (`gaze-trainer`,
+  PLAN-ET5 B5).** The five-minute dot ceremony does not produce accurate data (eight
+  attempts; ruled out as the bootstrap), and passive clicks are accurate but slow and
+  biased toward where the user's own applications put their controls. A trainer that
+  shows a picture of an application with a highlighted target is still target
+  acquisition wearing a costume; the eye behaves differently when the click has a
+  consequence it is already anticipating. So the trainer is a working libcosmic
+  application generated fresh per task (menus, sidebar, toolbar, tabs, lists, forms,
+  articles, dialogs, dark/light), asking for two-to-four-step flows in a sentence
+  ("open the Edit menu and choose Preferences"), which puts a search saccade before the
+  first click and an anticipatory one before the second. It knows its own widget boxes
+  and tells the collector over a socket; the collector takes its word (`source =
+  "trainer"`), no recognition. Coverage steering picks each task's opening control from
+  the emptiest bin of an 8×4 histogram seeded from every click already on disk; posture
+  prompts every twelve tasks; theme flips for the pupil. The export gains `source`,
+  `posture`, `trainer_task`, `trainer_hit`. Phase C's first question is whether
+  deliberate trainer clicks predict passive ones, which the passive sessions now exist
+  to answer. Not yet run against the device: the first trainer session is the next
+  entry here. After that first run the task flows were dropped for free-form
+  navigation over six archetypes (settings, files, mail, editor, browser, store), with
+  coverage now biasing where the layout puts its sidebar and toolbar instead of
+  choosing a target; the reason is that the user only needs to be navigating an
+  interface, not performing a task, and being told what to click is its own kind of
+  costume.
+- 2026-09-04, **trainer clicks never reached the export.** The trainer labels a click
+  without a capture, so the collector writes `frame_age_s: null`; the exporter's click
+  record held a plain `f64`, the record failed to parse, and the loader's "unknown
+  record kinds are skipped" arm swallowed it: 637 trainer clicks came out as stop rows
+  with no element, source or posture. Found because the first export had 629 blank
+  sources. `frame_age_s` is now `Option<f64>` everywhere (a trainer click has no frame
+  age; that is a state, not a NaN).
+- 2026-09-04, **Phase C on real data** (blob `70289bb2`, five click sessions 08-30 to
+  09-04: two passive days, 376 tree/vision clicks; three trainer days, 637 trainer plus
+  226 vision clicks; `loso_clicks.py`, one median row per click, leave-one-session-out).
+  Firmware alone: per-click median **1.83°**, p90 5.21°; by source trainer 1.69°, tree
+  2.10°, vision 2.22°, **caret 10.4°** (the I-beam ruling of 08-28 is wrong as a gaze
+  label: a click into a terminal or an input says nothing about where the eye was, and
+  carets are refused by the fit). Within a click the residual settles to its value by
+  350 ms before the window's end and stays, so the window is not the noise. Models:
+  global offset 1.67°; the per-session offset *oracle* 1.49°; the old quadratic screen
+  field, pooled, 1.66°; the kernel model on **per-eye directions and angle from the
+  axis only** (length scale 2, ridge 3, 200 centres, plus the linear pupil and radial
+  terms) **1.44°** (p90 4.47°), against 1.66° with all 27 features and 1.69° with the
+  head columns added, i.e. head position and the lagged head hurt held out at this
+  data size. A plain 2D field on the combined ray's angles gives 1.63°; the per-eye
+  form also handles monocular clicks (2.04° vs 3.05° firmware). Per session the model
+  reads 2.85 / 2.64 / 1.26 / 0.98 / 1.34° against 2.05 / 2.90 / 1.72 / 1.43 / 2.18°:
+  every trainer session about 30% better, the first passive session **worse**, because
+  the August sessions carry a pitch bias of the opposite sign (−0.7° vs +1.1 to +1.4°)
+  and a global correction moves them the wrong way. Kernel plus the per-session offset
+  oracle: 1.22° (−33%), so the next term is the day's offset, which is D5. Within the
+  same session (09-04) trainer buttons sit 0.8° of pitch above vision buttons, so part
+  of that offset is the source, not the day; whether the eye rests above a trainer
+  button's centre or the trainer's theme flips move the pupil is open. Gate: 21% on
+  the median, one session worse; not met as written, built anyway to be felt.
+- 2026-09-04, **D1–D3 built.** `model.rs` (the Nystrom kernel model, whitening and
+  ridge folded into per-centre weights and one variance form; the label's inverse as a
+  Newton step on tangent offsets, since the label's frame is built at the truth rather
+  than at the firmware ray and a naive fixed point drifts by 0.3°), `train.rs` (Jacobi
+  eigensolve, Cholesky, k-means++, leave-one-session-out; no `nalgebra`), `gaze-et5-cli
+  fit`, and the provider path: firmware 2D → ray on the declared plane → features →
+  correction faded by variance (full to the training rows' 95th percentile variance,
+  gone at three times that) → rotated by the mount pitch the labels used → intersected
+  with the *configured* desk, not the solved poses, so the runtime frame is the label's
+  by construction. Sigma widens by the model's variance. Rust reproduces the harness
+  (1.82 → 1.43°). The exporter's per-stop row is now a median (the mean sat 0.15°
+  higher from saccade frames the gate misses). Not run live yet: `gaze-proto
+  --provider et5` with `config/model-et5.json` present is the next thing to sit down
+  for. Expected feel on a September-like day: ~1.0–1.3° median instead of ~1.5–2.2°;
+  on an August-like day, no better, until D5.
+- 2026-09-04, **first live run.** `gaze-proto --provider et5` with the model: the user's
+  verdict was "way better" than the firmware alone. No measurement, just the feel.
+- 2026-09-04, **literature pass, then three offline experiments on the same 1184 clicks
+  (`model/label_timing.py`, `model/loso_clicks.py`).** *Label timing* (PACE, Huang et al.
+  CHI'16, found gaze-click agreement peaks a second before the press): not here. The
+  per-frame firmware residual is flat from 0.3 s before the press to the press (1.75–1.8°
+  median per 100 ms bin), rises steeply earlier (5° at −1.2 s: the eye is still arriving)
+  and after +0.1 s (the eye has left). The collector's window is on the minimum; the last
+  stable fixation before the press is 0.14° better (1.72 vs 1.86), not worth the
+  machinery. *Pupils* (Drewes 2014: 2.5° drift over 2–6 mm, per eye; 2025 reading study:
+  0.4–0.9°/mm): nothing learnable. Pupils in the kernel 1.56, a pupil² explicit term 1.50,
+  no pupil terms at all 1.49, against 1.44 for the plain per-eye-direction kernel. The
+  one large-pupil session (5.3 mm vs 3.1–4.2) is also the one with the opposite pitch
+  bias, which is consistent with the effect but is a single session; unlearnable by
+  leave-one-out. *Per-eye residuals*: the mean of the two eyes' own residuals reproduces
+  the firmware label to 0.45°, but two per-eye kernels combined land at 1.46 — the
+  firmware's combination is not where the error is. *Causal online offset* (an EWMA of
+  each click's leftover, gain 0.1, clipped at 2°, gated at 3°, clicks in time order,
+  every click including the first): **1.20° median, 2.06 p75, 4.24 p90**, against the
+  1.22 oracle and 1.44 for the model alone; 1.19 with a tighter clip, 1.36 ungated. The
+  steady state after twenty clicks is the same as the whole. Firmware plus offset with
+  no model: 1.38. The August session that got worse under the model (2.85) comes back to
+  1.58 with the offset; the other August session (2.6) does not move under anything.
+  The tree-vs-trainer gap noted earlier (2.7° vs 1.2°) is this same confound: tree
+  clicks exist only in the two August sessions.
+- 2026-09-04, **D5 built** (`offset.rs`, provider `observe_click`, `gaze-proto`
+  `feedback.rs`): the EWMA above, in the label's yaw/pitch frame, added to the model's
+  prediction before the ray is corrected (the model's part still fades with variance;
+  the offset applies everywhere). Real clicks come from `gaze-clicks`'s evdev reader in
+  `gaze-proto`, pointer from the compositor's cursor session, attributed against the
+  corrected rays in the 0.4 s before the press (median leftover, at least three rays).
+  Not offered: presses on `gaze-inject`'s own uinput mouse (excluded at the reader, for
+  `gaze-clicks` too) and presses within 12 px of the last warp destination, both being
+  the gaze clicking itself. Persists to `config/offset-et5.json`, keyed to the device
+  blob like the model; `--freeze-offset` attributes and logs without moving it. Not
+  built from the plan's D5 line: the head-jump reset. The trainer sessions carry
+  deliberate posture changes and the simulation tracked through them at this gain, so
+  a reset would only discard a converged estimate. Not run live yet.
+- 2026-09-04, **snap engine: a re-detect could leave a stale highlight.** Detection ids
+  restart at zero every pass, and `SnapEngine` identified its current target by id
+  alone: a new box wearing the old number was "the same element", so `adopt` kept the
+  old rectangle and only moved the click point, and the hysteresis let the stale box
+  defend with the new box's score. Identity is now id *and* box. Found while chasing a
+  live report of the highlight parking while the gaze marker moved; whether it is that
+  bug or a wedged perception pass is not yet known (the `detected` info lines say).
+- 2026-09-04, **snap engine: the kind prior no longer overrides containment.** Live
+  report: with D5 running the marker followed the eye but the highlight could not be
+  nudged from a sidebar row onto the row beside it ("Archive pull request" to "Lock
+  conversation", "1 participant" to the avatar). Not the hysteresis: running the
+  detector on the crops and the engine on its boxes showed same-kind neighbours switch
+  cleanly, and a Button beside a Text row never does. `KIND_PENALTY[Text] * kind` was
+  1.5° of score, so a control held from 0.3° away against a text row the gaze was
+  *inside*; at a 36 px row pitch (0.4–0.5° on the LG) no gaze position in the text row
+  could win. Bench v3 chose kind 1.5 on widget-correct, an eval in which text is never
+  the answer. Fix: the kind penalty is charged only to boxes the gaze point is outside.
+  Inside a box the position has been observed and the prior has nothing to add; nested
+  boxes fall to the area term, and a click on the smaller lands in the larger anyway.
+  Bench, σ 0.7° single-sample, before → after: all targets 25.0 → 25.5% correct, widgets
+  32.2 → 30.2%, text lines 25.0 → 25.8% with confident-wrong 10.1 → 16.7% (a text run
+  under a noisy first landing is now taken). That is the first-landing regime; the live
+  complaint is steady fixation, where the position is far better than 0.7° and the prior
+  deserves even less. Lowering `kind` alone (0.6 / 0.3 / 0.15 → all-targets 26.8 / 27.6 /
+  27.8%) was measured too, but any residual penalty still stacks with the 0.15 hysteresis
+  margin at that row pitch, so the structural rule won. `gaze-bench/report.md` is *not*
+  regenerated: the README's canonical command no longer reproduces it even on the old
+  code (23.5% `none` where the committed report has 0%), so the bench inputs or defaults
+  have drifted since it was written and that needs its own look before a new canonical
+  report means anything.
+- 2026-09-04, **snap candidates are now logged.** Second live edge case: "techgeek1" in a
+  PR header lost to the overlapping title text above it. The crop's detector boxes do
+  not overlap and the engine picks the line under every geometry I could reconstruct, so
+  `gaze-proto` now debug-logs the top three candidates (kind, box, score, distance,
+  area, centre term, gaze) on every target change. The next report carries numbers.
+- 2026-09-04, **snap engine: the containment rule becomes a ramp, and area doubles.** The
+  numbers came back. The detector drew one 585 x 112 px `Text` box over the two-line PR
+  title; the OCR line "techgeek1 wants to merge" starts 27 px above that box's bottom. At
+  gaze y 296.37 against a line top of 296.70 (a third of a pixel out) the line paid the
+  full 1.5° text penalty and the heading, containing the point, paid nothing: the step
+  in the containment rule. Once held, the heading defended inside the margin (0.63 vs
+  0.70). Fix one: the kind penalty ramps in as `min(1, distance / sigma)`, the odds the
+  point is really outside; a hair out costs a hair. Fix two: even inside, the line only
+  beat the heading by 0.07 because `center_deg` charged it 1.7° for being read at its
+  first word, so `area` goes 0.15 → 0.3 and the line wins by 0.24. Measured and
+  rejected: the centre offset along the short axis only (fixes the case, −5 points on
+  widgets in both bench modes), and the same blended in by the ramp (−5 as well). Bench,
+  σ 0.7 single-sample, correct all / widgets / lines: original 25.0 / 32.2 / 25.0, step
+  rule 25.5 / 30.2 / 25.8, ramp 26.6 / 29.5 / 27.0, ramp + area 0.3 (shipped) 27.0 /
+  30.5 / 26.9; sequence mode agrees. Widgets are still 1.7 under the original, which
+  bought text rows that can be looked at. Same caveat as before: the bench's noise is
+  bias-dominated first landing, the live complaint is steady fixation on a good day.
+- 2026-09-04, **edge scrolling built (tier one, principle 4), on the real scroll surface.**
+  The trigger is a dwell in the lower band (0.2 of the surface's height, 0.25 s) or upper
+  band (0.12, 0.5 s) of the surface under the gaze, the speed grows with depth into the
+  band up to 8 lines/s, ramped over 0.3 s, and the loop self-regulates: the text rises, the
+  line being read leaves the band, the scroll stops (Kumar & Winograd, UIST 2007).
+  Looking anywhere else stops it too; a blink coasts 0.25 s. Motion goes out as
+  `REL_WHEEL_HI_RES` at the sample rate with a `REL_WHEEL` click every 120 units, the
+  pointer warped into the surface once at the start if it was outside. **The surface is
+  never the window**: Discord's list ends above its composer, a sidebar scrolls apart from
+  the page. The accessibility tree knows the real one, and the stop condition turned out to
+  be geometry, not role: AT-SPI's `scroll pane` is used by GTK alone; Firefox scrolls a
+  `document web`, Discord a `section`/`panel`. But every toolkit reports a clipping node's
+  extents as its viewport and the clipped child's as its full layout, so the first ancestor
+  whose child pokes out vertically is the surface (`gaze_a11y::clip_surface`). Measured
+  with the new `gaze-a11y-cli chain`: Discord list 882 x 4305 in a 898 x 1296 panel above
+  the composer, Discord sidebar 2272 px in 302 x 1292, Firefox page 12901 px in the
+  1269 x 1343 document, all correct; content that fits yields no surface, which is right.
+  The question runs on `gaze-clicks`'s watched tree thread (10–30 ms, wedge-proof) via a
+  containment-keyed cache; terminals and iced apps are off the bus and do not scroll, and
+  the log says so. First live try did nothing in a browser: the cache polled the tree
+  with `take(id, Duration::ZERO)`, which computes the time left before it ever reads the
+  channel and so never collected a reply; the surface was never known. `TreeService::poll`
+  is the non-blocking read it needed. Whether Firefox honours `REL_WHEEL_HI_RES`-only
+  motion is still unverified (`gaze-inject-cli --smooth X Y -960` at a page is the test;
+  the pointer has to be free for it). Run: `cargo run --release -p gaze-proto --
+  --provider et5 --edge-scroll` (add `--dry-run` to watch the log first).
+- 2026-09-04, **edge scroll, second live run: "feels pretty nice", three fixes.** (1)
+  Bands 0.2 / 0.12 → 0.1 / 0.1 of the viewport. (2) At the end of a page the lower band
+  swallowed the elements in it: the surface now carries how far the content overflows each
+  way (`Scrollable::above_px/below_px`, from the clip's child extents), a band whose
+  direction has under 2 px of room is not a band, and a scroll that runs out of room
+  stops; the cache re-asks the tree every 400 ms *during* a scroll so the room tracks the
+  moving content. (3) Boxes were offset and took about a second to catch up after a scroll:
+  the perception pass detected outputs in config order and published the merged list only
+  at the end of the pass, so a scrolled output waited behind the others (~450 ms each).
+  Now a stopped scroll forces a re-detect of the output under the gaze, forced outputs go
+  first, every output publishes as soon as its detection lands, and the highlight is
+  hidden (label `redetecting`) from the stop until the store's generation advances, so
+  the old boxes are never drawn over moved content. The remaining latency is one
+  detection (~450 ms) plus up to one capture period (200 ms).
+- 2026-09-04, **edge scroll: elements scrolling into view got selected and broke the
+  scroll.** The 400 ms in-scroll refresh re-asks the tree at the gaze point, and under a
+  moving page that hit can land on a fixed header, a nested scrollable or a recycled list
+  row: a different clip, or none, replaced the surface, the scroller saw no band and
+  stopped, the forced re-detect published and the highlight returned on whatever was under
+  the gaze. The in-scroll refresh now accepts only a reply naming the same clip node (bus
+  and path) and drops the rest, so a scroll can only end by the eyes leaving the band, the
+  room running out, or the tracker losing the eyes.
+- 2026-09-04, **no retargeting through a scroll without an eye movement.** Ruling: content
+  moving under a still gaze is not the user choosing what it brings. From a scroll's start
+  until a fixation *begins* later than its stop (the I-VT filter's `since_s`), the snap
+  engine is not updated and the target is `None`; a fixation that persisted through the
+  scroll, or began during it, does not count. The engine is reset at the start so the
+  pre-scroll target cannot defend itself afterwards. The overlay label reads `move eyes to
+  retarget` while the block holds after a stop.
+- 2026-09-04, **edge scroll survives the eyes leaving the screen.** Reading fast down a page
+  the eyes run past the bottom bezel while still tracked: the ET5 sample keeps its ray and
+  `valid`, loses its point, and the scroller read that as a dropout and stopped after
+  0.25 s. Now `OutputGeometry::project_px` puts the ray onto the surface's own panel
+  extended past its edges, and the scroller takes `Eyes::Off(px)`: past the edge it is
+  scrolling towards it counts as full depth and the scroll continues; past any other edge
+  it is a look-away and stops; and it never *starts* a scroll, because the eyes below the
+  monitor are as likely on the keyboard as on the page.
+- 2026-09-04, **edge scroll: faster when asked.** "If I know I just want to go to the top
+  that's very slow." Two multipliers on the band speed, both flags: a *hold* that starts
+  after 1 s parked in the outer 40% of the band and doubles the speed every second after
+  (reading pace leaves the band every few hundred ms and never sees it; leaving the outer
+  band resets it), and a *turbo* of 3x while the tracked eyes are past the screen's edge,
+  so looking above the monitor for a couple of seconds is "go to the top". Everything caps
+  at 40 lines/s so a runaway stays readable. Ramp 0.3 → 0.2 s on request. Home/End keys
+  deliberately not used: they go to the keyboard focus, not the surface under the gaze.
+- 2026-09-04, **edge scroll: PR review by eye.** First real task done with gaze alone,
+  reviewing a PR: "felt a whole lot better than just scrolling but nav was a tad slow".
+  Ramp 0.2 → 0.15 s, bands 0.1 → 0.115 of the viewport, both directions. Small steps on
+  purpose: the band edge is also where clickable things at the bottom of a page live.
+  Second pass the same day: bands 0.12 ("still a tad small"), hold 1.0 → 0.3 s (0.6 "still
+  a little laggy"), ramp kept. Verdict: "we validated the premise"; the visuals are the
+  distraction now.
+- 2026-09-04, **edge scroll: the line-label edge case.** In a PR diff the targeting "wants
+  to prefer the line labels rather than the scroll". Not reproduced with a chain dump, but
+  the geometric clip rule has an obvious hole that fits: a line-number cell whose text
+  node overhangs it by a pixel or two *is* a clip by the raw test, and taking the first
+  clip up the chain hides the page scroll behind a 20 px viewport the scroller then
+  refuses. `clip_surface` now walks past clips under 120 px (`MIN_CLIP_PX`) instead of
+  stopping at them. If the label case persists, `gaze-a11y-cli chain X,Y` on a line
+  number is the next evidence to collect.
+- 2026-09-04, **wink-to-click: measured and dropped.** Idea: left wink = left click, right
+  wink = right click, single wink (a double "feels awkward in repetition"). Before writing a
+  detector, the negative class was measured from the eight recorded trainer sessions
+  (`config/sessions`, 1528 s of frames): the tracker drops exactly one eye for 150 to 600 ms
+  191 times, once per 8 s; requiring both eyes tracked cleanly before and after leaves 46
+  (per 33 s); requiring the open eye within 1 deg and the head within 2 mm over the episode
+  leaves 14 (per 110 s). The left slot drops half again as often as the right, consistent
+  with the tracker sitting to one side. Trainer sessions are a harsh sample (posture
+  changes, frames only around clicks) and there is no positive class, but a phantom click
+  every couple of minutes is not a starting point worth a shared-type change. Ruling: "no
+  point in using wink gestures"; commit stays with the Daydream controller (§10 plan).
+- 2026-09-04, **Daydream controller: first light.** Paired and read over BlueZ's D-Bus GATT
+  API with `zbus` blocking (no `bluer`, no tokio; the `bluer` plan above is superseded):
+  one match rule over the device subtree carries both the report `Value` and the device's
+  `Connected`, and `StopNotify`'s own `Notifying` change is the reader's wake-up. Stream
+  measured: 62 Hz, 20 bytes, zero drops over a minute, gyro noise at rest under 0.03 rad/s,
+  gravity +1 g on the controller's y (the pad normal), so yaw is about y and pitch about
+  x. mrdoob's layout holds bit for bit; one captured packet is the fixture. `gaze-proto
+  --daydream` maps pad click → commit, Home → exit, App → redetect, volume → wheel, and
+  makes a thumb on the pad the clutch for the fine channel: anchor at the snap point or
+  the raw gaze point, pointer warped there, gyro (default, 1500 px/rad, dead zone
+  0.03 rad/s) or touch deltas move it, commit clicks the refined point. The raw-gaze
+  anchor is the unlabelled-target escape hatch the recogniser never had. First hand-on
+  session (same day): pad x runs 0→1 left to right and y 0→1 top to bottom, as assumed;
+  pitch tracked, yaw seemed not to, but `watch`'s per-axis net turn (added for this)
+  measured yaw right as −y and pitch down as −x, exactly the default `-y,-x`, so the
+  mapping stands and the horizontal misbehaviour was the two faults below; the gaze kept
+  retargeting and edge-scrolling under the thumb, so a thumb on the
+  pad now locks the gaze out entirely (no retarget, no scroll, no focus warp); and driving
+  each refine step through the closed-loop `move_to` at 62 Hz made the cursor visibly
+  grow, the closed loop's measure-and-correct flurry reading as a shake. Refine motion is
+  now one plain relative report per controller report (`Injector::move_by`) and the
+  commit clicks where the compositor's cursor tracker says the pointer is, not where the
+  deltas add up to. Second session, with those fixes: gyro yaw still moved the pointer
+  next to nothing and the channel was jittery, so the touchpad is now the default refine
+  channel (`--refine touch`); the gyro stays as an option. The pad's dead horizontal was
+  `raw`'s to explain: x steps smoothly 0.01→0.97, but every sideways sweep runs the thumb
+  off the pad edge, and each re-land was a fresh `Refine::Begin` that re-anchored at the
+  snap point and warped the sweep away. A re-land now resumes the standing refine; only
+  the eyes moving on starts a new one. Ruled the same day: the refine is boxed to 100 px
+  around the anchor (`--refine-range`), since gaze already lands within a degree or two
+  and a full-screen range was fiddly; the touch gain dropped to 250 px per pad width so
+  one pad count is about one pixel and half a pad crosses the box. Also from that
+  session: aiming at GitHub's copy-path icon in a file header, which sits at the top of
+  the diff viewport, armed the edge scroller before the thumb could land. Eyes on a snap
+  target no larger than 48 px (`AIM_TARGET_PX`) now keep the scroller from arming; rows,
+  text links and paragraphs are wider and scroll as before, and a scroll already running
+  is not interrupted by passing over an icon. Follow-up the same day: OCR words are under
+  48 px too, and a scrolled page is words to its edge, so every one of them snapped in the
+  band and held the scroller off, which made scrolling text jerky and stop-start. Text
+  boxes no longer count as aiming whatever their size; buttons, icons, links and inputs
+  still do.
+- 2026-09-05, **Offset keyed to posture; pad commits as labels.** The day's-bias filter held
+  in the calibration posture and broke on a comfortable slouch, and a single bias relearnt
+  over twenty clicks cannot follow a body that moves between the two several times an
+  hour. The ET5 reports eye positions, so the offset is now a function of them: anchors in
+  tracker space, one per posture (40 mm reach, the head wobbles 10 to 20 mm within a
+  posture and moves 80 or more between sitting up and slouching), each holding its own
+  yaw/pitch, blended by a Gaussian in distance and relaxing to their mean far from all.
+  A click farther than the reach from every anchor founds a new one at the blended
+  prediction and its clicks enter at `1/(n+1)` over a two-click prior, down to the usual
+  tenth, so a new posture has half its correction in four clicks and most of it in ten,
+  and returning to an old one costs nothing. Daydream pad commits now feed the filter beside mouse presses: a refined
+  commit is the best label the system gets (the user moved the pointer to exactly what
+  they were looking at), and an unrefined one is the snap centre the user accepted.
+  Mouse-button commits still are not fed, since the click feed already sees the physical
+  press. First slouched session: a second anchor spawned without the user moving and
+  the offset swung a degree in one click. Two causes, both fixed: the posture key was
+  the mean of the *valid* eye origins, which a monocular frame moves by half an
+  interpupillary distance (~32 mm), so the key is now the binocular midpoint rebuilt
+  from the last known eye spacing when an eye drops, and the reach is 60 mm; and a new
+  anchor took its first click in full, so one ±1° label owned the posture, hence the
+  two-click prior. Same session: the perception thread redetected HDMI-A-1 every half
+  second for the whole run (30% of its pixels changing, 400 ms each, 770% CPU), almost
+  certainly the session's own terminal scrolling its log on that panel. Ruled: the
+  tracker reaches DP-1 only, so the desk config gained a per-output `detect` switch
+  (default on) and DP-2 and HDMI-A-1 are off; they stay in the geometry for the pointer.
+- 2026-09-05, **Controller and mouse take turns; tap right-clicks.** Moving the mouse left
+  gaze unable to take the pointer back. Best explanation from the code: a refine the thumb
+  left standing (no commit, and no retarget to clear it, which on an unlabelled target is
+  never) resumed on the next touch without a warp, from wherever the mouse had put the
+  pointer. A standing refine now resumes only while the pointer is within 24 px of its
+  point; otherwise it is stale and the touch is a fresh gesture with its warp. The
+  arbitration the user asked for is the controller's own sensors: a held controller never
+  reads a gyro under 0.035 rad/s for long (on the desk it peaks under 0.03), so gyro motion,
+  touch or a button within 6 s means held (first cut was 0.06 within 2 s; an arm resting at
+  the side sat under that and read as put down). A controller put down hands the pointer to
+  the mouse: no edge scroll, no focus warp, overlay says "controller down". The mouse also
+  takes the pointer the moment it moves, the way a mouse takes over from a gamepad in a game
+  (the `gaze-clicks` reader stamps every motion, wheel or button event, and now opens
+  whenever a controller is present, not only for a learning source; overlay says "mouse").
+  It keeps the pointer until the controller is used on purpose: a touch, a button, or a
+  swing past 0.25 rad/s, which lifting it off the desk does and a hand resting around it
+  while the other hand mouses does not. Picking it up
+  restores gaze within a report. A tap on the pad (down and up within 250 ms, under 0.04
+  pad widths of travel, no click) commits with the right button at the same point a click
+  would, so context menus need no mouse. Untested on the desk: all three.
+
+- 2026-09-09, **Remount to the 27" (DP-2); the edges were the code, not the tracker.**
+  The bar moved from under the ultrawide to under the 27": its 600 mm sit inside the
+  gaze envelope at the desk's distance where the 880 mm never did. Three things found
+  while checking the range with `view --direct DP-2` (a plane-only calibration, no fit):
+  (1) the firmware does **not** clamp its 2D output under a plane declared by corners
+  (readings to 1.68 while looking below the panel), so the provider's "pinned at the
+  bound" logic never fired and a reading a hair past an edge fell through to the ray
+  path instead; now a reading within 3% of the panel maps to the edge at ordinary sigma
+  and the 2.5° edge sigma is gone. (2) The ray path's edge clamp refused anything more
+  than 25° from the panel *centre*, and this panel's corners are 28° from its centre
+  from the eye, so a look just past a corner vanished; the gate is now 6° beyond the
+  panel's own extent, measured at its corners. (3) A calibration with no output entry
+  for the direct display disabled it, so single-eye frames (the common case at an edge)
+  had no surface to land on. The mount itself reads 8° low in elevation and 33 Hz even
+  when fully tracked; both to be revisited after the tilt is set.
+
 ## 11. Open questions
 
 - nottobii code quality/completeness as a base vs. writing a fresh ET5 driver against its protocol notes.

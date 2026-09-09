@@ -42,6 +42,11 @@ pub struct OutputGeometry {
     /// False for an output that is configured but currently absent from the compositor.
     #[serde(default = "default_true")]
     pub enabled       : bool,
+    /// Whether the screen recogniser watches this output. False for a panel the tracker
+    /// never reaches: capturing and detecting it costs a core for nothing, and a terminal
+    /// scrolling a log there re-triggers detection every half second.
+    #[serde(default = "default_true")]
+    pub detect        : bool,
     pub logical_x     : f64,
     pub logical_y     : f64,
     pub logical_w     : f64,
@@ -304,6 +309,42 @@ impl OutputGeometry {
         self.rotation() * local
     }
 
+    /// Where `ray` meets this panel's surface *extended past its edges*, in this output's
+    /// pixel space, so a point past the bottom edge has `y` beyond `logical_h`. For a gaze
+    /// that is tracked but off every panel: which edge it left through, and how far. `None`
+    /// when the ray never reaches the surface (parallel to a flat panel, or missing a curved
+    /// one's cylinder altogether). The nearest forward root is taken, and for a curved
+    /// panel the one closer to the visible arc when both are ahead.
+    pub fn project_px(&self, ray: &Ray) -> Option<GlobalPx> {
+        let rot    = self.rotation();
+        let inv    = rot.conjugate();
+        let origin = inv * (ray.origin - DVec3::from_array(self.position_mm));
+        let dir    = inv * ray.dir;
+
+        let (t0, t1) = {
+            if self.is_curved() {
+                self.local_cylinder_roots(origin, dir)?
+            }
+            else {
+                (self.local_plane_root(origin, dir)?, f64::INFINITY)
+            }
+        };
+
+        let candidates = [t0, t1]
+            .into_iter()
+            .filter(|t| t.is_finite() && *t > 0.0)
+            .map(|t| self.local_to_uv(origin + dir * t));
+
+        // Distance of (u, v) from the unit square, zero inside it.
+        let outside = |(u, v): &(f64, f64)| {
+            (u.clamp(0.0, 1.0) - u).hypot(v.clamp(0.0, 1.0) - v)
+        };
+
+        let (u, v) = candidates.min_by(|a, b| outside(a).total_cmp(&outside(b)))?;
+
+        Some(self.uv_to_px(u, v))
+    }
+
     /// Nearest forward intersection of `ray` with this panel, as `(t_mm, u, v)`, or `None`
     /// when the ray misses the visible area.
     pub fn intersect(&self, ray: &Ray) -> Option<(f64, f64, f64)> {
@@ -487,6 +528,7 @@ mod tests {
         OutputGeometry {
             name          : name.to_string(),
             enabled       : true,
+            detect        : true,
             logical_x     : logical_x,
             logical_y     : 0.0,
             logical_w     : 1000.0,
@@ -707,6 +749,26 @@ mod tests {
         let hit = disabled.intersect(&ray).expect("far panel still there");
         assert_eq!(hit.output, "far");
         assert!((hit.t_mm - 700.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn project_px_extends_the_panel_past_its_bottom_edge() {
+        let g   = desk();
+        let lg  = g.outputs.iter().find(|o| o.name == "DP-1").expect("the LG");
+        let eye = g.eye();
+
+        // A pixel 300 px below the LG's bottom edge, lifted to a ray the way a provider
+        // would, misses the visible panel but projects back to where it was aimed.
+        let below = GlobalPx { x: lg.logical_x + 1000.0, y: lg.logical_y + lg.logical_h + 300.0 };
+        let world = lg.px_to_world(below);
+        let ray   = Ray { origin: eye, dir: (world - eye).normalize() };
+
+        assert!(g.intersect(&ray).is_none(), "300 px below the panel must miss it");
+
+        let back = lg.project_px(&ray).expect("the extended surface is still ahead");
+
+        assert!((back.x - below.x).abs() < 1.0, "x {} vs {}", back.x, below.x);
+        assert!((back.y - below.y).abs() < 1.0, "y {} vs {}", back.y, below.y);
     }
 
     #[test]

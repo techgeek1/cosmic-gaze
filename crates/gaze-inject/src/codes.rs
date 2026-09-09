@@ -2,7 +2,7 @@
 
 use evdev::KeyCode;
 
-use crate::Button;
+use crate::{Button, Key};
 
 /// High-resolution wheel units per traditional wheel "notch" (a `REL_WHEEL` value of 1).
 /// Matches the kernel's `REL_WHEEL_HI_RES` convention that real mice have reported since
@@ -15,5 +15,12 @@ pub(crate) fn button_code(button: Button) -> KeyCode {
         Button::Left   => KeyCode::BTN_LEFT,
         Button::Right  => KeyCode::BTN_RIGHT,
         Button::Middle => KeyCode::BTN_MIDDLE,
+    }
+}
+
+/// Maps a `Key` to the `KeyCode` a keyboard reports for it.
+pub(crate) fn key_code(key: Key) -> KeyCode {
+    match key {
+        Key::F13 => KeyCode::KEY_F13,
     }
 }

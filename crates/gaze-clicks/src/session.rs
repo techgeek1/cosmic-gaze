@@ -216,9 +216,10 @@ mod tests {
                 score : 0.87,
             },
             crop_luma   : 0.21,
-            frame_age_s : 0.031,
+            frame_age_s : Some(0.031),
             cursor      : Some("hand".into()),
             source      : Some("vision".into()),
+            trainer     : None,
         }
     }
 

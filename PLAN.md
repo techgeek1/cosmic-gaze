@@ -175,6 +175,36 @@ Also has `--provider synthetic|webcam|replay` and the scroll tier (2026-08-26):
   is already delivering the user's own wheel.
 - **`--focus-follows-gaze`** warps (no click) after `--focus-dwell-s` (0.4) of fixation on
   an output the pointer is not on. `--dry-run` gates clicks, scrolls and warps alike.
+- **`--edge-scroll`** (2026-09-04) scrolls the surface under the gaze while the eyes dwell
+  in its lower `--edge-band` (0.12 of its height) or upper `--edge-top-band` (0.12), after
+  `--edge-dwell-s` (0.25) / `--edge-top-dwell-s` (0.5), at `--edge-max-lines-s` (8) times
+  the depth into the band (`--edge-exponent` 1), ramped over `--edge-ramp-s` (0.15). Holding
+  the outer band past `--edge-hold-s` (0.3) multiplies the speed by `--edge-hold-gain` (2) per
+  second, tracked eyes past the screen edge multiply it by `--edge-turbo` (3), all capped at
+  40 lines/s. The
+  surface is the real clipping node from the accessibility tree (`gaze_a11y::clip_surface`,
+  asked on `gaze-clicks`'s watched tree thread), never the window; no tree, no scroll. The
+  pointer is warped into the surface once at the start if it is outside; the motion goes
+  out as `REL_WHEEL_HI_RES` at the sample rate. A band with no content left in its
+  direction is not a band, so the end of a page can be looked at and clicked. When a
+  scroll stops the output under the gaze is re-detected first and the highlight is hidden
+  until that detection is published. `--dry-run` gates it like everything else.
+- **`--daydream`** (2026-09-04) reads the Daydream controller (`gaze-daydream`, BlueZ over
+  D-Bus) beside the mouse: the pad's click commits, a tap on the pad (under 250 ms, no
+  travel) commits with the right button, Home exits, App redetects, the volume keys are a
+  wheel (repeating while held). The controller's gyro says whether it is in a hand (over
+  0.035 rad/s within 6 s, or any touch or button), and the real mouse moving takes the pointer
+  on the spot until the controller is touched, clicked or swung past 0.25 rad/s (a lift off the
+  desk); put down or ceded to the mouse, gaze moves nothing (no edge
+  scroll, no focus warp) and the mouse has the pointer. A thumb resting on the pad is the
+  fine channel:
+  it captures the snap point (the gaze point when nothing snapped), warps the pointer
+  there, locks the gaze out, and `--refine touch` (default; `--refine-touch-gain` 250 px
+  per pad width) or `--refine gyro` (`--refine-gyro-gain` 1500 px/rad, `--refine-axes`
+  `-y,-x`) moves it as plain relative mouse motion inside a `--refine-range` 100 px box
+  around the anchor; the next commit clicks where the pointer is. Lifting the thumb keeps
+  the point until a commit or a retarget, and a thumb landing again resumes the drag; a
+  lift that moved under 2 px is forgotten.
 Live loop wiring provider -> filters -> snap -> overlay, capture+detect on a background
 thread gated by `changed_fraction`, commit on a keypress read from the grabbed mouse's
 buttons (simplest: left button on the Lenovo = commit), click via injector. Logs hits vs

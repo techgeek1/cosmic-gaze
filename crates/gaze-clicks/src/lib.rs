@@ -66,6 +66,7 @@ pub mod mouse;
 pub mod perceive;
 pub mod session;
 pub mod tracker;
+pub mod trainer;
 pub mod tree;
 
 pub use click::{Button, ButtonEvent, MultiCounter, PressKind, classify};
@@ -80,3 +81,5 @@ pub use mouse::{Candidate, MouseReader};
 pub use perceive::{Perception, PerceptionConfig, PointerSample};
 pub use session::ClickSession;
 pub use tracker::TrackerFeed;
+pub use trainer::{MATCH_TOLERANCE_S, TrainerLink, TrainerPress};
+pub use tree::{Question, TreeReply, TreeRequest, TreeService};

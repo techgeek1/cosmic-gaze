@@ -14,5 +14,9 @@ __pycache__/
 /config/calibration*
 # Recording sessions: personal gaze data, keyed to one device blob.
 /config/sessions/
+# The fitted residual model: personal, keyed to one device blob (gaze-et5-cli fit).
+/config/model*.json
+# The online offset: the day's bias, learnt from real clicks (gaze-proto).
+/config/offset*.json
 # Local experiments and captures; not part of the tree.
 /scratchpad/

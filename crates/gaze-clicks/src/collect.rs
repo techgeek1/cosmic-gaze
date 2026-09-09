@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::RecvTimeoutError;
-use gaze_core::{DesktopGeometry, Element, GlobalPx, OutputGeometry};
+use gaze_core::{DesktopGeometry, Element, GlobalPx, OutputGeometry, Rect, TRAINER_SOURCE, TrainerTag};
 use gaze_provider_et5::calibration::VIRTUAL_AREA;
 use gaze_provider_et5::record::{ClickElement, ClickRecord, SESSION_FORMAT, SessionMeta};
 use gaze_provider_et5::sweep::{StopWindow, TimedFrame};
@@ -47,6 +47,7 @@ use tracing::{debug, warn};
 use crate::click::{Button, ButtonEvent, MultiCounter, PressKind, classify};
 use crate::cursor::{CursorShape, classify as classify_cursor};
 use crate::tree::{TREE_TIMEOUT, TreeService};
+use crate::trainer::TrainerLink;
 use crate::element::{CARET_KIND, Pick, kind_name, pick};
 use crate::frames::{
     FrameChoice, GAZE_AFTER_S, GAZE_BEFORE_S, GAZE_MIN_FRACTION, STOP_AFTER_S, STOP_BEFORE_S,
@@ -102,6 +103,9 @@ pub struct CollectConfig {
     /// Half-width of the window the screen luminance is averaged over, logical pixels.
     /// Recognition is pointer-local; this is only the pupil covariate's window.
     pub luma_px     : f64,
+    /// Listen for `gaze-trainer` on its socket and take its word for the presses it
+    /// reports. Off only for tests that must not touch the runtime dir.
+    pub trainer     : bool,
 }
 
 /// What the rules did to the presses that arrived.
@@ -133,6 +137,10 @@ pub struct Tallies {
     /// Accepted on the I-beam's word alone, with no recognised box: an input, a
     /// terminal, a document. Counted alongside `accepted`, not instead of it.
     pub caret        : u64,
+    /// Accepted on the trainer's word: a press inside `gaze-trainer`'s window, whose
+    /// widgets the trainer itself labels. Counted alongside `accepted`, not instead
+    /// of it. A trainer press on nothing labelled counts as `no_element`.
+    pub trainer      : u64,
     /// Accepted, but recognised from the rolling fallback rather than the press's own
     /// capture. Counted alongside `accepted`, not instead of it.
     pub late_capture : u64,
@@ -174,6 +182,21 @@ struct Pending {
     tree_id    : u64,
 }
 
+/// What the trainer had to say about a press.
+enum Verdict {
+    /// The trainer saw the press land on a labelled widget.
+    Labelled {
+        element : ClickElement,
+        /// Theme background luminance, the trainer's stand-in for the crop's.
+        luma    : f64,
+        tag     : TrainerTag,
+    },
+    /// The trainer saw the press, on nothing it labels.
+    Nothing,
+    /// No trainer, or the press was not in its window.
+    Unmatched,
+}
+
 /// The running state of one collector run.
 struct Collector<'a> {
     config     : &'a CollectConfig,
@@ -204,6 +227,11 @@ struct Collector<'a> {
     tree       : TreeService,
     /// Ids handed to tree questions.
     next_tree  : u64,
+    /// The trainer's socket, when it is being listened on.
+    trainer    : Option<TrainerLink>,
+    /// Unix time at `t0`, so collector times and the trainer's wall-clock stamps
+    /// compare.
+    unix0      : f64,
     /// Total clicks written, across session rotations.
     written    : u64,
     /// How many session files this run has opened.
@@ -281,6 +309,23 @@ pub fn run(config: &CollectConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     let meta = session_meta(&blob, &device_display, device_area, &desk, pitch);
     let session = ClickSession::create(&config.out_dir, config.out.as_deref(), &meta)?;
 
+    // The trainer's socket. Failing to bind it is not failing to collect.
+    let trainer = {
+        match config.trainer {
+            false => None,
+            true  => match TrainerLink::listen() {
+                Ok(link) => Some(link),
+                Err(e)   => {
+                    warn!(error = %e, "no trainer socket; trainer clicks will go through recognition");
+
+                    None
+                }
+            },
+        }
+    };
+
+    let unix0 = now_unix_s() - t0.elapsed().as_secs_f64();
+
     println!("writing {}", session.path().display());
 
     let mut collector = Collector {
@@ -300,6 +345,8 @@ pub fn run(config: &CollectConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         next_id    : 0,
         tree       : TreeService::spawn(),
         next_tree  : 0,
+        trainer    : trainer,
+        unix0      : unix0,
         written    : 0,
         files      : 1,
         reported   : Tallies::default(),
@@ -421,6 +468,7 @@ impl Collector<'_> {
 
         if classify(hold_s, moved_px) == PressKind::Drag {
             self.tallies.drag += 1;
+            self.expire_trainer(pending.t_press);
 
             return Ok(());
         }
@@ -432,12 +480,32 @@ impl Collector<'_> {
             .cloned()
         else {
             self.tallies.off_desk += 1;
+            self.expire_trainer(pending.t_press);
 
             return Ok(());
         };
 
-        let Some((element, crop_luma, choice, source)) = self.recognise(&pending, event.t_s)? else {
-            return Ok(());
+        // The trainer's word first: it is the application itself, and it costs nothing.
+        let (element, crop_luma, choice, source, tag) = {
+            match self.trainer_verdict(&pending) {
+                Verdict::Labelled { element, luma, tag } => {
+                    (element, luma, FrameChoice::Stale, TRAINER_SOURCE, Some(tag))
+                }
+                Verdict::Nothing => {
+                    self.tallies.no_element += 1;
+
+                    return Ok(());
+                }
+                Verdict::Unmatched => {
+                    let Some((element, crop_luma, choice, source)) =
+                        self.recognise(&pending, event.t_s)?
+                    else {
+                        return Ok(());
+                    };
+
+                    (element, crop_luma, choice, source, None)
+                }
+            }
         };
 
         if matches!(choice, FrameChoice::Rolling { .. }) {
@@ -466,7 +534,49 @@ impl Collector<'_> {
             }
         }
 
-        self.write(&pending, event, &out, &element, source, crop_luma, choice, &window)
+        self.write(&pending, event, &out, &element, source, tag, crop_luma, choice, &window)
+    }
+
+    /// What the trainer said about this press, if it said anything.
+    ///
+    /// The trainer reports the pointer in its own window's coordinates; the collector
+    /// saw the same press in global coordinates, so the difference is the window's
+    /// origin and the widget's box moves by it. See `gaze_core::trainer`.
+    fn trainer_verdict(&mut self, pending: &Pending) -> Verdict {
+        let Some(link) = &self.trainer else {
+            return Verdict::Unmatched;
+        };
+
+        let t_unix = self.unix0 + pending.t_press;
+
+        let Some(press) = link.take_near(t_unix) else {
+            return Verdict::Unmatched;
+        };
+
+        let Some(element) = press.element else {
+            return Verdict::Nothing;
+        };
+
+        let dx = pending.px.x - press.px[0];
+        let dy = pending.px.y - press.px[1];
+
+        self.tallies.trainer += 1;
+
+        Verdict::Labelled {
+            element : ClickElement {
+                kind  : element.kind,
+                bbox  : Rect {
+                    x : element.bbox.x + dx,
+                    y : element.bbox.y + dy,
+                    w : element.bbox.w,
+                    h : element.bbox.h,
+                },
+                text  : element.text,
+                score : 1.0,
+            },
+            luma    : press.luma,
+            tag     : press.tag,
+        }
     }
 
     /// Asks the perception thread to recognise what is around the press.
@@ -617,6 +727,7 @@ impl Collector<'_> {
         out       : &OutputGeometry,
         element   : &ClickElement,
         source    : &'static str,
+        trainer   : Option<TrainerTag>,
         crop_luma : f64,
         choice    : FrameChoice,
         window    : &[TimedFrame],
@@ -643,6 +754,7 @@ impl Collector<'_> {
             crop_luma   : crop_luma,
             frame_age_s : age_of(choice),
             cursor      : pending.cursor.map(|c| c.name().to_string()),
+            trainer     : trainer,
         };
 
         let stop = self.feed.map(|_| StopWindow {
@@ -777,14 +889,21 @@ impl Collector<'_> {
             }
         };
 
+        let trainer = {
+            match &self.trainer {
+                Some(link) if link.connected() => ", trainer connected",
+                _                              => "",
+            }
+        };
+
         println!(
-            "status: {} accepted ({} tree, {} caret) / {} drag / {} no-element / {} blank \
-             ({} under a hand or I-beam) / {} no-gaze / {} stale ({} late-capture, \
+            "status: {} accepted ({} tree, {} caret, {} trainer) / {} drag / {} no-element / \
+             {} blank ({} under a hand or I-beam) / {} no-gaze / {} stale ({} late-capture, \
              {} overrun, {} off-desk, {} error) — median offset {} over the last {}, \
-             median detect {}",
-            t.accepted, t.tree, t.caret, t.drag, t.no_element, t.blank, t.disputed, t.no_gaze,
-            t.stale, t.late_capture, t.overrun, t.off_desk, t.error, offset,
-            self.offsets.len(), detect,
+             median detect {}{}",
+            t.accepted, t.tree, t.caret, t.trainer, t.drag, t.no_element, t.blank, t.disputed,
+            t.no_gaze, t.stale, t.late_capture, t.overrun, t.off_desk, t.error, offset,
+            self.offsets.len(), detect, trainer,
         );
     }
 
@@ -820,6 +939,13 @@ impl Collector<'_> {
         }
 
         Ok(())
+    }
+
+    /// Drops trainer presses a refused press can no longer match.
+    fn expire_trainer(&self, t_press: f64) {
+        if let Some(link) = &self.trainer {
+            link.expire_before(self.unix0 + t_press);
+        }
     }
 
     /// Sleeps until the collector's clock reaches `t_s`.
@@ -915,11 +1041,11 @@ fn distance(a: GlobalPx, b: GlobalPx) -> f64 {
 }
 
 /// How old the frame behind a click was, relative to the press.
-fn age_of(choice: FrameChoice) -> f64 {
+fn age_of(choice: FrameChoice) -> Option<f64> {
     match choice {
-        FrameChoice::Press { age_s }   => age_s,
-        FrameChoice::Rolling { age_s } => age_s,
-        FrameChoice::Stale             => f64::NAN,
+        FrameChoice::Press { age_s }   => Some(age_s),
+        FrameChoice::Rolling { age_s } => Some(age_s),
+        FrameChoice::Stale             => None,
     }
 }
 
@@ -983,9 +1109,9 @@ mod tests {
 
     #[test]
     fn the_frame_age_carries_the_sign_of_its_source() {
-        assert!(age_of(FrameChoice::Press { age_s: 0.031 }) > 0.0);
-        assert!(age_of(FrameChoice::Rolling { age_s: -0.3 }) < 0.0);
-        assert!(age_of(FrameChoice::Stale).is_nan());
+        assert!(age_of(FrameChoice::Press { age_s: 0.031 }).is_some_and(|a| a > 0.0));
+        assert!(age_of(FrameChoice::Rolling { age_s: -0.3 }).is_some_and(|a| a < 0.0));
+        assert!(age_of(FrameChoice::Stale).is_none());
     }
 
     #[test]

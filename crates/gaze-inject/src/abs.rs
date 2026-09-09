@@ -36,6 +36,9 @@ pub(crate) struct AbsoluteInjector {
     /// Union bounding box of every configured output, in global px: `(min_x, min_y,
     /// max_x, max_y)`. `move_to` scales into this box before converting to axis counts.
     bounds : (f64, f64, f64, f64),
+    /// Where the last `move_to` put the pointer, which is all an absolute device knows
+    /// about its position; `move_by` steps from here.
+    last   : Option<GlobalPx>,
 }
 
 // --- AbsoluteInjector ---
@@ -77,7 +80,7 @@ impl AbsoluteInjector {
             .build()
             .map_err(InjectError::UinputCreate)?;
 
-        Ok(AbsoluteInjector { device: device, bounds: layout.bounds() })
+        Ok(AbsoluteInjector { device: device, bounds: layout.bounds(), last: None })
     }
 }
 
@@ -90,7 +93,24 @@ impl InjectBackend for AbsoluteInjector {
             InputEvent::from(AbsoluteAxisEvent::new(AbsoluteAxisCode::ABS_Y, y)),
         ];
 
-        self.device.emit(&events).map_err(InjectError::Emit)
+        self.device.emit(&events).map_err(InjectError::Emit)?;
+
+        self.last = Some(p);
+
+        Ok(())
+    }
+
+    /// An absolute device has no relative axes, so a nudge is the last position plus the
+    /// delta. Before any `move_to` there is nothing to step from and the nudge is dropped.
+    fn move_by(&mut self, dx: i32, dy: i32) -> Result<()> {
+        match self.last {
+            Some(p) => self.move_to(GlobalPx { x: p.x + f64::from(dx), y: p.y + f64::from(dy) }),
+            None    => {
+                tracing::debug!(dx, dy, "absolute backend: nudge before any move_to, dropped");
+
+                Ok(())
+            }
+        }
     }
 
     fn click(&mut self, button: Button) -> Result<()> {
@@ -108,6 +128,24 @@ impl InjectBackend for AbsoluteInjector {
                 dy * WHEEL_HI_RES_PER_CLICK,
             )),
         ];
+
+        self.device.emit(&events).map_err(InjectError::Emit)
+    }
+
+    fn wheel(&mut self, clicks: i32, hi_res: i32) -> Result<()> {
+        let mut events = Vec::with_capacity(2);
+
+        if clicks != 0 {
+            events.push(InputEvent::from(RelativeAxisEvent::new(RelativeAxisCode::REL_WHEEL, clicks)));
+        }
+
+        if hi_res != 0 {
+            events.push(InputEvent::from(RelativeAxisEvent::new(RelativeAxisCode::REL_WHEEL_HI_RES, hi_res)));
+        }
+
+        if events.is_empty() {
+            return Ok(());
+        }
 
         self.device.emit(&events).map_err(InjectError::Emit)
     }

@@ -63,9 +63,16 @@ pub struct PerceptionConfig {
     pub period             : Duration,
 }
 
+/// What a forced re-detection covers: every output, or one by connector name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Redetect {
+    All,
+    Output(String),
+}
+
 /// Handle to a running perception thread.
 pub struct Perception {
-    redetect : Sender<()>,
+    redetect : Sender<Redetect>,
     stop     : Arc<AtomicBool>,
     join     : Option<JoinHandle<()>>,
 }
@@ -179,7 +186,14 @@ impl Perception {
     pub fn force_redetect(&self) {
         // A full queue would only mean a redetect is already pending, which is the same
         // outcome, so a failed send is not worth reporting.
-        let _ = self.redetect.try_send(());
+        let _ = self.redetect.try_send(Redetect::All);
+    }
+
+    /// Asks for a detection on one output on the next pass, ahead of the others: what a
+    /// scroll that just stopped wants, so the boxes under the gaze are fresh in one
+    /// detection's time rather than a whole pass's.
+    pub fn force_redetect_output(&self, name: &str) {
+        let _ = self.redetect.try_send(Redetect::Output(name.to_string()));
     }
 
     /// Stops the thread and waits for it. Idempotent.
@@ -221,7 +235,7 @@ fn run(
     capture  : Capture,
     detector : Detector,
     store    : Arc<ElementStore>,
-    redetect : Receiver<()>,
+    redetect : Receiver<Redetect>,
     stop     : Arc<AtomicBool>,
 )
 {
@@ -232,8 +246,16 @@ fn run(
     while !stop.load(Ordering::Relaxed) {
         let pass_start = Instant::now();
 
-        // Drain the whole channel: several presses between passes still mean one redetect.
-        let forced = redetect.try_iter().count() > 0;
+        // Drain the whole channel: several requests between passes still mean one pass.
+        let mut forced_all = false;
+        let mut forced     = HashSet::new();
+
+        for request in redetect.try_iter() {
+            match request {
+                Redetect::All          => forced_all = true,
+                Redetect::Output(name) => { forced.insert(name); }
+            }
+        }
 
         // Output identity is re-queried every pass because HDMI-A-1 on this desk drops off
         // the list and comes back (see PLAN.md's environment facts).
@@ -243,9 +265,13 @@ fn run(
             .map(|info| info.name)
             .collect();
 
-        let mut published = false;
+        // Forced outputs first: the one a scroll just stopped on should not wait behind
+        // two others that happened to change. The id offset stays the config index.
+        let mut order : Vec<(usize, &String)> = config.outputs.iter().enumerate().collect();
 
-        for (index, name) in config.outputs.iter().enumerate() {
+        order.sort_by_key(|(_, name)| !forced.contains(*name));
+
+        for (index, name) in order {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -276,7 +302,9 @@ fn run(
 
             let state = states.entry(name.clone()).or_default();
 
-            let Some(trigger) = trigger_for(state, &frame, &config, forced) else {
+            let force = forced_all || forced.contains(name);
+
+            let Some(trigger) = trigger_for(state, &frame, &config, force) else {
                 continue;
             };
 
@@ -323,10 +351,8 @@ fn run(
             state.detected_frame = Some(frame);
             state.detected_at    = Some(Instant::now());
 
-            published = true;
-        }
-
-        if published {
+            // Publish per output, not per pass: a reader waiting on this output's boxes
+            // gets them now instead of after every other output's detection.
             let merged : Vec<Element> = config
                 .outputs
                 .iter()
@@ -334,7 +360,7 @@ fn run(
                 .flat_map(|state| state.elements.iter().cloned())
                 .collect();
 
-            debug!(count = merged.len(), "publishing merged element list");
+            debug!(count = merged.len(), output = %name, "publishing merged element list");
 
             store.publish(merged);
         }

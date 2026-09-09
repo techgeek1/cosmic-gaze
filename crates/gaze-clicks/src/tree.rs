@@ -1,4 +1,6 @@
-//! The accessibility tree, asked once per press on its own thread.
+//! The accessibility tree, asked on its own thread: once per press what is at the point
+//! (the collector), and once per approach to a viewport edge what scrolls there (the
+//! edge scroller in `gaze-proto`).
 //!
 //! `gaze_a11y::A11y` answers "what is at this point" in single-digit milliseconds when
 //! the application under the pointer is on the bus, and not at all when it is not. The
@@ -27,7 +29,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use gaze_a11y::{A11y, Hit};
+use gaze_a11y::{A11y, Hit, Surface};
 use gaze_capture::ToplevelTracker;
 use gaze_core::GlobalPx;
 use tracing::{debug, info, warn};
@@ -47,22 +49,35 @@ const STUCK_AFTER: Duration = Duration::from_secs(5);
 /// resets it. Recovery after the wedge clears is at worst one ceiling late.
 const STUCK_CEILING: Duration = Duration::from_secs(320);
 
+/// What is being asked about a point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Question {
+    /// What is at the point: the collector's question, answered in `hit`.
+    Hit,
+    /// What scrolls at the point: the edge scroller's question, answered in `surface`.
+    Surface,
+}
+
 /// One question.
 #[derive(Clone, Copy, Debug)]
 pub struct TreeRequest {
-    pub id : u64,
-    pub px : GlobalPx,
+    pub id   : u64,
+    pub px   : GlobalPx,
+    pub kind : Question,
 }
 
-/// One answer.
+/// One answer. Whichever field the question did not ask for is `None`.
 #[derive(Clone, Debug)]
 pub struct TreeReply {
-    pub id  : u64,
+    pub id      : u64,
     /// `None` when the point is on no window, the window's application is not on the
     /// bus, or the bus was never there.
-    pub hit : Option<Hit>,
+    pub hit     : Option<Hit>,
+    /// The scroll surface under the point, for a [`Question::Surface`]; `None` for the
+    /// same reasons as `hit`, and when nothing above the point overflows.
+    pub surface : Option<Surface>,
     /// Round trip on the thread, milliseconds.
-    pub ms  : f64,
+    pub ms      : f64,
 }
 
 /// Handle to the tree thread.
@@ -108,6 +123,15 @@ impl TreeService {
 
     /// Asks what is at `px`. The answer is collected later with [`take`](Self::take).
     pub fn ask(&mut self, id: u64, px: GlobalPx) {
+        self.send(TreeRequest { id: id, px: px, kind: Question::Hit });
+    }
+
+    /// Asks what scrolls at `px`. Collected the same way; the answer is in `surface`.
+    pub fn ask_surface(&mut self, id: u64, px: GlobalPx) {
+        self.send(TreeRequest { id: id, px: px, kind: Question::Surface });
+    }
+
+    fn send(&mut self, request: TreeRequest) {
         // The progress clock starts at the first outstanding question, so a quiet
         // stretch with nothing asked never reads as a wedge.
         if self.progress.asked == self.progress.seen {
@@ -117,7 +141,7 @@ impl TreeService {
         self.progress.asked += 1;
 
         // A closed channel means the thread died, which `take` reports as no answer.
-        let _ = self.requests.send(TreeRequest { id: id, px: px });
+        let _ = self.requests.send(request);
     }
 
     /// The reply for `id`, waiting up to `timeout` for it.
@@ -126,7 +150,7 @@ impl TreeService {
     /// answered nothing for [`STUCK_AFTER`] with questions outstanding is wedged on a
     /// blocked D-Bus call, and is replaced before returning.
     pub fn take(&mut self, id: u64, timeout: Duration) -> Option<TreeReply> {
-        if let Some(reply) = self.parked.remove(&id) {
+        if let Some(reply) = self.poll(id) {
             return Some(reply);
         }
 
@@ -141,26 +165,8 @@ impl TreeService {
 
             match self.replies.recv_timeout(left) {
                 Ok(reply) => {
-                    // The thread's first answer proves it is not wedged; a later
-                    // replacement gets the short leash back.
-                    if self.progress.seen == 0 {
-                        self.patience = STUCK_AFTER;
-                    }
-
-                    self.progress.seen += 1;
-                    self.progress.at    = Instant::now();
-
-                    if reply.id == id {
+                    if let Some(reply) = self.accept(id, reply) {
                         return Some(reply);
-                    }
-
-                    self.parked.insert(reply.id, reply);
-
-                    // Keep the park from growing when a caller never collects.
-                    if self.parked.len() > 16 {
-                        let oldest = *self.parked.keys().min()?;
-
-                        self.parked.remove(&oldest);
                     }
                 }
                 Err(_)    => {
@@ -170,6 +176,53 @@ impl TreeService {
                 }
             }
         }
+    }
+
+    /// The reply for `id` if it has already arrived, without waiting. Everything else
+    /// that has arrived is parked for its own caller. For a loop that cannot block, such
+    /// as the gaze loop asking after a scroll surface; a wedge is still noticed here.
+    pub fn poll(&mut self, id: u64) -> Option<TreeReply> {
+        if let Some(reply) = self.parked.remove(&id) {
+            return Some(reply);
+        }
+
+        while let Ok(reply) = self.replies.try_recv() {
+            if let Some(reply) = self.accept(id, reply) {
+                return Some(reply);
+            }
+        }
+
+        self.replace_if_stuck();
+
+        None
+    }
+
+    /// Books one arrived reply: the watchdog sees progress, and the reply is returned if
+    /// it is the one wanted or parked if not.
+    fn accept(&mut self, wanted: u64, reply: TreeReply) -> Option<TreeReply> {
+        // The thread's first answer proves it is not wedged; a later replacement gets
+        // the short leash back.
+        if self.progress.seen == 0 {
+            self.patience = STUCK_AFTER;
+        }
+
+        self.progress.seen += 1;
+        self.progress.at    = Instant::now();
+
+        if reply.id == wanted {
+            return Some(reply);
+        }
+
+        self.parked.insert(reply.id, reply);
+
+        // Keep the park from growing when a caller never collects.
+        if self.parked.len() > 16
+            && let Some(oldest) = self.parked.keys().min().copied()
+        {
+            self.parked.remove(&oldest);
+        }
+
+        None
     }
 
     /// Replaces a wedged thread with a fresh one.
@@ -240,40 +293,62 @@ fn run(requests: Receiver<TreeRequest>, replies: Sender<TreeReply>) {
     }
 
     for request in requests {
-        let started = Instant::now();
-        let hit     = answer(&mut windows, &mut a11y, request.px);
-        let ms      = started.elapsed().as_secs_f64() * 1000.0;
+        let started        = Instant::now();
+        let (hit, surface) = answer(&mut windows, &mut a11y, request.px, request.kind);
+        let ms             = started.elapsed().as_secs_f64() * 1000.0;
 
-        debug!(id = request.id, ms = ms, hit = hit.is_some(), "tree reply");
+        debug!(id = request.id, kind = ?request.kind, ms = ms,
+               answered = hit.is_some() || surface.is_some(), "tree reply");
 
-        if replies.send(TreeReply { id: request.id, hit: hit, ms: ms }).is_err() {
+        let reply = TreeReply { id: request.id, hit: hit, surface: surface, ms: ms };
+
+        if replies.send(reply).is_err() {
             break;
         }
     }
 }
 
 /// One query, with every failure turned into "no answer".
-fn answer(windows: &mut Option<ToplevelTracker>, a11y: &mut Option<A11y>, px: GlobalPx)
-    -> Option<Hit>
+fn answer(
+    windows : &mut Option<ToplevelTracker>,
+    a11y    : &mut Option<A11y>,
+    px      : GlobalPx,
+    kind    : Question,
+)
+    -> (Option<Hit>, Option<Surface>)
 {
-    let windows = windows.as_mut()?;
-    let a11y    = a11y.as_mut()?;
+    let (Some(windows), Some(a11y)) = (windows.as_mut(), a11y.as_mut()) else {
+        return (None, None);
+    };
 
     if let Err(e) = windows.pump() {
         warn!(error = %e, "toplevel list stopped");
 
-        return None;
+        return (None, None);
     }
 
-    let window = windows.at(px)?;
+    let Some(window) = windows.at(px) else {
+        return (None, None);
+    };
 
-    match a11y.at(px, &window) {
-        Ok(hit) => hit,
-        Err(e)  => {
-            debug!(error = %e, app_id = %window.app_id, "tree query failed");
+    match kind {
+        Question::Hit => match a11y.at(px, &window) {
+            Ok(hit) => (hit, None),
+            Err(e)  => {
+                debug!(error = %e, app_id = %window.app_id, "tree query failed");
 
-            None
-        }
+                (None, None)
+            }
+        },
+
+        Question::Surface => match a11y.scroll_surface(px, &window) {
+            Ok(surface) => (None, surface),
+            Err(e)      => {
+                debug!(error = %e, app_id = %window.app_id, "surface query failed");
+
+                (None, None)
+            }
+        },
     }
 }
 

@@ -58,6 +58,9 @@ pub const DEFAULT_REJECT_SLACK : f64 = 2.0;
 /// Interactive controls form one tier, text runs are a worse target than any control at
 /// the same distance, and an unclassified box is worse still. Icons share the top tier
 /// because a detector cannot tell a toolbar button from a decorative glyph.
+///
+/// The penalty is a prior, charged in proportion to how surely the gaze point is *outside*
+/// the box: see the containment ramp in `collect`.
 pub const KIND_PENALTY : [f64; 8] = [
     0.0, // Button
     0.0, // Icon
@@ -89,12 +92,17 @@ pub struct SnapTarget {
 /// area is worth".
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScoreWeights {
-    /// Multiplier on [`KIND_PENALTY`]. At the default, a text run has to be 0.6 deg
-    /// closer than a control to win, and an unclassified box 1.2 deg closer.
+    /// Multiplier on [`KIND_PENALTY`], scaled by the box's distance over the sample's
+    /// sigma and clamped at one. A box the gaze is inside pays nothing, so a text row
+    /// under the gaze beats a control beside it; one a full sigma or more away pays in
+    /// full, so at the default a text run out there has to be 1.5 deg closer than a
+    /// control to win and an unclassified box 3 deg closer.
     pub kind       : f64,
     /// Multiplier on `ln(1 + area_deg2)`. The log keeps a full-screen container from
     /// swamping the distance term while still separating a 0.4 deg icon (0.15) from a
-    /// 6 x 1.7 deg toolbar (2.5): about 0.35 deg of distance at the default weight.
+    /// 6 x 1.7 deg toolbar (2.5): about 0.33 deg of distance at the default weight. This
+    /// is the term that decides between boxes the gaze is inside, so it has to clear the
+    /// hysteresis margin between a line and the block it overlaps: at 0.15 it did not.
     pub area       : f64,
     /// Multiplier on angular distance in degrees from the gaze point to the nearest
     /// point of the box. One by definition: it sets the unit.
@@ -116,7 +124,12 @@ pub struct ScoreWeights {
     /// Multiplier on raw angular distance in degrees from the gaze point to the box
     /// centre. The unclamped, size-independent alternative to `center`: it penalises a
     /// wide row hard when the gaze sits at one end of it, where `center` has saturated.
-    /// Directly comparable to `distance`, and unbounded. Default 0.0.
+    /// Directly comparable to `distance`, and unbounded.
+    ///
+    /// It also charges a text line read at its first word, which is a real cost: live
+    /// (2026-09-04) that alone nearly handed a line to the heading box overlapping it.
+    /// Measuring the offset along the short axis only fixed that and cost five points of
+    /// widget accuracy on the bench, so the line is left to win on `area` instead.
     pub center_deg : f64,
 }
 
@@ -222,9 +235,9 @@ impl SnapEngine {
             return None;
         }
 
-        self.collect(gaze, gaze_ppd_x, gaze_ppd_y, elements);
+        self.collect(gaze, gaze_ppd_x, gaze_ppd_y, f.sample.sigma_deg, elements);
 
-        match self.choose() {
+        match self.choose(elements) {
             Some(winner) => {
                 let target = self.adopt(&winner, gaze, elements);
 
@@ -321,6 +334,7 @@ impl SnapEngine {
         gaze       : GlobalPx,
         gaze_ppd_x : f64,
         gaze_ppd_y : f64,
+        sigma_deg  : f64,
         elements   : &[Element],
     ) {
         let reject_x = self.radius_deg * gaze_ppd_x * self.reject_slack;
@@ -372,7 +386,20 @@ impl SnapEngine {
             let center_deg  = ((gaze.x - centre.x) / ppd_x)
                 .hypot((gaze.y - centre.y) / ppd_y);
 
-            let score = self.weights.kind * KIND_PENALTY[kind_slot(e.kind)]
+            // The kind penalty is a prior on what people click, for choosing between
+            // boxes the gaze is near but on none of. A box the gaze point is inside has
+            // been observed, and the prior has nothing to add: charged in full, a text
+            // row under the gaze lost to any control within 1.5 deg, so the highlight
+            // could never be nudged from a button onto the text row beside it. The prior
+            // ramps in with the odds the point is really outside, which is the distance
+            // against the sample's sigma: a step at the edge made a text line lose to the
+            // heading box over it the moment the gaze drifted a third of a pixel out.
+            // Nested boxes that all contain the point are left to the area term, and a
+            // click on the smaller lands inside the larger anyway.
+            let outside   = (distance_deg / sigma_deg.max(f64::EPSILON)).min(1.0);
+            let kind_cost = self.weights.kind * KIND_PENALTY[kind_slot(e.kind)] * outside;
+
+            let score = kind_cost
                 + self.weights.area * (1.0 + area_deg2).ln()
                 + self.weights.distance * distance_deg
                 + self.weights.center * center_norm
@@ -403,13 +430,14 @@ impl SnapEngine {
     /// what stops the highlight flickering between two neighbours while the gaze jitters
     /// across the boundary between them. A current target that has left the radius has no
     /// score to defend and loses outright.
-    fn choose(&self) -> Option<Candidate> {
+    fn choose(&self, elements: &[Element]) -> Option<Candidate> {
         let best = *self.scratch.first()?;
 
-        let held = self
-            .current
-            .as_ref()
-            .and_then(|cur| self.scratch.iter().find(|c| c.id == cur.element.id));
+        // Ids restart from zero on every detection pass, so an id match alone can be a
+        // different box wearing the old number. Only the same box gets to defend.
+        let held = self.current.as_ref().and_then(|cur| {
+            self.scratch.iter().find(|c| c.id == cur.element.id && elements[c.index].bbox == cur.element.bbox)
+        });
 
         match held {
             Some(h) if best.score >= h.score - self.hysteresis_margin => Some(*h),
@@ -425,8 +453,11 @@ impl SnapEngine {
         let e     = &elements[winner.index];
         let point = e.bbox.clamp(gaze);
 
+        // Same id and same box: the same element, refreshed in place. A re-detect that
+        // reused the id for another box falls through and installs the new element, or
+        // the highlight would keep drawing a rectangle that is no longer on screen.
         match &mut self.current {
-            Some(cur) if cur.element.id == e.id => {
+            Some(cur) if cur.element.id == e.id && cur.element.bbox == e.bbox => {
                 cur.point = point;
                 cur.score = winner.score;
             }
@@ -616,7 +647,11 @@ impl Default for ScoreWeights {
             // and a physical commit a confident-wrong snap is a visible wrong highlight the
             // user nudges, not a wrong click, so the accuracy side of that trade is right.
             kind       : 1.5,
-            area       : 0.15,
+            // 0.15 until 2026-09-04. Bench at sigma 0.7 with the containment ramp: 0.15
+            // gave 26.6% all-targets / 29.5% widgets, 0.3 gave 27.0 / 30.5, 0.4 gave
+            // 27.1 / 31.0 with lines slipping; and 0.3 is what lets a 6 deg2 text line
+            // beat the 21 deg2 heading box over it by more than the hysteresis margin.
+            area       : 0.3,
             distance   : 1.0,
             // Normalised centre term measured harmful (saturates for rows and labels alike).
             center     : 0.0,
@@ -794,6 +829,27 @@ mod tests {
         let t = e.update(&fixating(0.1, 240.0, 112.0), &elements).unwrap();
 
         assert_eq!(t.element.id, 4);
+    }
+
+    #[test]
+    fn a_redetect_that_reuses_an_id_replaces_the_box() {
+        // Pass one: a button at x 160 under the gaze. Pass two: the detector numbers a
+        // different box, 40 px to the right and still within the radius, with the same
+        // id. The target must be the new box; the old code kept the stale rectangle and
+        // only moved the click point.
+        let before = vec![el(1, ElementKind::Button, 160.0, 190.0, 80.0, 20.0)];
+        let after  = vec![el(1, ElementKind::Button, 200.0, 190.0, 80.0, 20.0)];
+        let mut e  = engine();
+
+        let t = e.update(&fixating(0.0, 200.0, 200.0), &before).unwrap();
+
+        assert_eq!(t.element.bbox.x, 160.0);
+
+        let t = e.update(&fixating(0.1, 200.0, 200.0), &after).unwrap();
+
+        assert_eq!(t.element.id, 1);
+        assert_eq!(t.element.bbox.x, 200.0, "the stale box survived the re-detect");
+        assert_eq!(e.current().unwrap().element.bbox.x, 200.0);
     }
 
     #[test]
@@ -991,24 +1047,60 @@ mod tests {
     }
 
     #[test]
-    fn centre_term_prefers_the_nested_label_over_its_row() {
+    fn a_box_containing_the_gaze_pays_no_kind_penalty() {
         let elements = row_and_label();
 
-        // Without a centre term the row wins: distance is zero for both, and the row
-        // being a control outweighs it being 10x the area.
-        let mut plain = engine_with(baseline());
+        // The gaze is inside both the row and its text label. Both have been observed, so
+        // the kind prior is out of it and the area term picks the label, whichever weight
+        // the prior carries. A click on the label lands on the row regardless.
+        for weights in [baseline(), ScoreWeights::default()] {
+            let mut e = engine_with(weights);
+            let t     = e.update(&fixating(0.0, 300.0, 500.0), &elements).unwrap();
 
-        assert_eq!(
-            plain.update(&fixating(0.0, 300.0, 500.0), &elements).unwrap().element.id,
-            1
-        );
+            assert_eq!(t.element.id, 2, "weights {weights:?}");
+        }
+    }
 
-        // The gaze is dead centre in the label and two thirds of the way out from the
-        // centre of the row, which is what flips it.
-        let mut e = engine_with(ScoreWeights { center: 0.8, ..baseline() });
-        let t     = e.update(&fixating(0.0, 300.0, 500.0), &elements).unwrap();
+    #[test]
+    fn the_gaze_can_be_nudged_from_a_button_row_onto_the_text_row_beside_it() {
+        // Two 26 px sidebar rows on a 36 px pitch (0.43 deg at 60 px/deg), the detector
+        // calling one a button and the other a text run. Live, at kind 1.5, the text row
+        // could not be reached at all: the button held from 0.3 deg away against a text
+        // row the gaze was inside.
+        let elements = vec![
+            el(1, ElementKind::Button, 200.0, 500.0, 150.0, 26.0),
+            el(2, ElementKind::Text  , 200.0, 536.0, 150.0, 26.0),
+        ];
+        let mut e = engine();
 
-        assert_eq!(t.element.id, 2);
+        assert_eq!(e.update(&fixating(0.0, 260.0, 513.0), &elements).unwrap().element.id, 1);
+
+        // Into the middle of the text row.
+        assert_eq!(e.update(&fixating(0.1, 260.0, 549.0), &elements).unwrap().element.id, 2);
+
+        // And back, against the same hysteresis.
+        assert_eq!(e.update(&fixating(0.2, 260.0, 513.0), &elements).unwrap().element.id, 1);
+
+        // In the gap between them the prior still counts: the button takes it.
+        assert_eq!(e.update(&fixating(0.3, 260.0, 531.0), &elements).unwrap().element.id, 1);
+    }
+
+    #[test]
+    fn a_hair_outside_a_box_costs_a_hair_of_the_prior() {
+        // Live 2026-09-04: the detector drew one 585 x 112 px "Text" box over a two-line
+        // heading, and the OCR line under it ("techgeek1 wants to merge") starts 27 px
+        // above the heading box's bottom edge. The gaze on that line's top edge, a third
+        // of a pixel out, must not hand the line to the heading.
+        let elements = vec![
+            el(44 , ElementKind::Text, 3865.6, 211.4, 585.0, 112.4),
+            el(111, ElementKind::Text, 3950.1, 296.7, 520.2,  35.4),
+        ];
+        let mut e = engine();
+
+        assert_eq!(e.update(&fixating(0.0, 4096.7, 296.37), &elements).unwrap().element.id, 111);
+
+        // And once inside, the heading's contained score is not close enough to hold.
+        assert_eq!(e.update(&fixating(0.1, 4114.8, 318.1), &elements).unwrap().element.id, 111);
     }
 
     #[test]

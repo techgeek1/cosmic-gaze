@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 use serde::{Deserialize, Serialize};
 use tracing::info;
-use gaze_core::{DesktopGeometry, GlobalPx, OutputGeometry, Ray, Rect};
+use gaze_core::{DesktopGeometry, GlobalPx, OutputGeometry, Ray, Rect, TrainerTag};
 use gaze_overlay::{OverlayHandle, OverlayState};
 
 use crate::blob::{BlobReport, sha256_hex};
@@ -297,13 +297,21 @@ pub struct ClickRecord {
     pub crop_luma   : f64,
     /// Capture-completion time of the frame the element came from, relative to the
     /// press. Positive for the capture fired by the press itself, negative for a
-    /// fallback frame taken from the rolling cache.
-    pub frame_age_s : f64,
+    /// fallback frame taken from the rolling cache. Absent when no frame was used:
+    /// a stale cache, or a trainer click, which the trainer labels without a capture.
+    /// (Written as `null` before 2026-09-04, when it was a NaN `f64` that would not
+    /// read back and silently dropped every trainer click from the export.)
+    #[serde(default)]
+    pub frame_age_s : Option<f64>,
     /// The pointer's shape at the press, as `gaze_clicks::cursor::CursorShape` names it:
     /// `arrow`, `hand`, `text`, `centred` or `other`. Absent when the compositor had not
     /// reported the cursor image, and in files written before it was recorded.
     #[serde(default)]
     pub cursor      : Option<String>,
+    /// What the trainer was asking for, on a click `gaze-trainer` labelled (`source`
+    /// is then `trainer`). Absent on every passive click.
+    #[serde(default)]
+    pub trainer     : Option<TrainerTag>,
 }
 
 /// What a finished session produced.

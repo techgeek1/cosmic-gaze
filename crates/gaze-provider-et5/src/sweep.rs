@@ -35,7 +35,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -292,6 +292,10 @@ impl Default for SweepConfig {
 pub enum SweepKey {
     /// End the current collection early.
     Advance,
+    /// The user says they are on the target now: the controller's pad click, or `c`.
+    /// The retrain treats it as the acceptance itself, checked against the gate's
+    /// vote; everything else treats it as `Advance`.
+    Commit,
     /// Skip the current stop (behind a bezel, uncomfortable).
     Skip,
     /// Abort the sweep.
@@ -299,10 +303,18 @@ pub enum SweepKey {
 }
 
 /// Spawns a stdin reader translating lines into sweep keys: empty line advances,
-/// `s` skips, `q` quits.
+/// `c` commits, `s` skips, `q` quits.
 pub fn terminal_keys() -> Receiver<SweepKey> {
     let (tx, rx) = crossbeam_channel::unbounded();
 
+    terminal_keys_into(tx);
+
+    rx
+}
+
+/// The stdin reader behind [`terminal_keys`], feeding a channel the caller owns so
+/// another source (a controller) can share it.
+pub fn terminal_keys_into(tx: Sender<SweepKey>) {
     std::thread::Builder::new()
         .name("sweep-keys".into())
         .spawn(move || {
@@ -316,6 +328,7 @@ pub fn terminal_keys() -> Receiver<SweepKey> {
                 let key = {
                     match line.trim() {
                         ""  => SweepKey::Advance,
+                        "c" => SweepKey::Commit,
                         "s" => SweepKey::Skip,
                         "q" => SweepKey::Quit,
                         _   => continue,
@@ -328,8 +341,6 @@ pub fn terminal_keys() -> Receiver<SweepKey> {
             }
         })
         .expect("spawn key thread");
-
-    rx
 }
 
 // --- Outcome ---
@@ -937,7 +948,7 @@ pub(crate) fn wait_draining(
 
                     return Ok(());
                 }
-                Ok(SweepKey::Advance) => return Ok(()),
+                Ok(SweepKey::Advance | SweepKey::Commit) => return Ok(()),
                 Err(_)                => {}
             }
         }
@@ -1559,7 +1570,7 @@ fn triangulated_plane(out: &OutputGeometry, points: &[PointObservation])
 /// the sagitta, which a three-corner declaration cannot express; the trained mapping
 /// absorbs the 2D consequences, and only the firmware's internal head-translation
 /// compensation sees the residual depth error.
-pub(crate) fn plane_corners(out: &OutputGeometry) -> DisplayArea {
+pub fn plane_corners(out: &OutputGeometry) -> DisplayArea {
     DisplayArea {
         tl_mm : out.uv_to_world(0.0, 0.0).to_array(),
         tr_mm : out.uv_to_world(1.0, 0.0).to_array(),
@@ -1571,7 +1582,7 @@ pub(crate) fn plane_corners(out: &OutputGeometry) -> DisplayArea {
 /// mount pitch, so a point high in the desk frame drops in the sensor frame the
 /// way the measured eye origins do (true eye height ~200 mm reads as ~38 mm on
 /// this setup — a frame pitched up ~13 degrees).
-pub(crate) fn desk_to_sensor(p: [f64; 3], pitch_deg: f64) -> [f64; 3] {
+pub fn desk_to_sensor(p: [f64; 3], pitch_deg: f64) -> [f64; 3] {
     let (sin, cos) = pitch_deg.to_radians().sin_cos();
 
     [p[0], p[1] * cos - p[2] * sin, p[1] * sin + p[2] * cos]
@@ -2831,6 +2842,7 @@ mod tests {
         let out = OutputGeometry {
             name          : "RING".into(),
             enabled       : true,
+            detect        : true,
             logical_x     : 0.0,
             logical_y     : 0.0,
             logical_w     : 4520.0,

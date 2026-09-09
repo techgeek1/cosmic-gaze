@@ -160,6 +160,20 @@ pub struct Hit {
     pub coord   : CoordMode,
 }
 
+/// The scrollable region under a point: the nearest ancestor whose content overflows
+/// it vertically. See [`A11y::scroll_surface`] and [`clip_surface`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Surface {
+    /// The clipping node: what a wheel event over `viewport` scrolls.
+    pub clip     : Node,
+    /// Its extents in global logical pixels. The bands an edge scroller wants are
+    /// measured against this, never against the window.
+    pub viewport : Rect,
+    /// The overflowing child's extents, which extend above and/or below the viewport.
+    /// How far it pokes out is how much there is left to scroll each way.
+    pub content  : Rect,
+}
+
 /// An application on the bus.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Application {
@@ -237,6 +251,71 @@ impl A11y {
     pub fn at(&mut self, p: GlobalPx, window: &Toplevel) -> Result<Option<Hit>, A11yError> {
         let started = Instant::now();
 
+        let Some((leaf, mode, origin)) = self.resolve(p, window)? else {
+            return Ok(None);
+        };
+
+        let (target, climbed) = self.climb(&leaf, mode, origin, window)?;
+
+        debug!(?mode, role = %leaf.role, ms = started.elapsed().as_secs_f64() * 1000.0, "a11y hit");
+
+        Ok(Some(Hit {
+            leaf    : leaf,
+            target  : target,
+            climbed : climbed,
+            coord   : mode,
+        }))
+    }
+
+    /// The node under `p` and every ancestor above it, leaf first, up to and including
+    /// the frame. Diagnostic: this is the walk `at` deliberately does not make, and it
+    /// exists so the shape of a toolkit's tree (which ancestor is the scroll surface, what
+    /// it is called, what its extents are against its children's) can be read off the
+    /// desk instead of guessed. Empty when the tree has no answer.
+    pub fn ancestors(&mut self, p: GlobalPx, window: &Toplevel) -> Result<Vec<Node>, A11yError> {
+        let Some((leaf, mode, origin)) = self.resolve(p, window)? else {
+            return Ok(Vec::new());
+        };
+
+        let mut chain = vec![leaf];
+
+        while chain.len() <= MAX_CLIMB {
+            let last = chain.last().expect("non-empty");
+
+            if last.role == "frame" || last.role == "application" {
+                break;
+            }
+
+            let Some((pb, pp)) = self.parent(&last.bus, &last.path)? else {
+                break;
+            };
+
+            chain.push(self.node(&pb, &pp, mode, origin, window)?);
+        }
+
+        Ok(chain)
+    }
+
+    /// The scrollable region under `p`: [`clip_surface`] over [`A11y::ancestors`].
+    /// `Ok(None)` when the tree has no answer or nothing above the point overflows.
+    pub fn scroll_surface(&mut self, p: GlobalPx, window: &Toplevel)
+        -> Result<Option<Surface>, A11yError>
+    {
+        let started = Instant::now();
+        let chain   = self.ancestors(p, window)?;
+        let surface = clip_surface(&chain);
+
+        debug!(depth = chain.len(), found = surface.is_some(),
+               ms = started.elapsed().as_secs_f64() * 1000.0, "scroll surface");
+
+        Ok(surface)
+    }
+
+    /// The leaf under `p`, with the coordinate interpretation and frame origin that
+    /// produced it. Shared by [`A11y::at`] and [`A11y::ancestors`].
+    fn resolve(&mut self, p: GlobalPx, window: &Toplevel)
+        -> Result<Option<(Node, CoordMode, FrameOrigin)>, A11yError>
+    {
         let Some((bus, frame)) = self.frame_for(window)? else {
             debug!(app_id = %window.app_id, title = %window.title, "no accessible application for the window");
 
@@ -283,22 +362,12 @@ impl A11y {
             }
 
             let leaf = self.node(&leaf_bus, &leaf_path, mode, origin, window)?;
-            let (target, climbed) = self.climb(&leaf, mode, origin, window)?;
 
-            debug!(?mode, role = %leaf.role, ms = started.elapsed().as_secs_f64() * 1000.0, "a11y hit");
-
-            return Ok(Some(Hit {
-                leaf    : leaf,
-                target  : target,
-                climbed : climbed,
-                coord   : mode,
-            }));
+            return Ok(Some((leaf, mode, origin)));
         }
 
         Ok(None)
     }
-
-    // --- Lookups ---
 
     /// The application frame that is `window`, as (bus, path).
     ///
@@ -350,7 +419,6 @@ impl A11y {
         Ok((b, p.to_string()))
     }
 
-    /// `Component.GetExtents`, or `None` for an object without a `Component`.
     fn extents(&self, bus: &str, path: &str, coord: u32) -> Option<(i32, i32, i32, i32)> {
         let proxy = self.proxy(bus, path, IFACE_COMPONENT).ok()?;
 
@@ -521,6 +589,58 @@ impl A11y {
 ///
 /// `image` is here deliberately: a thumbnail is a click target in its own right, and a
 /// collector wants to know the click was on a picture rather than on text.
+/// Slack in the overflow test, logical pixels: rounding between a toolkit's layout and
+/// the integer extents it reports.
+const OVERFLOW_SLACK_PX: f64 = 1.0;
+
+/// A clipping node shorter than this is not a scroll viewport, and the walk continues
+/// past it. A table cell whose glyphs overhang it, a one-line label taller than its row:
+/// these overflow their parent by the geometric test too, and taking the first of them
+/// hides the page scroll behind a clip nothing can usefully scroll.
+pub const MIN_CLIP_PX: f64 = 120.0;
+
+/// The scroll surface in an ancestor chain (leaf first, as [`A11y::ancestors`] returns
+/// it): the first ancestor whose child's extents extend above or below its own.
+///
+/// Toolkits do not label scroll surfaces. AT-SPI has a `scroll pane` role and GTK uses
+/// it, but Firefox scrolls its page as a `document web`, and a Discord list or a
+/// scrollable `div` anywhere is a plain `section` or `panel` with nothing in its role or
+/// state set saying it clips. What every toolkit does report is geometry: the clipping
+/// node's extents are its viewport, and the child it clips keeps its full laid-out
+/// extents, which overflow the viewport. Measured on the desk 2026-09-04, this rule
+/// found Discord's message list (a 4305 px `list` in an 898 x 1296 `panel` ending above
+/// the composer), Discord's channel sidebar (a 2272 px `list` in a 302 x 1292
+/// `section`) and Firefox's page (a 12901 px `landmark` in a 1269 x 1343
+/// `document web`), each with the right viewport. The same test says "nothing to
+/// scroll" for content that fits, which is also the right answer.
+///
+/// Horizontal overflow is ignored: a carousel is not what a vertical wheel moves. A clip
+/// shorter than [`MIN_CLIP_PX`] is skipped for the next one up, see there.
+pub fn clip_surface(chain: &[Node]) -> Option<Surface> {
+    for pair in chain.windows(2) {
+        let (Some(child), Some(parent)) = (pair[0].rect, pair[1].rect) else {
+            continue;
+        };
+
+        if parent.h < MIN_CLIP_PX || parent.w <= 0.0 {
+            continue;
+        }
+
+        let above = child.y < parent.y - OVERFLOW_SLACK_PX;
+        let below = child.y + child.h > parent.y + parent.h + OVERFLOW_SLACK_PX;
+
+        if above || below {
+            return Some(Surface {
+                clip     : pair[1].clone(),
+                viewport : parent,
+                content  : child,
+            });
+        }
+    }
+
+    None
+}
+
 pub fn is_actionable(role: &str) -> bool {
     matches!(
         role,
@@ -595,6 +715,100 @@ mod tests {
 
         // A frame smaller than its toplevel (a toolkit rounding down) adds nothing.
         assert_eq!(FrameOrigin::of((0, 0, tw - 1, th), &w), FrameOrigin { x: 0, y: 0 });
+    }
+
+    /// A node with only what `clip_surface` reads.
+    fn boxed(role: &str, x: f64, y: f64, w: f64, h: f64) -> Node {
+        Node {
+            bus  : ":1.4".to_string(),
+            path : format!("/{role}"),
+            role : role.to_string(),
+            name : String::new(),
+            rect : Some(Rect { x: x, y: y, w: w, h: h }),
+        }
+    }
+
+    #[test]
+    fn the_discord_message_list_clips_at_the_panel_above_the_composer() {
+        // `gaze-a11y-cli chain 756,866`, 2026-09-04, leaf first.
+        let chain = vec![
+            boxed("image"    , 469.0,   802.0, 399.0,  225.0),
+            boxed("button"   , 469.0,   802.0, 399.0,  225.0),
+            boxed("article"  , 453.0,   655.0, 432.0,  417.0),
+            boxed("section"  , 453.0,   653.0, 786.0,  421.0),
+            boxed("list item", 381.0,   585.0, 882.0,  491.0),
+            boxed("list"     , 381.0, -2761.0, 882.0, 4305.0),
+            boxed("section"  , 381.0, -2761.0, 882.0, 4305.0),
+            boxed("panel"    , 381.0,   248.0, 898.0, 1296.0),
+            boxed("landmark" , 381.0,   248.0, 898.0, 1346.0),
+        ];
+
+        let surface = clip_surface(&chain).expect("the list overflows the panel");
+
+        assert_eq!(surface.clip.role, "panel");
+        assert_eq!(surface.viewport, Rect { x: 381.0, y: 248.0, w: 898.0, h: 1296.0 });
+        assert_eq!(surface.content.h, 4305.0);
+    }
+
+    #[test]
+    fn the_firefox_page_clips_at_the_document_not_the_window() {
+        // `gaze-a11y-cli chain 1985,966`: five same-sized sections above the landmark
+        // are all overflowing children of the document, and none of them is the clip.
+        let chain = vec![
+            boxed("section"     , 1350.0,   960.0,  827.0,    72.0),
+            boxed("article"     , 1350.0, -4931.0,  827.0, 11676.0),
+            boxed("section"     , 1318.0, -4963.0,  891.0, 11740.0),
+            boxed("section"     , 1285.0, -6043.0, 1269.0, 12901.0),
+            boxed("landmark"    , 1285.0, -6043.0, 1269.0, 12901.0),
+            boxed("document web", 1285.0,   251.0, 1269.0,  1343.0),
+            boxed("scroll pane" , 1285.0,   251.0, 1269.0,  1343.0),
+            boxed("frame"       , 1285.0,   166.0, 1269.0,  1428.0),
+        ];
+
+        let surface = clip_surface(&chain).expect("the landmark overflows the document");
+
+        assert_eq!(surface.clip.role, "document web");
+        assert_eq!(surface.viewport.h, 1343.0);
+    }
+
+    #[test]
+    fn content_that_fits_has_no_surface_and_a_carousel_does_not_count() {
+        let fits = vec![
+            boxed("button" , 100.0, 100.0,  50.0,  20.0),
+            boxed("section",  90.0,  90.0, 200.0, 100.0),
+            boxed("frame"  ,   0.0,   0.0, 800.0, 600.0),
+        ];
+
+        assert_eq!(clip_surface(&fits), None);
+
+        // A row of cards wider than its strip: horizontal overflow only.
+        let carousel = vec![
+            boxed("image"  , 100.0, 100.0, 100.0,  80.0),
+            boxed("list"   ,   0.0,  95.0, 3000.0, 90.0),
+            boxed("section",  50.0,  95.0,  700.0, 90.0),
+            boxed("frame"  ,   0.0,   0.0,  800.0, 600.0),
+        ];
+
+        assert_eq!(clip_surface(&carousel), None);
+    }
+
+    #[test]
+    fn a_cell_its_glyphs_overhang_is_not_the_clip_the_page_is() {
+        // A diff's line-number cell: the text node pokes out of the 20 px cell, which by
+        // the raw test is a clip. The page scroll is three levels up.
+        let chain = vec![
+            boxed("text"        , 1300.0,   498.0,   40.0,    24.0),
+            boxed("table cell"  , 1300.0,   500.0,   40.0,    20.0),
+            boxed("table row"   , 1300.0,   500.0,  900.0,    20.0),
+            boxed("table"       , 1300.0, -3000.0,  900.0,  9000.0),
+            boxed("document web", 1285.0,   251.0, 1269.0,  1343.0),
+            boxed("frame"       , 1285.0,   166.0, 1269.0,  1428.0),
+        ];
+
+        let surface = clip_surface(&chain).expect("the table overflows the document");
+
+        assert_eq!(surface.clip.role, "document web");
+        assert_eq!(surface.content.h, 9000.0);
     }
 
     #[test]

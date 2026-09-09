@@ -8,6 +8,8 @@ use clap::{Parser, ValueEnum};
 use gaze_core::{NoiseModel, SigmaProfile};
 use gaze_provider_webcam::DEFAULT_SOCKET;
 
+use crate::daydream::RefineMode;
+
 /// Off-axis angle the `--sigma` override declares its flat region reaches to. Far beyond
 /// anything a desk spans, so `SigmaProfile::sigma_at` never leaves that region and every
 /// sample gets exactly the sigma that was asked for, on every output.
@@ -95,6 +97,21 @@ pub struct Args {
     #[arg(long)]
     pub calibration: Option<PathBuf>,
 
+    /// Residual model for the ET5 provider (`gaze-et5-cli fit`). Omitted, the
+    /// conventional file (`config/model-et5.json`) is used when it exists.
+    #[arg(long)]
+    pub model: Option<PathBuf>,
+
+    /// Where the ET5 online offset (the day's bias, learnt from real clicks) persists
+    /// across runs. Only meaningful with a residual model.
+    #[arg(long, default_value = "config/offset-et5.json")]
+    pub offset: PathBuf,
+
+    /// Keep the ET5 online offset frozen: real clicks are attributed and logged but
+    /// do not move it, and nothing is written to `--offset`.
+    #[arg(long)]
+    pub freeze_offset: bool,
+
     /// I-VT saccade velocity threshold, deg/s. Default 30 (tracker) or 80 (webcam).
     #[arg(long)]
     pub filter_velocity_deg_s: Option<f64>,
@@ -133,6 +150,54 @@ pub struct Args {
     #[arg(long, default_value_t = 0.4)]
     pub focus_dwell_s: f64,
 
+    /// Scroll the surface under the gaze continuously while the eyes dwell in its lower
+    /// or upper band, at a speed that grows with how deep in the band they are. The
+    /// surface is the real scrolling region from the accessibility tree, never the
+    /// window; where the tree has no answer nothing scrolls. See `edge_scroll`.
+    #[arg(long)]
+    pub edge_scroll: bool,
+
+    /// Share of the surface's height forming the lower (read-on) band.
+    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_BAND_FRACTION)]
+    pub edge_band: f64,
+
+    /// Share of the surface's height forming the upper (go-back) band.
+    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_TOP_BAND_FRACTION)]
+    pub edge_top_band: f64,
+
+    /// Seconds the gaze must stay in the lower band before scrolling starts.
+    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_DWELL_S)]
+    pub edge_dwell_s: f64,
+
+    /// Seconds the gaze must stay in the upper band before scrolling starts.
+    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_TOP_DWELL_S)]
+    pub edge_top_dwell_s: f64,
+
+    /// Scroll speed at the surface's edge, wheel lines per second.
+    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_MAX_LINES_S)]
+    pub edge_max_lines_s: f64,
+
+    /// Seconds for the speed to ramp up from zero when a scroll starts.
+    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_RAMP_S)]
+    pub edge_ramp_s: f64,
+
+    /// Exponent on band depth: 1 is linear, 2 slow near the inner edge and fast at the outer.
+    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_EXPONENT)]
+    pub edge_exponent: f64,
+
+    /// Seconds the eyes must hold the outer part of the band before the speed grows.
+    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_HOLD_S)]
+    pub edge_hold_s: f64,
+
+    /// Speed multiplier gained per second of hold past `--edge-hold-s` (2 doubles it
+    /// every second), capped at 40 lines per second overall.
+    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_HOLD_GAIN)]
+    pub edge_hold_gain: f64,
+
+    /// Speed multiplier while the tracked eyes are past the edge of the screen itself.
+    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_TURBO)]
+    pub edge_turbo: f64,
+
     /// Override the desk noise profile with a flat sigma, in degrees, on every output.
     /// Also sets the webcam provider's flat sigma, which otherwise defaults to the 2.5
     /// degrees `gaze-provider-webcam` calls the optimistic end of webcam-only gaze.
@@ -155,6 +220,40 @@ pub struct Args {
     /// Draw the noise-free gaze point on the overlay alongside the noisy one.
     #[arg(long)]
     pub show_truth: bool,
+
+    /// Read the Daydream controller (`gaze-daydream`) alongside the mouse: its pad
+    /// commits, Home exits, App holds the voice stack's push-to-talk (forwarded as F13),
+    /// the volume keys are a wheel, and a thumb on the pad refines the commit point (see
+    /// `--refine`). Pair it once with
+    /// `bluetoothctl` and wake it with Home before starting.
+    #[arg(long)]
+    pub daydream: bool,
+
+    /// The controller's Bluetooth address, when more than one is paired.
+    #[arg(long, requires = "daydream")]
+    pub daydream_address: Option<String>,
+
+    /// What moves the commit point while the thumb rests on the controller's pad.
+    #[arg(long, value_enum, default_value_t = RefineMode::Touch, requires = "daydream")]
+    pub refine: RefineMode,
+
+    /// Gyro refine gain, logical pixels per radian of wrist turn.
+    #[arg(long, default_value_t = crate::daydream::DEFAULT_GYRO_GAIN_PX_PER_RAD)]
+    pub refine_gyro_gain: f64,
+
+    /// Touch refine gain, logical pixels per full pad width.
+    #[arg(long, default_value_t = crate::daydream::DEFAULT_TOUCH_GAIN_PX)]
+    pub refine_touch_gain: f64,
+
+    /// Side of the box, centred on where the refine began, that the refined point stays
+    /// inside, in logical pixels.
+    #[arg(long, default_value_t = crate::daydream::DEFAULT_RANGE_PX)]
+    pub refine_range: f64,
+
+    /// Which gyro axes drive pointer x and y, each `x`, `y` or `z` with an optional
+    /// minus, pointer x first. Change it if the wrist and the pointer disagree.
+    #[arg(long, default_value = crate::daydream::DEFAULT_AXES)]
+    pub refine_axes: String,
 
     /// Commit channel latency, in seconds. A commit is attributed to the target that was
     /// fixated this long ago, not to whatever is under the gaze now.
@@ -226,13 +325,30 @@ impl Args {
 
     /// Whether anything at all may reach the real pointer this run.
     ///
-    /// `--dry-run` is the master off switch: it gates warps and scrolls as well as clicks,
+    /// `--dry-run` is the master off switch: it gates warps and scrolls (wheel and edge)
+    /// as well as clicks,
     /// so a dry run is safe to leave running while the desk is being used for something
     /// else. Note that the default (neither flag) is *not* a dry run for the scroll tier:
     /// `--scroll` alone scrolls for real, because a scroll is not a click and routing it
     /// to the window under gaze is the whole point of the flag.
     pub fn injects(&self) -> bool {
-        !self.dry_run && (self.click || self.scroll || self.focus_follows_gaze)
+        !self.dry_run && (self.click || self.scroll || self.focus_follows_gaze || self.edge_scroll)
+    }
+
+    /// The edge scroller's tunables from the flags.
+    pub fn edge_params(&self) -> crate::edge_scroll::EdgeParams {
+        crate::edge_scroll::EdgeParams {
+            band_fraction     : self.edge_band,
+            top_band_fraction : self.edge_top_band,
+            dwell_s           : self.edge_dwell_s,
+            top_dwell_s       : self.edge_top_dwell_s,
+            max_lines_s       : self.edge_max_lines_s,
+            ramp_s            : self.edge_ramp_s,
+            exponent          : self.edge_exponent,
+            hold_s            : self.edge_hold_s,
+            hold_gain         : self.edge_hold_gain,
+            turbo             : self.edge_turbo,
+        }
     }
 }
 

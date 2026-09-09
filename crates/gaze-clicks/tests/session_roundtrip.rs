@@ -109,9 +109,10 @@ fn a_written_click_session_loads_back_as_click_rows() {
             score : 0.91,
         },
         crop_luma   : 0.34,
-        frame_age_s : 0.028,
+        frame_age_s : Some(0.028),
         cursor      : None,
         source      : Some("vision".into()),
+        trainer     : None,
     };
 
     let stop = StopWindow {
@@ -211,9 +212,10 @@ fn a_click_session_without_gaze_still_loads() {
             score : 0.55,
         },
         crop_luma   : 0.9,
-        frame_age_s : 0.041,
+        frame_age_s : Some(0.041),
         cursor      : None,
         source      : Some("vision".into()),
+        trainer     : None,
     };
 
     session.write_click(&click, None, &[]).expect("the click is written");

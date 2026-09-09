@@ -9,8 +9,10 @@
 
 pub mod geometry;
 pub mod noise;
+pub mod trainer;
 pub mod types;
 
 pub use geometry::{DesktopGeometry, OutputGeometry, SurfaceHit, rotation_ypr};
 pub use noise::{NoiseModel, SigmaProfile};
+pub use trainer::{TRAINER_SOURCE, TrainerElement, TrainerMessage, TrainerTag, socket_path};
 pub use types::{Element, ElementKind, ElementSource, GazeSample, GlobalPx, OutputPx, Ray, Rect};

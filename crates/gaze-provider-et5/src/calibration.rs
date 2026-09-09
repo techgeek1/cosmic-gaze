@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use gaze_core::{DesktopGeometry, GlobalPx, OutputGeometry};
 
 use crate::blob::CalibrationResult;
-use crate::field::FieldMap;
+use crate::field::{FieldDegree, FieldMap, FieldRow, fit_best};
 use crate::ttp::{DisplayArea, DisplayRect};
 
 /// Format version written to the file; bump on breaking changes. Version 2 replaced
@@ -209,6 +209,24 @@ pub struct HealthStop {
     pub samples   : usize,
 }
 
+/// Fewest health stops a field is fitted from. Below this the held-out selection has
+/// nothing to hold out and the fit would be the noise of a couple of dwells.
+pub const MIN_HEALTH_ROWS: usize = 6;
+
+/// What `fit_field_from_health` decided, for the log.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FieldFit {
+    /// Health stops the fit used.
+    pub rows         : usize,
+    /// Degree chosen; `Translation` with zero coefficients is the identity.
+    pub degree       : FieldDegree,
+    /// RMS of the stops uncorrected, normalised units.
+    pub identity_rms : f64,
+    /// Held-out RMS of the chosen map, normalised units. Equal to `identity_rms`
+    /// when nothing beat leaving the data alone.
+    pub score        : f64,
+}
+
 /// A complete client-side calibration.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Et5Calibration {
@@ -292,6 +310,53 @@ impl Et5Calibration {
         self.outputs.iter().find(|o| o.name == name)
     }
 
+    /// Fits the direct-mode display's correction field from the health check: each
+    /// stop is one row, the firmware's reported gaze against the target, both in the
+    /// display's normalised coordinates, which is exactly what `correct_point` sees
+    /// at run time. Selection is `fit_best`'s: the identity competes, so a health
+    /// check that is pure noise leaves the field as it was. Returns the chosen degree,
+    /// the identity's RMS and the winner's held-out RMS (normalised units), or `None`
+    /// when there is no direct display, no matching output entry, or fewer than
+    /// [`MIN_HEALTH_ROWS`] stops.
+    pub fn fit_field_from_health(&mut self) -> Option<FieldFit> {
+        let name = self.device_output.clone()?;
+
+        if self.health.len() < MIN_HEALTH_ROWS {
+            return None;
+        }
+
+        let rows: Vec<FieldRow> = self.health.iter()
+            .map(|h| FieldRow {
+                nx      : 2.0 * h.gaze_u - 1.0,
+                ny      : 2.0 * h.gaze_v - 1.0,
+                want_nx : 2.0 * h.u - 1.0,
+                want_ny : 2.0 * h.v - 1.0,
+            })
+            .collect();
+
+        let identity_rms = {
+            let sum: f64 = rows.iter()
+                .map(|r| (r.nx - r.want_nx).powi(2) + (r.ny - r.want_ny).powi(2))
+                .sum();
+
+            (sum / rows.len() as f64).sqrt()
+        };
+
+        let (map, score) = fit_best(&rows);
+        let degree       = map.degree;
+        let entry        = self.outputs.iter_mut().find(|o| o.name == name)?;
+
+        entry.field          = map;
+        entry.field_rms_norm = score;
+
+        Some(FieldFit {
+            rows         : rows.len(),
+            degree       : degree,
+            identity_rms : identity_rms,
+            score        : score,
+        })
+    }
+
     /// Rewrites the pose fields of every matching output in `geometry` with the
     /// solved poses. Outputs the sweep did not cover keep their configured pose.
     pub fn apply_poses(&self, geometry: &mut DesktopGeometry) {
@@ -369,6 +434,7 @@ mod tests {
         OutputGeometry {
             name          : "DP-9".into(),
             enabled       : true,
+            detect        : true,
             logical_x     : 100.0,
             logical_y     : 200.0,
             logical_w     : 1000.0,

@@ -29,6 +29,11 @@ pub enum WarpReason {
     Scroll,
     /// A fixation outlasted the dwell on an output the pointer was not on.
     Focus,
+    /// An edge scroll started with the pointer outside the surface it has to land on.
+    EdgeScroll,
+    /// The controller's refine gesture began: the pointer goes to the snap point so the
+    /// hand can take it from there.
+    Refine,
 }
 
 /// Warp policy and the counters the exit summary reports.

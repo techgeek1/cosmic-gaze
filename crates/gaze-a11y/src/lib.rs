@@ -39,4 +39,4 @@
 
 mod bus;
 
-pub use bus::{A11y, A11yError, Application, CoordMode, Hit, Node, is_actionable};
+pub use bus::{A11y, A11yError, Application, CoordMode, Hit, MIN_CLIP_PX, Node, Surface, clip_surface, is_actionable};

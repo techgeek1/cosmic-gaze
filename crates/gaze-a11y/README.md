@@ -100,11 +100,32 @@ reverted within the minute.
 the pixels. That is the division of labour the design set out: the tree where there is
 one, the recogniser where there is not.
 
+## The second question: what scrolls here
+
+`A11y::scroll_surface` finds the scrollable region under a point, for `gaze-proto`'s edge
+scroller. Toolkits do not label scroll surfaces (AT-SPI has a `scroll pane` role, but
+Firefox scrolls its page as a `document web` and a Discord list is a `section`), so the
+rule is geometric: walk the ancestors of the node under the point, and the first one whose
+child's extents poke out above or below its own is the clip, its extents the viewport
+(`clip_surface`). Measured 2026-09-04 with `gaze-a11y-cli chain`:
+
+| point                    | overflowing child            | clip found                          |
+|--------------------------|------------------------------|-------------------------------------|
+| Discord message list     | `list` 882 x 4305            | `panel` 898 x 1296, above composer  |
+| Discord channel sidebar  | `list` 294 x 2272            | `section` 302 x 1292                |
+| Firefox page body        | `landmark` 1269 x 12901      | `document web` 1269 x 1343          |
+
+Content that fits produces no surface, which is also the right answer. Horizontal
+overflow (a carousel) is ignored, and so is a clip under 120 px tall (`MIN_CLIP_PX`): a
+cell whose glyphs overhang it passes the geometric test but is not what a wheel moves, and
+stopping there would hide the page scroll behind it. Cost is the hit plus one parent walk, 10 to 30 ms.
+
 ## CLI
 
 ```
 gaze-a11y-cli apps                 # applications and their windows on the bus
 gaze-a11y-cli at 4919,698          # the node under a desk point, with timing
+gaze-a11y-cli chain 4919,698       # that node and every ancestor, role and extents each
 gaze-a11y-cli follow --seconds 30  # the node under the pointer whenever it moves
 ```
 

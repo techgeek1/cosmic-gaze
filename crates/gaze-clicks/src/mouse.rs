@@ -28,7 +28,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,9 @@ use crate::click::{Button, ButtonEvent};
 /// the clone input-remapper publishes on this desk. Mouse-shaped nodes are read
 /// regardless, so this only matters for a clone that hides its buttons.
 pub const DEFAULT_NAME: &str = "input-remapper mouse";
+
+/// Name substring of `gaze-inject`'s virtual pointer, which is never a user's mouse.
+pub const INJECTOR_NAME: &str = "gaze-inject";
 
 /// How long the reader sleeps between polls of the non-blocking fds. Two milliseconds
 /// caps the error on a press timestamp at the same figure, which is a tenth of the
@@ -83,6 +86,11 @@ pub struct MouseReader {
     join   : Option<JoinHandle<()>>,
     /// The nodes open at startup, path and kernel name, for the startup log.
     nodes  : Vec<(PathBuf, String)>,
+    /// Nanoseconds after `t0` of the last motion, wheel or button event on any node,
+    /// plus one; zero until the first. A hand on the mouse is read from this.
+    input  : Arc<AtomicU64>,
+    /// The clock `input` counts from.
+    t0     : Instant,
 }
 
 // --- MouseReader ---
@@ -120,14 +128,16 @@ impl MouseReader {
             .collect();
 
         let stop     = Arc::new(AtomicBool::new(false));
+        let input    = Arc::new(AtomicU64::new(0));
         let (tx, rx) = crossbeam_channel::unbounded();
 
         let join = thread::Builder::new()
             .name("gaze-clicks-mouse".to_string())
             .spawn({
-                let stop = Arc::clone(&stop);
+                let stop  = Arc::clone(&stop);
+                let input = Arc::clone(&input);
 
-                move || run(readings, rescan, &tx, &capture, &stop, t0)
+                move || run(readings, rescan, &tx, &capture, &stop, &input, t0)
             })
             .context("spawning the mouse reader thread")?;
 
@@ -136,7 +146,18 @@ impl MouseReader {
             stop   : stop,
             join   : Some(join),
             nodes  : nodes,
+            input  : input,
+            t0     : t0,
         })
+    }
+
+    /// When the mouse last did anything: moved, scrolled, or had a button pressed or
+    /// released. `None` until it has.
+    pub fn last_input(&self) -> Option<Instant> {
+        match self.input.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(self.t0 + Duration::from_nanos(n - 1)),
+        }
     }
 
     /// The nodes that were open at startup, path and kernel name. The rescan may add
@@ -203,6 +224,12 @@ pub fn candidates() -> Vec<Candidate> {
 /// grabbed node (a remapper's source) is silent to every other reader — exactly one
 /// open node speaks for any physical press.
 pub fn wanted(candidate: &Candidate, name_substr: &str) -> bool {
+    // `gaze-inject`'s uinput device is mouse-shaped, and every press it makes is one
+    // the gaze itself placed: reading it back would label the gaze with the gaze.
+    if candidate.name.contains(INJECTOR_NAME) {
+        return false;
+    }
+
     let mouse = candidate.buttons && !candidate.keyboard;
     let named = !name_substr.is_empty() && candidate.name.contains(name_substr);
 
@@ -262,7 +289,7 @@ fn open_node(path: &Path) -> Result<Reading> {
 }
 
 /// Reads every open node until `stop` is set, forwarding left and right press and
-/// release.
+/// release and stamping `input` with every event a hand on the mouse produces.
 ///
 /// A press fires its screen capture before the event is queued, so the capture starts
 /// as close to the press as this process can manage. A node that errors is dropped
@@ -274,6 +301,7 @@ fn run(
     tx           : &Sender<ButtonEvent>,
     capture      : &Sender<u64>,
     stop         : &AtomicBool,
+    input        : &AtomicU64,
     t0           : Instant,
 )
 {
@@ -291,6 +319,8 @@ fn run(
             match reading.device.fetch_events() {
                 Ok(events) => {
                     for event in events {
+                        note_input(event, input, t0);
+
                         forwarded |= forward(event, &mut next_id, tx, capture, t0);
                     }
                 }
@@ -331,6 +361,21 @@ fn run(
         if !forwarded {
             thread::sleep(POLL_INTERVAL);
         }
+    }
+}
+
+/// Stamps `input` when the event is one a hand makes: relative motion (which includes
+/// the wheel) or any key. Sync reports and the odd misc event are not a hand.
+fn note_input(event: InputEvent, input: &AtomicU64, t0: Instant) {
+    let hand = matches!(
+        event.destructure(),
+        EventSummary::RelativeAxis(..) | EventSummary::Key(..)
+    );
+
+    if hand {
+        let ns = t0.elapsed().as_nanos().min(u64::MAX as u128 - 1) as u64;
+
+        input.store(ns + 1, Ordering::Relaxed);
     }
 }
 

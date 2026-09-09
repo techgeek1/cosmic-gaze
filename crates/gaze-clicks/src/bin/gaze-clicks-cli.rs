@@ -90,6 +90,11 @@ enum Command {
         /// pixels. Recognition is pointer-local; this is only the pupil covariate.
         #[arg(long, default_value_t = 256.0)]
         luma_px     : f64,
+
+        /// Do not listen for `gaze-trainer`; its clicks then go through recognition
+        /// like any other application's.
+        #[arg(long)]
+        no_trainer  : bool,
     },
 
     /// List the evdev nodes a run could read, and mark the one it would pick.
@@ -146,7 +151,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Run {
             out, out_dir, mouse, mouse_name, models, desk, calibration, blob,
-            no_tracker, capture_hz, luma_px,
+            no_tracker, capture_hz, luma_px, no_trainer,
         } => run(CollectConfig {
             out         : out,
             out_dir     : out_dir,
@@ -159,6 +164,7 @@ fn main() -> Result<()> {
             no_tracker  : no_tracker,
             capture_hz  : capture_hz,
             luma_px     : luma_px,
+            trainer     : !no_trainer,
         }),
 
         Command::Devices { mouse_name }                 => devices(&mouse_name),

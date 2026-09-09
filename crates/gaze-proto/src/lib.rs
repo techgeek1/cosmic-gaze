@@ -30,6 +30,10 @@
 
 pub mod buttons;
 pub mod cli;
+pub mod daydream;
+pub mod edge_scroll;
+pub mod feedback;
+pub mod surface;
 pub mod perception;
 pub mod score;
 pub mod session;
@@ -37,6 +41,7 @@ pub mod source;
 pub mod warp;
 
 pub use cli::{Args, Provider};
+pub use feedback::ClickFeed;
 pub use perception::{ElementStore, Perception, PerceptionConfig};
 pub use score::{Outcome, Scoreboard, classify};
 pub use source::{Control, GazeSource, WebcamHealth};

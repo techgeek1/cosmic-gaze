@@ -4,6 +4,7 @@
 //! ```text
 //! gaze-a11y-cli apps                 # applications and their windows on the AT-SPI bus
 //! gaze-a11y-cli at 4919,698          # the node under a desk point
+//! gaze-a11y-cli chain 4919,698       # that node and every ancestor up to the frame
 //! gaze-a11y-cli follow --seconds 30  # the node under the pointer, whenever it moves
 //! ```
 //!
@@ -39,6 +40,12 @@ enum Command {
         points: Vec<GlobalPx>,
     },
 
+    /// Report the node under one or more desk points and every ancestor above it, with
+    /// role, name and extents at each level: the shape of the tree around a point.
+    Chain {
+        #[arg(value_parser = parse_point, num_args = 1..)]
+        points: Vec<GlobalPx>,
+    },
     /// Report the node under the pointer whenever it moves.
     Follow {
         /// Stop after this many seconds instead of waiting for Ctrl-C.
@@ -57,6 +64,7 @@ fn main() -> Result<()> {
     match args.command {
         Command::Apps               => apps(),
         Command::At { points }      => at(&points),
+        Command::Chain { points }   => chain(&points),
         Command::Follow { seconds, hz } => follow(seconds, hz),
     }
 }
@@ -96,6 +104,40 @@ fn at(points: &[GlobalPx]) -> Result<()> {
         println!("({:.0}, {:.0}) in {:?} [{}]: {}  ({:.1} ms)",
                  point.x, point.y, truncate(&window.title, 30), window.app_id,
                  describe(hit.as_ref()), started.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    Ok(())
+}
+
+/// Reports the ancestor chain above each point, leaf first.
+fn chain(points: &[GlobalPx]) -> Result<()> {
+    let mut windows = ToplevelTracker::connect().context("opening the toplevel list")?;
+    let mut a11y    = A11y::connect().context("connecting to the accessibility bus")?;
+
+    windows.pump().context("reading the toplevel list")?;
+
+    for &point in points {
+        let Some(window) = windows.at(point) else {
+            println!("({:.0}, {:.0}): no window", point.x, point.y);
+
+            continue;
+        };
+
+        let started = Instant::now();
+        let nodes   = a11y.ancestors(point, &window).context("asking the tree")?;
+
+        println!("({:.0}, {:.0}) in {:?} [{}] window ({:.0},{:.0}) {:.0}x{:.0}  ({:.1} ms)",
+                 point.x, point.y, truncate(&window.title, 30), window.app_id,
+                 window.rect.x, window.rect.y, window.rect.w, window.rect.h,
+                 started.elapsed().as_secs_f64() * 1000.0);
+
+        for (depth, n) in nodes.iter().enumerate() {
+            let rect = n.rect.map_or("no extents".to_string(), |r| {
+                format!("({:.0},{:.0}) {:.0}x{:.0} bottom {:.0}", r.x, r.y, r.w, r.h, r.y + r.h)
+            });
+
+            println!("  {depth:2} {:<16} {rect}  {:?}", n.role, truncate(&n.name, 40));
+        }
     }
 
     Ok(())

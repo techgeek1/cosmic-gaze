@@ -1,8 +1,12 @@
 # ET5 provider build plan: host-owned device state, then a state-conditioned model
 
-**Status 2026-08-28: A0–A3, B1–B2, B4 and the Phase C harness built (see DESIGN.md §10c results
-log); A5 built — `calibrate` is now the retrain ceremony (no `--retrain` flag; it confirms
-before touching the device). A4, B3 and the device checks are the user's.** Background and the research that led here:
+**Status 2026-09-04: A0–A3, A5, B1–B2, B4–B5, Phase C, D1–D3 and D5 built (DESIGN.md §10c
+results log). Phase C ran on five click sessions: the per-eye direction kernel model takes
+the held-out per-click median from 1.83° to 1.44° (21%, under the 25% gate) and one August
+session gets worse, because the day-to-day bias is the next largest term. D5, a causal
+click-fed offset, reaches 1.20° on the same clicks in simulation (the oracle is 1.22) and
+is live in `gaze-proto`, fed by the real mouse. `gaze-et5-cli fit` writes
+`config/model-et5.json`, `gaze-proto` picks it and `config/offset-et5.json` up.** Background and the research that led here:
 DESIGN.md §10c. This plan replaces the compound sweep's client-side fitting (correction
 field + head-gain regression) and, more importantly, the assumption that the tracker
 remembers its own calibration.
@@ -230,6 +234,47 @@ it is the data source E1/E2's flywheel acceptance will eventually run on.
   prints and outlines the element under the pointer four times a second (`--hz`), with the
   capture-to-draw latency, through the same `element::pick` a click goes through.
 
+### B5. Driven labels from a real application (`gaze-trainer`)
+
+The five-minute dot ceremony does not produce accurate data (ruled 2026-09-03 after
+eight attempts), and passive clicks are accurate but slow and biased toward wherever
+the user's applications put their controls. The trainer is the third source: a
+libcosmic application the user simply navigates, generated fresh in one of six
+archetypes (settings, files, mail, editor, browser, store) so the layouts differ, and
+that knows its own widget boxes. No tasks, no instructions, no targets (ruled
+2026-09-03 after the first driven session): the clicks are whatever the user finds
+worth clicking, which is what makes them ordinary clicks rather than target
+acquisition.
+
+- **Labels come from the application, not from recognition.** Every control is wrapped
+  in a `Probe` that reports its box on draw and publishes its label on a press,
+  synchronously in the event pass. The press goes to the collector over
+  `$XDG_RUNTIME_DIR/gaze-clicks.sock` as one JSON line (`gaze_core::trainer`), in
+  window-local coordinates; the collector saw the same press in global coordinates
+  and the difference is the window origin, which cancels the toolkit's coordinate
+  space. Matched by wall-clock time within 150 ms. A matched press skips the tree and
+  the recogniser (`source = "trainer"`, score 1); a press on nothing labelled is
+  refused as `no-element`. Probes never nest, so one probe speaks per press.
+- **Coverage steering.** An 8×4 histogram over the window, seeded from every `click`
+  record in `config/sessions/` on the trainer's output, biases the *layout* rather than
+  choosing a target: the share of labels in the left half and in the top half become
+  the probabilities of putting the next window's sidebar on the right and its toolbar
+  at the bottom (clamped to [0.2, 0.8]), so the emptier half fills first. The rest of
+  the layout varies per window anyway: sidebar width, density, dialog anchor.
+- **Posture prompts** every 80 labelled presses (`--posture-every`), cycling normal /
+  back / in / left / normal / right / tall / slouch; the posture stays on the wire until
+  the next prompt. **Theme** flips dark/light per window for the pupil; the theme
+  background's luminance is the click's `crop_luma`.
+- **Records.** `ClickRecord` gains `trainer: Option<TrainerTag>` (task, step, hit,
+  posture, theme). `task` is now the generated window's number and `step` is reserved
+  at 0; `hit` now means "a labelled control was under the press", so a press on
+  padding or the header bar is the only `hit = false`. The export gains `source`,
+  `posture`, `trainer_task` and `trainer_hit` columns, so a window can be held out
+  whole and passive clicks can be the generalisation check for trainer clicks.
+- **Open questions for Phase C.** Whether deliberate trainer clicks predict passive
+  ones (train on trainer, test on passive sessions); whether unlabelled (`hit = false`)
+  presses are worth keeping; whether the eye leads the click by the same margin in both.
+
 ### B3. Collection **[user]**
 - ≥ 6 sessions over ≥ 3 days, morning and evening, glasses state noted. Nothing else moves
   (tracker, monitors, desk config) during the collection window.
@@ -248,22 +293,42 @@ it is the data source E1/E2's flywheel acceptance will eventually run on.
 - **Gate to Phase D:** session-out RMS at least 25% below the best baseline and no session
   worse. If the residual is dominated by a per-session constant uncorrelated with any
   feature, Phase D shrinks to D5 (the online offset is the whole answer).
+  **Outcome 2026-09-04:** 21% on the per-click median, one session worse; neither
+  branch cleanly. The field is real (every trainer session −30%) and so is the day
+  bias (the per-session offset oracle on top takes it to −33%). D1–D3 built for the
+  feel; D5 next.
 
 ## Phase D — Rust runtime
 
 ### D1. `model.rs`: kernel model (inducing points, weights, lengthscales, variance solve),
   `predict(&Features) -> (dyaw_deg, dpitch_deg, var)`, serde in the calibration file.
+  **Built 2026-09-04**, as its own file `config/model-et5.json` (800 KB of centres and
+  the variance form is not TOML material), keyed to the blob hash and the mount pitch.
 ### D2. `train.rs`: fit from B2 rows with `nalgebra` Cholesky; grouped-CV grid for the
   hyperparameters; `gaze-et5-cli fit` writes the calibration. Must reproduce C3's numbers
-  on the same export (test).
+  on the same export (test). **Built**: no `nalgebra` (a Jacobi eigensolve, a Cholesky
+  and k-means++ in 300 lines); no grid at fit time, the hyperparameters are the harness's
+  pick and are flags; `fit` reproduces `loso_clicks.py` (1.82 → 1.43 vs 1.83 → 1.44).
 ### D3. Provider: correction applied to the firmware ray before intersection; variance →
   σ profile; correction faded to zero above a variance threshold. Field and head gain
-  removed. Calibration format v2 (older files refused).
+  removed. Calibration format v2 (older files refused). **Built**: field and head gain
+  bypassed rather than removed when a model is loaded; the corrected ray is intersected
+  with the configured desk rotated by the pitch the labels used, not the solved poses.
 ### D4. `EyeCombiner`: weights from rolling pupil-signal variance through a sigmoid with a
   moving average (Tobii [patent reference removed]), times a per-eye residual weight by region from the
   training data.
 ### D5. Online offset: yaw/pitch bias with exponential forgetting (minutes), reset when the
   head state jumps past a threshold, updated only by accepted flywheel pairs (E2).
+  **Built 2026-09-04** as `offset.rs` plus the provider's `observe_click`: forgetting is
+  per click (gain 0.1, so about ten clicks) rather than per minute, the innovation is
+  clipped at 2° and gated at 3° (E2's foveal tolerance, no RANSAC yet), and there is no
+  head-jump reset (the simulation tracked the trainer's posture changes without one).
+  Persisted to `config/offset-et5.json`, keyed to the blob. Simulated 1.44 → 1.20°.
+  **Reworked 2026-09-05** after the single bias broke on a slouch: the bias is now a
+  function of head position, a set of anchors (one per posture, 60 mm reach on the
+  binocular midpoint) each holding its own yaw/pitch and blended by distance, a new
+  posture inheriting the blend and closing most of its gap in ten clicks. Daydream pad commits feed it alongside mouse presses.
+  The file format changed; an old file starts cold.
 
 ## Phase E — Flywheel
 
@@ -271,6 +336,12 @@ it is the data source E1/E2's flywheel acceptance will eventually run on.
   pointer from `CursorTracker`), attribute the fixation from the ring buffer with a
   stimulus-type window (gaze precedes the click) and log (features, click px, fixation
   stats) to `config/flywheel/<date>.jsonl`. Snap commits log the same record.
+  **Partly built 2026-09-04** (`gaze-proto/src/feedback.rs`): the real mouse, the
+  pointer and the attribution (0.4 s before the press, the window `label_timing.py`
+  found flat) feed D5 directly, one log line per press. Not built: the JSONL record with
+  features. Mouse-button snap commits are *not* offered (they are the gaze clicking, and
+  the feed already sees the physical press); Daydream pad commits are, since 2026-09-05,
+  refined or not.
 ### E2. Acceptance: foveal tolerance against the current prediction (start at 3°); rejects go
   to an error buffer whose overflow raises "recalibrate" in the log; RANSAC over the recent
   buffer before any parameter update; ≥ 4 observations and a spatial-spread check.
@@ -281,7 +352,7 @@ it is the data source E1/E2's flywheel acceptance will eventually run on.
 
 ## Order and parallelism
 
-A0, A1, A2, A3, A5 code, B1, B2, B4 and the C1–C4 harness (against session zero) are all
+A0, A1, A2, A3, A5 code, B1, B2, B4, B5 and the C1–C4 harness (against session zero) are all
 agent work and mostly independent; A1 first because everything else connects through it. A4 and
 B3 are the user's, and Phase C's real result waits on B3. D1–D2 can start against C3's
 exported model before the gate if the harness is ready; D3–D5 and E wait for the gate.
