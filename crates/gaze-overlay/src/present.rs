@@ -1,27 +1,24 @@
-//! The pointer look: how a [`Pointer`] intent becomes a dot, a trail and a highlight
-//! over time.
+//! The pointer look: how a [`Pointer`] intent becomes a dot and a highlight over time.
 //!
-//! The producer says what is where and whether the eyes are moving; this decides how it
-//! looks from one frame to the next. The dot fades in as the gaze reaches something
-//! clickable and out as it leaves, the highlight crossfades from one element to the
-//! next instead of jumping, a short trail follows the dot through a saccade, and the dot
-//! thins to a ghost once a fixation has settled on a target. Everything is driven by a
-//! clock the caller advances, so it runs on the overlay thread's frame callbacks and can
-//! be stepped by hand in a test.
+//! The producer says what is where; this decides how it looks from one frame to the
+//! next. The dot fades in as the gaze reaches something clickable and out as it leaves,
+//! and the highlight crossfades from one element to the next instead of jumping.
+//! Everything is driven by a clock the caller advances, so it runs on the overlay
+//! thread's frame callbacks and can be stepped by hand in a test.
 //!
 //! The look is deliberately quiet. Every choice here is about not putting motion or
-//! colour next to text the user is reading: the raw gaze point is never marked, fades
-//! are fast enough not to lag the eyes but slow enough not to blink, and the trail is a
-//! few faint samples that are gone within a fifth of a second of the eyes stopping.
+//! colour next to text the user is reading: the raw gaze point is never marked, and the
+//! fades are fast enough not to lag the eyes but slow enough not to blink. A trail
+//! behind the dot and a thinner dot on a settled fixation were both tried on 2026-09-09
+//! and taken out again: at 33 Hz the trail read as a rendering bug, and a dot that
+//! changed weight while the eyes held still looked like it was doing something.
 
-use std::collections::VecDeque;
-
-use gaze_core::{GlobalPx, Rect};
+use gaze_core::Rect;
 use tiny_skia::Pixmap;
 
 use crate::draw::{self, Item, PixelBox};
 use crate::mapping::OutputMapping;
-use crate::state::{Motion, OverlayState, Pointer, Target};
+use crate::state::{OverlayState, Pointer, Target};
 use crate::theme::Theme;
 
 /// Radius of the dot, logical pixels. Eight across, about four times a period in the
@@ -32,16 +29,13 @@ pub const DOT_RADIUS_PX: f64 = 4.0;
 /// Width of the halo around the dot and the highlight stroke, logical pixels.
 pub const HALO_PX: f64 = 1.0;
 
-/// Alpha of the dot while the eyes are moving or have just landed.
+/// Alpha of the dot when shown.
 pub const DOT_ALPHA: f32 = 0.9;
 
-/// Alpha of the dot once a fixation has settled on a target. The highlight carries the
-/// information from then on; the dot only has to be findable.
-pub const GHOST_ALPHA: f32 = 0.4;
-
-/// How far the highlight sits outside the element's box, logical pixels, so its stroke
-/// does not paint over the widget's own border.
-pub const HIGHLIGHT_INFLATE_PX: f64 = 3.0;
+/// How far the highlight's inner edge sits outside the element's box, logical pixels.
+/// One pixel: enough to keep the stroke off the widget's own border without making the
+/// box read as bigger than the widget, which it did at three.
+pub const HIGHLIGHT_INFLATE_PX: f64 = 1.0;
 
 /// Stroke width of the highlight, logical pixels.
 pub const HIGHLIGHT_STROKE_PX: f64 = 2.0;
@@ -60,15 +54,6 @@ pub const FADE_IN_S: f64 = 0.06;
 /// to a neighbour reads as sliding, not blinking.
 pub const FADE_OUT_S: f64 = 0.14;
 
-/// How long a trail sample lives, seconds. Five samples at the tracker's 33 Hz.
-pub const TRAIL_S: f64 = 0.15;
-
-/// Width of the trail at its head, logical pixels. It tapers to nothing at the tail.
-pub const TRAIL_WIDTH_PX: f64 = 3.0;
-
-/// Alpha of the trail at its head, relative to the dot's.
-pub const TRAIL_ALPHA: f32 = 0.35;
-
 /// Alpha below which a fade is finished and the item stops being drawn.
 const ALPHA_EPSILON: f32 = 1.0 / 255.0;
 
@@ -82,8 +67,6 @@ pub struct Presenter {
     /// Every highlight still visible: the current target fading in, and any previous
     /// ones fading out behind it.
     boxes  : Vec<Highlight>,
-    /// Gaze samples from the current or last saccade, oldest first.
-    trail  : VecDeque<TrailPoint>,
     /// The clock as of the last step, seconds on the caller's timeline.
     now_s  : f64,
 }
@@ -102,13 +85,6 @@ struct Highlight {
     fade   : Fade,
 }
 
-/// One gaze sample on the trail.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct TrailPoint {
-    t_s : f64,
-    p   : GlobalPx,
-}
-
 // --- Presenter ---
 
 impl Presenter {
@@ -119,7 +95,6 @@ impl Presenter {
             intent : None,
             dot    : Fade { alpha: 0.0, goal: 0.0 },
             boxes  : Vec::new(),
-            trail  : VecDeque::new(),
             now_s  : 0.0,
         }
     }
@@ -134,10 +109,9 @@ impl Presenter {
         &self.theme
     }
 
-    /// Takes a new intent at time `now_s`. Sets where every fade is heading and extends
-    /// the trail when the eyes are moving; nothing moves until [`Presenter::step`],
-    /// which is also what advances the clock (`now_s` here only stamps the trail).
-    pub fn observe(&mut self, pointer: Option<&Pointer>, now_s: f64) {
+    /// Takes a new intent. Sets where every fade is heading; nothing moves until
+    /// [`Presenter::step`].
+    pub fn observe(&mut self, pointer: Option<&Pointer>) {
         let Some(p) = pointer else {
             self.intent   = None;
             self.dot.goal = 0.0;
@@ -149,12 +123,8 @@ impl Presenter {
             return;
         };
 
-        // The dot: shown near something clickable, thinned once settled on a target.
-        self.dot.goal = match (p.near, p.motion, p.target) {
-            (false, _, _)                   => 0.0,
-            (true, Motion::Settled, Some(_)) => GHOST_ALPHA,
-            (true, _, _)                     => DOT_ALPHA,
-        };
+        // The dot: shown near something clickable, and not otherwise.
+        self.dot.goal = if p.near { DOT_ALPHA } else { 0.0 };
 
         // The highlight: the current target heads for full, everything else for zero.
         // A target already on the list (fading out after a brief switch away, say) is
@@ -176,12 +146,6 @@ impl Presenter {
             }
         }
 
-        // The trail: only a moving eye adds to it, and only while the dot is up, so a
-        // saccade across a page of prose leaves no streak.
-        if p.motion == Motion::Moving && p.near {
-            self.trail.push_back(TrailPoint { t_s: now_s, p: p.gaze });
-        }
-
         self.intent = Some(*p);
     }
 
@@ -200,23 +164,17 @@ impl Presenter {
 
         self.boxes.retain(|h| h.fade.goal > 0.0 || h.fade.alpha > 0.0);
 
-        while self.trail.front().is_some_and(|t| now_s - t.t_s > TRAIL_S) {
-            self.trail.pop_front();
-        }
-
         self.active()
     }
 
-    /// True while a fade is in progress or the trail has not yet expired.
+    /// True while a fade is in progress.
     pub fn active(&self) -> bool {
-        !self.dot.settled()
-            || self.boxes.iter().any(|h| !h.fade.settled())
-            || !self.trail.is_empty()
+        !self.dot.settled() || self.boxes.iter().any(|h| !h.fade.settled())
     }
 
     /// True when nothing is drawn and nothing is about to be.
     pub fn is_idle(&self) -> bool {
-        self.dot.alpha <= 0.0 && self.boxes.is_empty() && self.trail.is_empty()
+        self.dot.alpha <= 0.0 && self.boxes.is_empty()
     }
 
     /// The draw items for one output as of the last step. Like [`draw::scene`], items
@@ -253,14 +211,6 @@ impl Presenter {
 
         if alpha < ALPHA_EPSILON {
             return items;
-        }
-
-        if self.trail.len() >= 2 {
-            items.push(Item::Trail {
-                points : self.trail.iter().map(|t| map.buffer(t.p)).collect(),
-                width  : map.buffer_len(TRAIL_WIDTH_PX),
-                color  : self.theme.accent_at(alpha * TRAIL_ALPHA),
-            });
         }
 
         if let Some(p) = self.intent {
@@ -304,11 +254,6 @@ impl Presenter {
     pub fn highlights(&self) -> impl Iterator<Item = (Target, f32)> + '_ {
         self.boxes.iter().map(|h| (h.target, h.fade.alpha))
     }
-
-    /// How many samples the trail holds.
-    pub fn trail_len(&self) -> usize {
-        self.trail.len()
-    }
 }
 
 // --- Fade ---
@@ -344,16 +289,17 @@ fn inflate(r: Rect, by: f64) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    use gaze_core::GlobalPx;
+
     use super::*;
 
     fn map() -> OutputMapping {
         OutputMapping::new("DP-1", Rect { x: 0.0, y: 0.0, w: 1000.0, h: 600.0 }, 1)
     }
 
-    fn pointer(x: f64, motion: Motion, near: bool, target: Option<u64>) -> Pointer {
+    fn pointer(x: f64, near: bool, target: Option<u64>) -> Pointer {
         Pointer {
             gaze   : GlobalPx { x: x, y: 300.0 },
-            motion : motion,
             near   : near,
             target : target.map(|id| Target {
                 id   : id,
@@ -381,20 +327,20 @@ mod tests {
     fn the_dot_is_hidden_away_from_interactive_elements() {
         let mut p = Presenter::new(Theme::fallback());
 
-        p.observe(Some(&pointer(100.0, Motion::Moving, false, None)), 0.0);
+        p.observe(Some(&pointer(100.0, false, None)));
         run(&mut p, 0.5);
 
         assert!(p.scene(&map()).is_empty());
         assert!(p.is_idle());
     }
 
-    /// The dot fades in near a target, ghosts once settled on it, and the highlight
-    /// comes up with it.
+    /// The dot fades in near a target and the highlight comes up with it; the dot's
+    /// weight does not change afterwards.
     #[test]
-    fn the_dot_appears_near_a_target_and_ghosts_when_settled() {
+    fn the_dot_appears_near_a_target_at_one_weight() {
         let mut p = Presenter::new(Theme::fallback());
 
-        p.observe(Some(&pointer(100.0, Motion::Settling, true, Some(1))), 0.0);
+        p.observe(Some(&pointer(100.0, true, Some(1))));
 
         assert!(p.step(0.001) , "a fade in is in progress");
         assert!(p.dot_alpha() > 0.0 && p.dot_alpha() < DOT_ALPHA);
@@ -403,11 +349,7 @@ mod tests {
 
         assert_eq!(p.dot_alpha(), DOT_ALPHA);
         assert_eq!(p.highlights().map(|(_, a)| a).collect::<Vec<_>>(), vec![1.0]);
-
-        p.observe(Some(&pointer(100.0, Motion::Settled, true, Some(1))), p.now_s);
-        run(&mut p, 1.0);
-
-        assert_eq!(p.dot_alpha(), GHOST_ALPHA);
+        assert!(!p.active(), "a settled look asks for no frames");
     }
 
     /// Moving from one element to the next crossfades: for a while both are drawn, the
@@ -416,10 +358,10 @@ mod tests {
     fn a_new_target_crossfades_from_the_old_one() {
         let mut p = Presenter::new(Theme::fallback());
 
-        p.observe(Some(&pointer(100.0, Motion::Settled, true, Some(1))), 0.0);
+        p.observe(Some(&pointer(100.0, true, Some(1))));
         run(&mut p, 0.5);
 
-        p.observe(Some(&pointer(300.0, Motion::Settling, true, Some(2))), p.now_s);
+        p.observe(Some(&pointer(300.0, true, Some(2))));
         p.step(p.now_s + 0.03);
 
         let mid: Vec<(u64, f32)> = p.highlights().map(|(t, a)| (t.id, a)).collect();
@@ -438,39 +380,15 @@ mod tests {
         assert_eq!(p.highlights().map(|(t, _)| t.id).collect::<Vec<_>>(), vec![2]);
     }
 
-    /// The trail is fed by moving samples only and is gone within its lifetime of the
-    /// eyes stopping, so a settled dot never has one.
-    #[test]
-    fn the_trail_follows_a_saccade_and_expires() {
-        let mut p = Presenter::new(Theme::fallback());
-
-        for i in 0..4 {
-            let t = i as f64 * 0.03;
-
-            p.observe(Some(&pointer(100.0 + i as f64 * 40.0, Motion::Moving, true, None)), t);
-            p.step(t);
-        }
-
-        assert_eq!(p.trail_len(), 4);
-        assert!(p.scene(&map()).iter().any(|i| matches!(i, Item::Trail { .. })));
-
-        p.observe(Some(&pointer(220.0, Motion::Settling, true, None)), 0.12);
-        run(&mut p, TRAIL_S + 0.1);
-
-        assert_eq!(p.trail_len(), 0);
-        assert!(!p.scene(&map()).iter().any(|i| matches!(i, Item::Trail { .. })));
-        assert!(!p.active(), "nothing left to animate");
-    }
-
     /// Taking the pointer down fades everything out and leaves the presenter idle, and
     /// idle means it stops asking for frames.
     #[test]
     fn taking_the_pointer_down_fades_out_and_goes_idle() {
         let mut p = Presenter::new(Theme::fallback());
 
-        p.observe(Some(&pointer(100.0, Motion::Settled, true, Some(1))), 0.0);
+        p.observe(Some(&pointer(100.0, true, Some(1))));
         run(&mut p, 0.5);
-        p.observe(None, p.now_s);
+        p.observe(None);
 
         assert!(p.step(p.now_s + 0.01), "fading out");
         assert!(!p.scene(&map()).is_empty());
@@ -488,9 +406,9 @@ mod tests {
     fn a_target_that_moves_keeps_its_fade() {
         let mut p = Presenter::new(Theme::fallback());
 
-        p.observe(Some(&pointer(100.0, Motion::Settled, true, Some(1))), 0.0);
+        p.observe(Some(&pointer(100.0, true, Some(1))));
         run(&mut p, 0.5);
-        p.observe(Some(&pointer(140.0, Motion::Settled, true, Some(1))), p.now_s);
+        p.observe(Some(&pointer(140.0, true, Some(1))));
         p.step(p.now_s + 0.001);
 
         let (target, alpha) = p.highlights().next().unwrap();

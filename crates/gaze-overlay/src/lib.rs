@@ -11,10 +11,9 @@
 //! The pointer look ([`Pointer`]) is for daily use: the producer sends an intent, where
 //! the gaze is, whether it is moving, whether anything clickable is near and which
 //! element is favoured, and the overlay presents it on its own clock ([`Presenter`]).
-//! The dot appears only near something clickable and thins once the eyes settle on a
-//! target, the highlight is a rounded box in the desktop's accent colour that
-//! crossfades from element to element, and a short faint trail follows a saccade. The
-//! accent and corner radius come from the COSMIC theme ([`Theme`]) and follow it live.
+//! The dot appears only near something clickable, and the highlight is a rounded box in
+//! the desktop's accent colour that crossfades from element to element. The accent and
+//! corner radius come from the COSMIC theme ([`Theme`]) and follow it live.
 //!
 //! Everything the caller passes in is in global logical pixels, the same space
 //! `gaze_core::Rect` and the snap engine use. The mapping onto individual outputs is
@@ -72,7 +71,7 @@ pub use draw::render;
 pub use error::OverlayError;
 pub use mapping::OutputMapping;
 pub use present::Presenter;
-pub use state::{Motion, OverlayState, Pointer, Target};
+pub use state::{OverlayState, Pointer, Target};
 pub use theme::{Theme, ThemeWatch};
 pub use tiny_skia::Pixmap;
 pub use wayland::{Overlay, OverlayHandle};

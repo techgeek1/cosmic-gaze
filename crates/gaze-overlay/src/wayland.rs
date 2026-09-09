@@ -361,7 +361,7 @@ impl App {
             return;
         }
 
-        self.presenter.observe(state.pointer.as_ref(), self.seconds());
+        self.presenter.observe(state.pointer.as_ref());
         self.state = state;
 
         for surface in &mut self.surfaces {
@@ -524,9 +524,9 @@ impl App {
             "overlay commit"
         );
 
-        // While a fade or a trail is in progress the surface stays dirty, so the
-        // frame callback just requested draws the next step; the animation is paced
-        // by the compositor and stops asking for frames the moment it settles.
+        // While a fade is in progress the surface stays dirty, so the frame callback
+        // just requested draws the next step; the animation is paced by the compositor
+        // and stops asking for frames the moment it settles.
         surface.buffers.as_mut().unwrap().next = 1 - slot_index;
         surface.dirty                          = animating;
         surface.frame_sent                     = Some(Instant::now());

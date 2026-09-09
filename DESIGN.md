@@ -1193,7 +1193,14 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   while a fade or trail is in progress and stops asking for frame callbacks when it
   settles, so a settled gaze costs no repaints. Debug look still behind
   `--overlay-debug`; the ceremonies still draw with it. Verified with
-  `gaze-overlay-cli --pointer` live and `--render`; not yet driven with the tracker.
+  `gaze-overlay-cli --pointer` live and `--render`. **Driven the same day**, and three
+  of the choices went: the trail read as a rendering bug at 33 Hz, the ghosting looked
+  like the dot doing something while the eyes held still, and the 3 px inflation made
+  boxes read bigger than their widgets (Discord and Reddit worst). Highlights were also
+  appearing on elements the eyes were nowhere near, because the display followed the
+  engine's 2° snap radius; the dot and highlight are now gated on `--near-deg` (0.8°)
+  while the engine keeps `--snap-deg` (2°), so a commit past the gate lands unmarked.
+  The dot now holds one weight while shown; the highlight sits 1 px outside the box.
 
 ## 11. Open questions
 

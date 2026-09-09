@@ -1,8 +1,8 @@
 //! Manual test for the overlay: animates a gaze marker along a figure-eight across the
 //! union of every output, with a highlight box following it, then exits cleanly. With
 //! `--pointer` it shows the pointer look instead: a gaze hopping between three fake
-//! controls, settling on each, so the dot's fade, ghosting, trail and the highlight's
-//! crossfade can all be seen in the desktop's own accent colour.
+//! controls, settling on each, so the dot's fade and the highlight's crossfade can be
+//! seen in the desktop's own accent colour.
 //!
 //! There is nothing to assert here, the point is to look at the screen. While it runs the
 //! desktop underneath must stay fully usable: clicking, dragging and hovering should all
@@ -21,7 +21,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use gaze_core::{GlobalPx, Rect};
-use gaze_overlay::{Motion, Overlay, OverlayState, Pointer, Presenter, Target, Theme, render};
+use gaze_overlay::{Overlay, OverlayState, Pointer, Presenter, Target, Theme, render};
 
 /// How often the animation pushes a new state. The overlay paces its own drawing off
 /// frame callbacks, so pushing faster than the display refreshes only coalesces.
@@ -45,9 +45,6 @@ const HOP_DWELL_S: f64 = 1.4;
 /// Seconds the flight between two controls takes.
 const HOP_FLIGHT_S: f64 = 0.3;
 
-/// Seconds after landing before the fixation counts as settled, matching the session.
-const HOP_SETTLE_S: f64 = 0.15;
-
 /// Size of a fake control.
 const CONTROL_W: f64 = 160.0;
 
@@ -69,7 +66,7 @@ struct Args {
     #[arg(long)]
     threaded: bool,
 
-    /// Show the pointer look (dot, trail, themed highlight) hopping between three fake
+    /// Show the pointer look (dot, themed highlight) hopping between three fake
     /// controls instead of the debug figure-eight.
     #[arg(long)]
     pointer: bool,
@@ -153,8 +150,7 @@ fn render_frames(dir: &Path, at: f64, look: Look) -> anyhow::Result<()> {
 
     fs::create_dir_all(dir)?;
 
-    // The pointer look has state: fades and a trail that depend on the frames before
-    // `at`. Replaying the animation into a presenter up to that point gives the frame the
+    // The pointer look has state: fades that depend on the frames before `at`. Replaying the animation into a presenter up to that point gives the frame the
     // screen would have shown.
     let (state, presenter) = match look {
         Look::Debug   => (frame_at(&desk, at), None),
@@ -163,7 +159,7 @@ fn render_frames(dir: &Path, at: f64, look: Look) -> anyhow::Result<()> {
             let mut t         = 0.0;
 
             while t <= at {
-                presenter.observe(pointer_at(&desk, t).as_ref(), t);
+                presenter.observe(pointer_at(&desk, t).as_ref());
                 presenter.step(t);
 
                 t += STEP.as_secs_f64();
@@ -283,7 +279,8 @@ fn animate(desk: &Desk, seconds: f64, look: Look, mut push: impl FnMut(OverlaySt
 
 /// The pointer look's intent at time `t`: the gaze rests on one of three controls laid
 /// across the middle of the desktop, then flies to the next with an ease-out, so each
-/// hop shows a saccade with a trail, a landing, and the dot thinning once settled.
+/// hop shows the dot appearing as it nears the next control and the highlight
+/// crossfading to it.
 fn pointer_at(desk: &Desk, t: f64) -> Option<Pointer> {
     let controls = desk.controls();
     let period   = HOP_DWELL_S + HOP_FLIGHT_S;
@@ -292,11 +289,9 @@ fn pointer_at(desk: &Desk, t: f64) -> Option<Pointer> {
     let from     = controls[hop % controls.len()];
     let to       = controls[(hop + 1) % controls.len()];
 
-    let (gaze, motion) = {
+    let gaze = {
         if phase < HOP_DWELL_S {
-            let motion = if phase < HOP_SETTLE_S { Motion::Settling } else { Motion::Settled };
-
-            (from.center(), motion)
+            from.center()
         }
         else {
             // Ease out: fast off the mark, slowing into the target, like a saccade.
@@ -305,7 +300,7 @@ fn pointer_at(desk: &Desk, t: f64) -> Option<Pointer> {
             let a = from.center();
             let b = to.center();
 
-            (GlobalPx { x: a.x + (b.x - a.x) * e, y: a.y + (b.y - a.y) * e }, Motion::Moving)
+            GlobalPx { x: a.x + (b.x - a.x) * e, y: a.y + (b.y - a.y) * e }
         }
     };
 
@@ -321,7 +316,6 @@ fn pointer_at(desk: &Desk, t: f64) -> Option<Pointer> {
 
     Some(Pointer {
         gaze   : gaze,
-        motion : motion,
         near   : dist < NEAR_PX,
         target : (dist < CONTROL_H).then(|| Target {
             id   : controls.iter().position(|c| *c == nearest).unwrap_or(0) as u64,

@@ -237,6 +237,18 @@ pub struct Args {
     #[arg(long)]
     pub overlay_debug: bool,
 
+    /// How close the gaze must be to an element, degrees from its nearest edge, for the
+    /// pointer look to show the dot and highlight it. The snap engine still targets out
+    /// to `--snap-deg`, so a commit past this distance lands on an unmarked element.
+    #[arg(long, default_value_t = 0.8)]
+    pub near_deg: f64,
+
+    /// Snap radius: how far the gaze may be from an element's nearest edge, degrees, for
+    /// the engine to target it at all. Wider forgives more tracker error and pulls to
+    /// more wrong elements.
+    #[arg(long, default_value_t = 2.0)]
+    pub snap_deg: f64,
+
     /// Let the pointer look mark text elements (OCR words, labels) as well as controls.
     /// Off, a target that is text gets no highlight and no dot, so a page of prose stays
     /// unmarked while it is read; a commit on an OCR word still lands, unmarked.

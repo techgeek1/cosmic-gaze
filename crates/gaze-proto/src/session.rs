@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use gaze_core::{DesktopGeometry, Element, ElementKind, GazeSample, GlobalPx};
 use gaze_inject::{Button as InjectButton, Injector, Key};
-use gaze_overlay::{Motion, Overlay, OverlayState, Pointer, Target};
+use gaze_overlay::{Overlay, OverlayState, Pointer, Target};
 use gaze_provider_et5::{ClickFeedback, ClickVia};
 use gaze_provider_synthetic::to_jsonl_line;
 use gaze_snap::{FilterStack, FixationState, Filtered, SnapEngine};
@@ -54,11 +54,6 @@ use crate::warp::{WARP_COOLDOWN, WarpReason, Warper};
 /// How far the filtered gaze point must move before the overlay is repainted. Below this
 /// the ring would jitter in place and cost a frame per sample for no visible change.
 const OVERLAY_MOVE_PX: f64 = 2.0;
-
-/// How long a fixation must have held before the pointer look treats it as settled and
-/// thins the dot. Shorter than a dwell, longer than the filter's first fixating sample,
-/// so a glance that is still deciding keeps a full dot.
-const SETTLE_S: f64 = 0.15;
 
 /// Capture passes per second on the perception thread. Capture is ~35 ms per ultrawide, so
 /// this leaves the cores to the detector and the gaze loop.
@@ -268,6 +263,7 @@ pub fn run(args: &Args) -> Result<()> {
 
     let mut engine = SnapEngine::create()
         .scale(Box::new(geometry.clone()))
+        .radius_deg(args.snap_deg)
         .build();
 
     // --- edge scrolling ---
@@ -312,9 +308,9 @@ pub fn run(args: &Args) -> Result<()> {
     let mut last_hidden                      = false;
     let mut last_blocked                     = false;
     let mut last_owner  : Option<Owner>      = None;
-    // The pointer look's state apart from position, so a change of motion or of what is
-    // near repaints even when the eyes have not moved.
-    let mut last_pointer : Option<(Motion, bool, Option<u64>)> = None;
+    // The pointer look's state apart from position, so a change in what is near
+    // repaints even when the eyes have not moved.
+    let mut last_pointer : Option<(bool, Option<u64>)> = None;
     let mut stale_gen   : Option<u64>        = None;
     // Set when a scroll starts or stops; retargeting stays off until a fixation that began
     // later than this, which is the eyes having moved on purpose.
@@ -680,23 +676,27 @@ pub fn run(args: &Args) -> Result<()> {
         // The pointer look's intent. The highlight goes down during a scroll and until
         // the detector has caught up with it, since every box is where the content was;
         // the dot is drawn where the fine channel has moved the commit point while a
-        // thumb is on the pad, and at the gaze otherwise.
+        // thumb is on the pad, and at the gaze otherwise. Both are gated on the gaze
+        // being within `--near-deg` of the element: the engine will snap from further
+        // out than that, but a highlight on an element the eyes are nowhere near reads
+        // as the overlay guessing, not the eyes aiming.
         let pointer = gaze.map(|g| {
             let refining = refined.filter(|r| r.engaged);
+            let close    = |c: &gaze_snap::Candidate| {
+                c.distance_deg <= args.near_deg && worth_marking(&elements[c.index], args)
+            };
 
             Pointer {
                 gaze   : refining.map_or(g, |r| r.point()),
-                motion : motion_of(&filtered),
-                near   : refining.is_some()
-                    || engine.ranked().any(|c| worth_marking(&elements[c.index], args)),
+                near   : refining.is_some() || engine.ranked().any(close),
                 target : target
                     .as_ref()
-                    .filter(|t| !hidden && worth_marking(&t.element, args))
+                    .filter(|t| !hidden && engine.ranked().any(|c| c.id == t.element.id && close(c)))
                     .map(|t| Target { id: t.element.id, rect: t.element.bbox }),
             }
         });
 
-        let pointer_key = pointer.map(|p| (p.motion, p.near, p.target.map(|t| t.id)));
+        let pointer_key = pointer.map(|p| (p.near, p.target.map(|t| t.id)));
 
         if moved || target_id != last_target || hidden != last_hidden || blocked != last_blocked
             || owner != last_owner || pointer_key != last_pointer
@@ -1406,18 +1406,6 @@ fn log_candidates(engine: &SnapEngine, elements: &[Element], gaze: Option<Global
             gaze_y     = gaze.map(|g| g.y),
             "snap candidate",
         );
-    }
-}
-
-/// What the eyes are doing, for the pointer look. A fixation is settled once it has held
-/// for [`SETTLE_S`]; a lost sample never gets here because the pointer is `None` then.
-fn motion_of(filtered: &Filtered) -> Motion {
-    match filtered.state {
-        FixationState::Fixating { since_s } if filtered.sample.t_s - since_s >= SETTLE_S => {
-            Motion::Settled
-        }
-        FixationState::Fixating { .. } => Motion::Settling,
-        FixationState::Saccade | FixationState::Lost => Motion::Moving,
     }
 }
 

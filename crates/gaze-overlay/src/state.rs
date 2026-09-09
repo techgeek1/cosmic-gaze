@@ -11,8 +11,8 @@ use gaze_core::{GlobalPx, Rect};
 /// Two looks share this struct. `gaze`, `highlight`, `truth` and `label` are the debug
 /// look: drawn exactly as given, on the frame they arrive, in fixed colours. `pointer`
 /// is the daily-driver look: an intent the overlay presents on its own clock, fading
-/// the highlight in and out, trailing the dot through a saccade and colouring both from
-/// the desktop theme ([`crate::Presenter`]). A producer normally sets one or the other.
+/// the dot and the highlight in and out and colouring both from the desktop theme
+/// ([`crate::Presenter`]). A producer normally sets one or the other.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OverlayState {
     /// Where the filtered gaze point is. Drawn as a ring with a centre dot.
@@ -35,8 +35,8 @@ pub struct OverlayState {
     pub pointer    : Option<Pointer>,
 }
 
-/// The pointer look as the producer wants it: what is where, and whether the eyes are
-/// moving. How that is shown, the fades, the trail and the colours, is the overlay's.
+/// The pointer look as the producer wants it: what is where. How that is shown, the
+/// fades and the colours, is the overlay's.
 ///
 /// The dot is drawn only while `near` is set, so the point of gaze stays unmarked over
 /// the text the user is reading and appears as the eyes reach something that can be
@@ -47,10 +47,7 @@ pub struct Pointer {
     /// Where the dot goes: the filtered gaze point, or the refined commit point while
     /// the fine channel is moving it.
     pub gaze   : GlobalPx,
-    /// Whether the eyes are in flight, have just landed, or have settled. Decides the
-    /// trail and the dot's weight.
-    pub motion : Motion,
-    /// An interactive element is within snapping reach. Shows the dot.
+    /// An interactive element is close. Shows the dot.
     pub near   : bool,
     /// The element the snap engine currently favours, when it is one worth marking.
     pub target : Option<Target>,
@@ -64,19 +61,6 @@ pub struct Target {
     pub id   : u64,
     /// The element's box in global logical pixels.
     pub rect : Rect,
-}
-
-/// What the eyes are doing, as far as the pointer look cares.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Motion {
-    /// A saccade, or the filter has not yet decided. The dot is at full weight and
-    /// trails.
-    Moving,
-    /// A fixation that began a moment ago. Full weight, no trail: the dot has arrived.
-    Settling,
-    /// A fixation that has held. On a target the dot fades to a ghost, since the
-    /// highlight already says where a commit will land and the dot is on the fovea.
-    Settled,
 }
 
 // --- OverlayState ---

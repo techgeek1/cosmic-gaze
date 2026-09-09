@@ -14,20 +14,24 @@ The session sends an intent, `Pointer { gaze, motion, near, target }`, and the o
 thread presents it on its own clock (`present.rs`). Rules:
 
 - **Nothing is drawn over what is being read.** The dot appears only while an
-  interactive element is within snapping reach (`near`), so a page of prose stays
-  unmarked. Text elements (OCR words, labels) do not count unless `--highlight-text`.
+  interactive element is within `--near-deg` (0.8°) of the gaze, so a page of prose
+  stays unmarked. Text elements (OCR words, labels) do not count unless
+  `--highlight-text`. The engine still snaps out to `--snap-deg` (2°); a commit past
+  the near gate lands on an unmarked element, which is the price of not marking guesses.
 - **The dot** is 8 px in the desktop accent with a one-pixel halo in black or white,
   whichever the accent is further from, so it survives a white page and a dark window.
-  It fades in and out (60 ms in, 140 ms out) rather than popping.
-- **Weight follows motion.** In flight and just after landing the dot is at full
-  alpha; once a fixation has held 150 ms on a target it thins to a ghost, because the
-  highlight already says where the commit will land and the dot is on the fovea.
-- **The trail** is a few faint samples (150 ms, tapering) behind the dot while the eyes
-  are moving, for the feel of motion the raw point lacked. A settled dot has none.
-- **The highlight** is a rounded rectangle 3 px outside the element, corner radius from
+  It fades in and out (60 ms in, 140 ms out) rather than popping, and holds one weight
+  while shown.
+- **The highlight** is a rounded rectangle 1 px outside the element, corner radius from
   the theme's small radius, accent stroke with halo, 12% accent fill. It crossfades from
   element to element instead of jumping, which also hides the flicker between two
-  adjacent candidates.
+  adjacent candidates. It is gated on the same near distance as the dot.
+- **Tried and removed the same day, after a driven session:** a trail behind the dot
+  in flight (at 33 Hz it read as a rendering bug), the dot thinning to a ghost once a
+  fixation settled (a dot changing weight while the eyes hold still looks like it is
+  doing something), a 3 px inflation of the highlight (the boxes read as bigger than
+  their widgets, worst on Discord and Reddit), and showing the highlight anywhere in
+  the snap radius (a box on an element the eyes are nowhere near reads as guessing).
 - **Theme** from cosmic-config (`com.system76.CosmicTheme.{Mode,Dark,Light}`), watched,
   so an accent change in cosmic-settings is picked up live. Stock COSMIC colours when
   there is no theme to read.
@@ -38,8 +42,9 @@ The debug look is still there behind `gaze-proto --overlay-debug` and every cere
 the frame the screen would show.
 
 Not done here, on purpose: easing the dot's position (it would add lag to a channel that
-already feels heavy; the trail shows the lag instead), and any caption in the pointer
-look.
+already feels heavy), and any caption in the pointer look. Still open: the detector's
+own boxes on web content are looser than the widgets they mark, which the 1 px inflation
+does not fix; that is a `gaze-detect` question.
 
 ## U2. Daemon (`gazed`)
 

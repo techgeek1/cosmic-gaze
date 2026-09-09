@@ -140,13 +140,6 @@ pub enum Item {
         fill       : [u8; 4],
         halo_color : [u8; 4],
     },
-    /// The pointer look's trail: a polyline oldest first, drawn tapering in width and
-    /// alpha from nothing at the tail to `width` and `color` at the head.
-    Trail {
-        points : Vec<(f32, f32)>,
-        width  : f32,
-        color  : [u8; 4],
-    },
 }
 
 // --- Api ---
@@ -380,10 +373,6 @@ pub fn draw(pixmap: &mut PixmapMut, items: &[Item]) {
                     );
                 }
             }
-
-            Item::Trail { points, width, color } => {
-                draw_trail(pixmap, points, *width, *color);
-            }
         }
     }
 }
@@ -508,28 +497,6 @@ fn item_bounds(item: &Item) -> PixelBox {
 
             PixelBox::around(x - s, y - s, w + s * 2.0, h + s * 2.0)
         }
-
-        Item::Trail { points, width, .. } => {
-            let mut x0 = f32::INFINITY;
-            let mut y0 = f32::INFINITY;
-            let mut x1 = f32::NEG_INFINITY;
-            let mut y1 = f32::NEG_INFINITY;
-
-            for (x, y) in points {
-                x0 = x0.min(*x);
-                y0 = y0.min(*y);
-                x1 = x1.max(*x);
-                y1 = y1.max(*y);
-            }
-
-            if points.is_empty() {
-                return PixelBox::EMPTY;
-            }
-
-            let s = width * 0.5;
-
-            PixelBox::around(x0 - s, y0 - s, x1 - x0 + width, y1 - y0 + width)
-        }
     }
 }
 
@@ -637,41 +604,6 @@ fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia
     pb.close();
 
     pb.finish()
-}
-
-/// Draws the trail one segment at a time, each thinner and fainter than the one after
-/// it. A handful of segments, so per-segment paint setup is nothing.
-fn draw_trail(pixmap: &mut PixmapMut, points: &[(f32, f32)], width: f32, color: [u8; 4]) {
-    let n = points.len().saturating_sub(1);
-
-    for (i, pair) in points.windows(2).enumerate() {
-        // The newest segment gets the full width and alpha; the oldest almost none.
-        let t     = (i + 1) as f32 / n as f32;
-        let alpha = (f32::from(color[3]) * t).round() as u8;
-
-        let mut pb = PathBuilder::new();
-
-        pb.move_to(pair[0].0, pair[0].1);
-        pb.line_to(pair[1].0, pair[1].1);
-
-        let Some(path) = pb.finish() else {
-            continue;
-        };
-
-        let stroke = Stroke {
-            width    : (width * t).max(1.0),
-            line_cap : LineCap::Round,
-            ..Stroke::default()
-        };
-
-        pixmap.stroke_path(
-            &path,
-            &paint([color[0], color[1], color[2], alpha]),
-            &stroke,
-            Transform::identity(),
-            None,
-        );
-    }
 }
 
 /// Writes a premultiplied RGBA colour over every pixel of an already clipped box.
