@@ -90,11 +90,16 @@ pub const HELD_WINDOW: Duration = Duration::from_secs(6);
 /// works the mouse; a lift off the desk sweeps well past it.
 pub const PICKUP_GYRO_RAD_S: f32 = 0.25;
 
-/// How far the fine channel must have moved, logical pixels, before a touch becomes a
-/// refine. Under this the thumb is resting on the pad to see where the eyes are, and the
-/// gaze keeps driving; over it the thumb has taken the point. A resting thumb wanders a
-/// few pixels' worth at the default touch gain; this is a deliberate nudge.
-pub const REFINE_START_PX: f64 = 12.0;
+/// How far the thumb must have moved from where it landed, as a fraction of the pad,
+/// before a touch becomes a refine. A thumb settling onto the pad shifts its centroid a
+/// good deal as the pad of the finger flattens, so this is well past the tap tolerance;
+/// with the default touch gain it is 30 logical pixels. The gyro mode accumulates its
+/// own motion against the same figure in pixels.
+pub const REFINE_START_PAD: f32 = 0.12;
+
+/// Shortest time after the thumb lands before travel counts, so the settling of the
+/// first few reports never starts a refine.
+const REFINE_START_DELAY: Duration = Duration::from_millis(120);
 
 /// Angular rate below which the gyro is noise, rad/s. At rest on the desk the peak over a
 /// second was 0.01 to 0.03.
@@ -194,8 +199,9 @@ struct Mapper {
     touch_since   : Option<(Instant, glam::Vec2)>,
     /// Whether the pad was clicked during the current touch, which makes it not a tap.
     touch_clicked : bool,
-    /// Fine-channel travel since the thumb landed, before the refine began, logical
-    /// pixels; `None` once it has begun (or between touches).
+    /// Gyro travel since the thumb landed, before the refine began, logical pixels;
+    /// `None` once it has begun (or between touches). Touch mode measures the thumb's
+    /// displacement from where it landed instead and only uses this as the flag.
     pending_move  : Option<(f64, f64)>,
     /// When the last report arrived, for the gyro's `dt`.
     last_at       : Option<Instant>,
@@ -403,19 +409,30 @@ impl Mapper {
                 RefineMode::Off => (0.0, 0.0),
             };
 
-            // Motion accumulates silently until it amounts to a nudge; then the refine
-            // begins with the travel so far, and every later move passes straight on.
+            // Motion counts for nothing until it amounts to a nudge: the thumb a pad
+            // fraction from where it landed, or the wrist the same distance in pixels,
+            // and not within the settling time either way. Then the refine begins from
+            // where the point is, the way a joystick's dead zone begins from its rim,
+            // and every later move passes straight on.
             match self.pending_move.as_mut() {
                 Some((px, py)) => {
                     *px += dx;
                     *py += dy;
 
-                    if px.hypot(*py) >= REFINE_START_PX {
-                        let (px, py) = (*px, *py);
+                    let settled = self
+                        .touch_since
+                        .is_some_and(|(since, _)| report.at.saturating_duration_since(since) >= REFINE_START_DELAY);
 
+                    let travelled = match self.config.mode {
+                        RefineMode::Touch => self
+                            .touch_since
+                            .is_some_and(|(_, from)| (now - from).length() >= REFINE_START_PAD),
+                        _ => px.hypot(*py) >= f64::from(REFINE_START_PAD) * self.config.touch_gain_px,
+                    };
+
+                    if settled && travelled {
                         self.pending_move = None;
                         out.push(Control::Refine(Refine::Begin));
-                        out.push(Control::Refine(Refine::Move { dx_px: px, dy_px: py }));
                     }
                 }
 
@@ -568,23 +585,32 @@ mod tests {
         let t0         = Instant::now();
         let step       = Duration::from_millis(16);
 
-        // Landing arms; the refine waits for travel, then begins with it.
+        // Landing arms; the refine waits for the thumb to settle and travel, then
+        // begins, and only the motion after that moves the point.
         mapper.step(touch_report(t0, Some((0.20, 0.50))), &mut out);
         assert_eq!(out, vec![Control::Arm { down: true }]);
 
         out.clear();
         mapper.step(touch_report(t0 + step, Some((0.30, 0.50))), &mut out);
+        assert!(out.is_empty(), "travel inside the settling time: {out:?}");
 
-        let [Control::Refine(Refine::Begin), Control::Refine(Refine::Move { dx_px, dy_px })] = out[..]
-        else {
-            panic!("expected a begin and one move, got {out:?}");
+        let step = REFINE_START_DELAY;
+
+        mapper.step(touch_report(t0 + step, Some((0.35, 0.50))), &mut out);
+        assert_eq!(out, vec![Control::Refine(Refine::Begin)]);
+
+        out.clear();
+        mapper.step(touch_report(t0 + step + Duration::from_millis(16), Some((0.45, 0.50))), &mut out);
+
+        let [Control::Refine(Refine::Move { dx_px, dy_px })] = out[..] else {
+            panic!("expected one move, got {out:?}");
         };
 
         assert!((dx_px - 100.0).abs() < 1.0, "dx {dx_px}");
         assert!(dy_px.abs() < 1.0, "dy {dy_px}");
 
         out.clear();
-        mapper.step(touch_report(t0 + 2 * step, Some((0.30, 0.60))), &mut out);
+        mapper.step(touch_report(t0 + step + Duration::from_millis(32), Some((0.45, 0.60))), &mut out);
 
         let [Control::Refine(Refine::Move { dx_px, dy_px })] = out[..] else {
             panic!("expected one move, got {out:?}");
@@ -594,7 +620,7 @@ mod tests {
         assert!((dy_px - 100.0).abs() < 1.0, "dy {dy_px}");
 
         out.clear();
-        mapper.step(touch_report(t0 + 3 * step, None), &mut out);
+        mapper.step(touch_report(t0 + step + Duration::from_millis(48), None), &mut out);
         assert_eq!(out, vec![Control::Refine(Refine::End), Control::Arm { down: false }]);
     }
 
@@ -615,13 +641,14 @@ mod tests {
         let step       = Duration::from_millis(16);
 
         mapper.step(touch_report(t0, Some((0.50, 0.50))), &mut out);
-        mapper.step(touch_report(t0 + step, Some((0.51, 0.50))), &mut out);
-        mapper.step(touch_report(t0 + 2 * step, Some((0.50, 0.51))), &mut out);
+        mapper.step(touch_report(t0 + step, Some((0.54, 0.50))), &mut out);
+        mapper.step(touch_report(t0 + 30 * step, Some((0.50, 0.55))), &mut out);
+        mapper.step(touch_report(t0 + 60 * step, Some((0.46, 0.47))), &mut out);
 
         assert_eq!(out, vec![Control::Arm { down: true }]);
 
         out.clear();
-        mapper.step(touch_report(t0 + 20 * step, None), &mut out);
+        mapper.step(touch_report(t0 + 90 * step, None), &mut out);
 
         assert_eq!(out, vec![Control::Arm { down: false }]);
     }

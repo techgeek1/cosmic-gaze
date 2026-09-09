@@ -1222,8 +1222,10 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   punctuation runs the recogniser calls controls, a dot on prose before the tree
   answers) is only noise while reading, and while aiming the same marks are the point.
   Tobii's desktop software and Talon both settled on show-on-intent. The thumb landing
-  now only arms; the refine begins after 12 px of travel, so a resting thumb shows
-  where the eyes are and gaze keeps driving until the thumb nudges.
+  now only arms; the refine begins once the thumb is 12% of the pad from its landing
+  point after a 120 ms settle (12 px of summed travel started a refine on every touch:
+  the finger flattening onto the pad moves its centroid that much on its own), so a
+  resting thumb shows where the eyes are and gaze keeps driving until the thumb nudges.
 
 ## 11. Open questions
 

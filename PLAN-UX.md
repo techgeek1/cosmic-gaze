@@ -18,8 +18,10 @@ thread presents it on its own clock (`present.rs`). Rules:
   grabbed); unarmed, the overlay draws nothing, so reading is never marked and the
   mouse is never fought. This is the pattern Tobii's desktop software and Talon settled
   on: the gaze trace shows on intent. Landing the thumb only arms; the refine begins
-  once it has travelled 12 px, so a resting thumb shows where the eyes are while the
-  gaze keeps driving. `--overlay-always` is the old always-on behaviour.
+  once the thumb is 12% of the pad from where it landed and at least 120 ms have
+  passed (a finger settling onto the pad shifts its centroid a good deal), so a resting
+  thumb shows where the eyes are while the gaze keeps driving. `--overlay-always` is
+  the old always-on behaviour.
 - **Nothing is drawn over what is being read.** The dot appears only while an
   interactive element is within `--near-deg` (0.8°) of the gaze, so a page of prose
   stays unmarked. Text elements (OCR words, labels) do not count unless
