@@ -10,7 +10,7 @@ brief; the Vision Pro glow and Tobii's own keep-the-trace-off default are the pr
 
 ## U1. The pointer look (`gaze-overlay`) — built 2026-09-09
 
-The session sends an intent, `Pointer { gaze, motion, near, target }`, and the overlay
+The session sends an intent, `Pointer { gaze, near, target, zone }`, and the overlay
 thread presents it on its own clock (`present.rs`). Rules:
 
 - **Nothing is drawn unless asked.** The look is armed while a thumb rests on the
@@ -53,6 +53,16 @@ thread presents it on its own clock (`present.rs`). Rules:
   doing something), a 3 px inflation of the highlight (the boxes read as bigger than
   their widgets, worst on Discord and Reddit), and showing the highlight anywhere in
   the snap radius (a box on an element the eyes are nowhere near reads as guessing).
+- **Thumb down points, thumb up scrolls.** The eyes do one thing at a time. With a
+  thumb on the pad or F14 latched they point: controls are marked and the edge scroller
+  is shown nothing, so a scroll never fights a refine. With the thumb up they read, and
+  may scroll: no control is marked, and the band of the scroll surface the eyes are in
+  or approaching (from three quarters of a band height above its inner edge, closing at
+  1.5x that) is drawn as a faint zone, 5% accent fill and a 1 px stroke at 30%, with the
+  dot, deepening to 10% while the scroll runs. The zone opens on a fixation only, like
+  the dot, and a running scroll keeps it up whatever the eyes do. This replaced the
+  old rule that eyes on a small control held the scroller off, which after the near
+  gate and the tree verdicts was gating on elements that no longer existed.
 - **The tree outranks the recogniser.** Once per place the eyes settle, the session asks
   the accessibility tree what is there (`verify.rs`, on `gaze-clicks`'s tree thread,
   polled, never blocking). A control it names (`link`, `push button`, `entry`, ...) is

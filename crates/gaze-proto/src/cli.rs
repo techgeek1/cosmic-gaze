@@ -163,7 +163,10 @@ pub struct Args {
     /// Scroll the surface under the gaze continuously while the eyes dwell in its lower
     /// or upper band, at a speed that grows with how deep in the band they are. The
     /// surface is the real scrolling region from the accessibility tree, never the
-    /// window; where the tree has no answer nothing scrolls. See `edge_scroll`.
+    /// window; where the tree has no answer nothing scrolls. Only while the eyes are
+    /// not pointing: a thumb on the Daydream pad or the F14 latch silences it, and with
+    /// the thumb up the overlay shows the band the eyes are near as a faint zone. See
+    /// `edge_scroll`.
     #[arg(long)]
     pub edge_scroll: bool,
 

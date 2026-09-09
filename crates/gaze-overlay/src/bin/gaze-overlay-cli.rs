@@ -321,6 +321,7 @@ fn pointer_at(desk: &Desk, t: f64) -> Option<Pointer> {
             id   : controls.iter().position(|c| *c == nearest).unwrap_or(0) as u64,
             rect : nearest,
         }),
+        zone   : None,
     })
 }
 

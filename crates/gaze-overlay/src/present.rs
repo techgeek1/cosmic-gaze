@@ -22,7 +22,7 @@ use tiny_skia::Pixmap;
 
 use crate::draw::{self, Item, PixelBox};
 use crate::mapping::OutputMapping;
-use crate::state::{OverlayState, Pointer, Target};
+use crate::state::{OverlayState, Pointer, Target, Zone};
 use crate::theme::Theme;
 
 /// Radius of the dot, logical pixels. Eight across, about four times a period in the
@@ -50,6 +50,19 @@ pub const HIGHLIGHT_STROKE_ALPHA: f32 = 0.85;
 /// Alpha of the highlight's interior when fully shown. Enough to see the element is
 /// marked, little enough to read its label through.
 pub const HIGHLIGHT_FILL_ALPHA: f32 = 0.12;
+
+/// Stroke width of a scroll zone, logical pixels. Thinner than the highlight: the zone
+/// is a place, not a thing, and it sits next to the text being read.
+pub const ZONE_STROKE_PX: f64 = 1.0;
+
+/// Alpha of the zone's stroke when fully shown.
+pub const ZONE_STROKE_ALPHA: f32 = 0.3;
+
+/// Alpha of the zone's interior while the eyes are in or approaching it.
+pub const ZONE_FILL_ALPHA: f32 = 0.05;
+
+/// Alpha of the zone's interior while it is scrolling, so the scroll is visibly on.
+pub const ZONE_ACTIVE_FILL_ALPHA: f32 = 0.1;
 
 /// Time constant of a fade in, seconds. About three of these to look fully there.
 pub const FADE_IN_S: f64 = 0.06;
@@ -104,6 +117,8 @@ pub struct Presenter {
     /// Every highlight still visible: the current target fading in, and any previous
     /// ones fading out behind it.
     boxes  : Vec<Highlight>,
+    /// Every scroll zone still visible, likewise.
+    zones  : Vec<Band>,
     /// The clock as of the last step, seconds on the caller's timeline.
     now_s  : f64,
 }
@@ -120,6 +135,15 @@ struct Fade {
 struct Highlight {
     target : Target,
     fade   : Fade,
+}
+
+/// One scroll band's zone, its fade, and how far it has turned from resting to scrolling.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Band {
+    zone     : Zone,
+    fade     : Fade,
+    /// 0 while the eyes rest in the band, 1 while it scrolls; eased between the two.
+    strength : Fade,
 }
 
 /// A critically damped spring in two dimensions.
@@ -143,6 +167,7 @@ impl Presenter {
             spring : None,
             away_s : None,
             boxes  : Vec::new(),
+            zones  : Vec::new(),
             now_s  : 0.0,
         }
     }
@@ -167,6 +192,10 @@ impl Presenter {
 
             for h in &mut self.boxes {
                 h.fade.goal = 0.0;
+            }
+
+            for z in &mut self.zones {
+                z.fade.goal = 0.0;
             }
 
             return;
@@ -209,6 +238,29 @@ impl Presenter {
             }
         }
 
+        // The zone: the same, keyed by the band's place. A band that moved (the
+        // surface was resized) is a new one; the old fades out where it was.
+        for z in &mut self.zones {
+            z.fade.goal = 0.0;
+        }
+
+        if let Some(zone) = p.zone {
+            let strength = if zone.active { 1.0 } else { 0.0 };
+
+            match self.zones.iter_mut().find(|z| same_rect(z.zone.rect, zone.rect)) {
+                Some(z) => {
+                    z.zone          = zone;
+                    z.fade.goal     = 1.0;
+                    z.strength.goal = strength;
+                }
+                None    => self.zones.push(Band {
+                    zone     : zone,
+                    fade     : Fade { alpha: 0.0, goal: 1.0 },
+                    strength : Fade { alpha: strength, goal: strength },
+                }),
+            }
+        }
+
         self.intent = Some(*p);
     }
 
@@ -236,6 +288,13 @@ impl Presenter {
 
         self.boxes.retain(|h| h.fade.goal > 0.0 || h.fade.alpha > 0.0);
 
+        for z in &mut self.zones {
+            z.fade.step(dt);
+            z.strength.step(dt);
+        }
+
+        self.zones.retain(|z| z.fade.goal > 0.0 || z.fade.alpha > 0.0);
+
         self.active()
     }
 
@@ -244,13 +303,14 @@ impl Presenter {
     pub fn active(&self) -> bool {
         !self.dot.settled()
             || self.boxes.iter().any(|h| !h.fade.settled())
+            || self.zones.iter().any(|z| !z.fade.settled() || !z.strength.settled())
             || (self.dot.alpha > 0.0 && self.spring.is_some_and(|s| !s.at_rest()))
             || (self.away_s.is_some() && self.dot.goal > 0.0)
     }
 
     /// True when nothing is drawn and nothing is about to be.
     pub fn is_idle(&self) -> bool {
-        self.dot.alpha <= 0.0 && self.boxes.is_empty()
+        self.dot.alpha <= 0.0 && self.boxes.is_empty() && self.zones.is_empty()
     }
 
     /// The draw items for one output as of the last step. Like [`draw::scene`], items
@@ -258,7 +318,33 @@ impl Presenter {
     pub fn scene(&self, map: &OutputMapping) -> Vec<Item> {
         let mut items = Vec::new();
 
-        // Highlights first so the dot stays on top of them. Older ones first too, so a
+        // Zones under everything: they are wide and faint, and a highlight inside one
+        // (a link in the last lines of a page) must still read as the thing marked.
+        for z in &self.zones {
+            let alpha = z.fade.alpha;
+
+            if alpha < ALPHA_EPSILON {
+                continue;
+            }
+
+            let fill         = ZONE_FILL_ALPHA + (ZONE_ACTIVE_FILL_ALPHA - ZONE_FILL_ALPHA) * z.strength.alpha;
+            let (x, y, w, h) = map.buffer_rect(z.zone.rect);
+
+            items.push(Item::RoundBox {
+                x      : x,
+                y      : y,
+                w      : w,
+                h      : h,
+                radius : map.buffer_len(self.theme.radius_px),
+                stroke : map.buffer_len(ZONE_STROKE_PX),
+                halo   : 0.0,
+                color  : self.theme.accent_at(alpha * ZONE_STROKE_ALPHA),
+                fill   : self.theme.accent_at(alpha * fill),
+                halo_color : self.theme.halo_at(0.0),
+            });
+        }
+
+        // Highlights next so the dot stays on top of them. Older ones first too, so a
         // target fading in paints over the one it replaces.
         for hl in &self.boxes {
             let alpha = hl.fade.alpha;
@@ -335,6 +421,11 @@ impl Presenter {
     pub fn highlights(&self) -> impl Iterator<Item = (Target, f32)> + '_ {
         self.boxes.iter().map(|h| (h.target, h.fade.alpha))
     }
+
+    /// The scroll zones currently visible with their alphas, oldest first.
+    pub fn zones(&self) -> impl Iterator<Item = (Zone, f32)> + '_ {
+        self.zones.iter().map(|z| (z.zone, z.fade.alpha))
+    }
 }
 
 // --- Fade ---
@@ -406,6 +497,11 @@ impl Spring {
 
 // --- Internals ---
 
+/// Whether two rectangles are the same place to within a pixel fraction.
+fn same_rect(a: Rect, b: Rect) -> bool {
+    (a.x - b.x).abs() < 0.5 && (a.y - b.y).abs() < 0.5 && (a.w - b.w).abs() < 0.5 && (a.h - b.h).abs() < 0.5
+}
+
 /// Grows a rectangle by `by` on every side.
 fn inflate(r: Rect, by: f64) -> Rect {
     Rect { x: r.x - by, y: r.y - by, w: r.w + by * 2.0, h: r.h + by * 2.0 }
@@ -433,6 +529,16 @@ mod tests {
                 id   : id,
                 rect : Rect { x: x - 50.0, y: 280.0, w: 100.0, h: 40.0 },
             }),
+            zone   : None,
+        }
+    }
+
+    fn scrolling(active: bool) -> Pointer {
+        Pointer {
+            gaze   : GlobalPx { x: 500.0, y: 560.0 },
+            near   : true,
+            target : None,
+            zone   : Some(Zone { rect: Rect { x: 0.0, y: 520.0, w: 1000.0, h: 80.0 }, active: active }),
         }
     }
 
@@ -499,8 +605,10 @@ mod tests {
 
         assert_eq!(p.dot_alpha(), DOT_ALPHA, "near again, never faded");
 
+        let linger = p.style.linger_s;
+
         p.observe(Some(&pointer(100.0, false, None)));
-        run(&mut p, p.style.linger_s + 1.0);
+        run(&mut p, linger + 1.5);
 
         assert!(p.is_idle(), "gone once nothing was near for the linger");
     }
@@ -604,6 +712,41 @@ mod tests {
         assert!(p.is_idle());
         assert!(!p.active());
         assert!(p.scene(&map()).is_empty());
+    }
+
+    /// A scroll zone fades in with the dot, deepens when the scroll starts without
+    /// restarting its fade, and fades out with the pointer.
+    #[test]
+    fn a_zone_fades_in_deepens_while_scrolling_and_fades_out() {
+        let mut p = presenter();
+
+        p.observe(Some(&scrolling(false)));
+        run(&mut p, 0.5);
+
+        assert_eq!(p.dot_alpha(), DOT_ALPHA);
+        assert_eq!(p.zones().map(|(_, a)| a).collect::<Vec<_>>(), vec![1.0]);
+        assert!(!p.active());
+
+        let resting = p.scene(&map());
+
+        p.observe(Some(&scrolling(true)));
+
+        assert!(p.step(p.now_s + 0.01), "strength easing");
+
+        run(&mut p, 0.5);
+
+        let fill_of = |items: &[Item]| match items[0] {
+            Item::RoundBox { fill, .. } => fill[3],
+            _                           => panic!("zone first"),
+        };
+
+        assert!(fill_of(&p.scene(&map())) > fill_of(&resting), "deeper while scrolling");
+        assert_eq!(p.zones().count(), 1, "same band, no crossfade");
+
+        p.observe(None);
+        run(&mut p, 1.5);
+
+        assert!(p.is_idle());
     }
 
     /// The highlight follows an element that is reported at a new place under the same

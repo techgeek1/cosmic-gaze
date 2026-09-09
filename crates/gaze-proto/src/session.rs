@@ -12,7 +12,9 @@
 //! it routes the scroll to the window under the gaze point instead of the one under the
 //! pointer. With `--edge-scroll` the eyes alone scroll: a dwell in the lower or upper band
 //! of the surface being looked at moves it, and looking elsewhere stops it
-//! (`edge_scroll`).
+//! (`edge_scroll`). The eyes do one thing at a time: with a thumb on the pad or F14
+//! latched they point, and the scroller sees nothing; with the thumb up they scroll, and
+//! the overlay shows the band they are near as a faint zone instead of any control.
 //!
 //! With `--daydream` the controller is a second control source on top of the mouse, and
 //! the only one with a fine channel: a thumb on its pad captures the snap point (or the
@@ -35,7 +37,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use gaze_core::{DesktopGeometry, Element, ElementKind, GazeSample, GlobalPx};
 use gaze_inject::{Button as InjectButton, Injector, Key};
-use gaze_overlay::{Overlay, OverlayState, Pointer, PointerStyle, Target};
+use gaze_overlay::{Overlay, OverlayState, Pointer, PointerStyle, Target, Zone};
 use gaze_provider_et5::{ClickFeedback, ClickVia};
 use gaze_provider_synthetic::to_jsonl_line;
 use gaze_snap::{FilterStack, FixationState, Filtered, SnapEngine};
@@ -43,7 +45,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::cli::{Args, Provider};
 use crate::daydream::{Daydream, DaydreamConfig, Owner, parse_axes};
-use crate::edge_scroll::{Action as EdgeAction, EdgeScroller, Eyes};
+use crate::edge_scroll::{APPROACH_FRACTION, Action as EdgeAction, EdgeScroller, Eyes, Scrollable};
 use crate::feedback::{self, ClickFeed, Press};
 use crate::keys::LatchKeys;
 use crate::perception::{ElementStore, Perception, PerceptionConfig};
@@ -76,11 +78,9 @@ const REFINE_MIN_PX: f64 = 2.0;
 /// farther and something else (the mouse, a scroll) has moved it, so the point is stale.
 const RESUME_NEAR_PX: f64 = 24.0;
 
-/// A snap target no wider and no taller than this is an icon or a small button, and eyes
-/// on one are aiming, not reading: the edge scroller does not arm while they are. Rows,
-/// links in text and paragraphs are wider than this and keep scrolling as before. Text
-/// boxes never count whatever their size (see [`aiming_at`]).
-const AIM_TARGET_PX: f64 = 48.0;
+/// The scroll zone's closing reach as a multiple of its opening one
+/// ([`APPROACH_FRACTION`] band heights), so its inner edge does not blink the zone.
+const ZONE_HYSTERESIS: f64 = 1.5;
 
 /// The fine channel's state: where the commit point is being moved from and by how much.
 #[derive(Clone, Copy, Debug)]
@@ -353,13 +353,15 @@ pub fn run(args: &Args) -> Result<()> {
     // repaints even when the eyes have not moved.
     let mut last_pointer : Option<(bool, Option<u64>)> = None;
     let mut last_armed   = false;
+    let mut last_zone    : Option<Zone> = None;
     let mut stale_gen   : Option<u64>        = None;
     // Set when a scroll starts or stops; retargeting stays off until a fixation that began
     // later than this, which is the eyes having moved on purpose.
     let mut retarget_block : Option<f64>     = None;
     let mut refined     : Option<Refined>    = None;
     // Whether a thumb is on the pad, and whether F14 has latched the look on. Either
-    // arms the pointer look; `--overlay-always` arms it for the whole run.
+    // means the eyes are pointing: it arms the pointer look and silences the edge
+    // scroller. `--overlay-always` arms the look for the whole run without doing that.
     let mut pad_down    = false;
     let mut latched     = false;
     // Whether push-to-talk is forwarded down right now, so an exit mid-hold releases it.
@@ -643,18 +645,18 @@ pub fn run(args: &Args) -> Result<()> {
             .map(|d| d.owner(clicks.as_ref().and_then(ClickFeed::last_mouse_input)));
         let held  = owner.is_none_or(|o| o == Owner::Controller);
 
-        // Eyes on a small control (last sample's, one tick stale) are aiming at it, and a
-        // toolbar or file header at the top of a viewport sits squarely in the band. A
-        // scroll already running is not interrupted by passing over one.
-        let aiming = engine.current().is_some_and(|t| aiming_at(&t.element));
+        // Thumb down or latched: the eyes are pointing. Thumb up: they are reading, and
+        // may scroll. One or the other, never both, so a scroll never fights a refine
+        // and a control in the band never holds a scroll off.
+        let input = pad_down || latched;
 
         // Edge scrolling first: a scroll decides whether the snap engine may retarget at
         // all this sample, and a scroll that starts here takes the highlight down with it.
-        let scrolling = match edge.as_mut() {
+        let (scrolling, zone) = match edge.as_mut() {
             Some((scroller, surfaces)) => {
-                let was     = scroller.scrolling();
-                let quiet   = locked || !held || (aiming && !was);
-                let stopped = edge_scroll(
+                let was               = scroller.scrolling();
+                let quiet             = input || !held;
+                let (stopped, surface) = edge_scroll(
                     scroller,
                     surfaces,
                     &mut warper,
@@ -685,10 +687,23 @@ pub fn run(args: &Args) -> Result<()> {
                     retarget_block = Some(filtered.sample.t_s);
                 }
 
-                scroller.scrolling()
+                // The band the eyes are in or approaching, for the overlay. It opens on
+                // a fixation only, like the dot, and closes at 1.5x the reach it opened
+                // at; a running scroll keeps it up whatever the eyes do.
+                let reach = match last_zone {
+                    Some(_) => APPROACH_FRACTION * ZONE_HYSTERESIS,
+                    None    => APPROACH_FRACTION,
+                };
+                let settled = matches!(filtered.state, FixationState::Fixating { .. });
+                let zone    = surface
+                    .filter(|_| scroller.scrolling() || last_zone.is_some() || settled)
+                    .and_then(|s| scroller.near_band(gaze, &s, reach))
+                    .map(|(_, rect)| Zone { rect: rect, active: scroller.scrolling() });
+
+                (scroller.scrolling(), zone)
             }
 
-            None => false,
+            None => (false, None),
         };
 
         // Retargeting needs the eyes to have moved: a fixation that began after the scroll
@@ -745,7 +760,7 @@ pub fn run(args: &Args) -> Result<()> {
         // marked with its own box, and text it names is not marked whatever the
         // recogniser called it.
         let aim   = target.as_ref().map(|t| t.point).or(gaze);
-        let armed = args.overlay_always || pad_down || latched;
+        let armed = args.overlay_always || input;
 
         if let Some(v) = verifier.as_mut() {
             let settled = matches!(filtered.state, FixationState::Fixating { .. });
@@ -753,10 +768,12 @@ pub fn run(args: &Args) -> Result<()> {
             v.update(aim.filter(|_| armed && settled && !locked));
         }
 
-        // Unarmed, nothing is drawn: the eyes are reading, and a highlight the user did
-        // not ask for is the thing that fights them. The look comes up with the thumb
-        // on the pad or the latch, and the presenter fades it out when it goes.
-        let pointer = gaze.filter(|_| armed).map(|g| {
+        // Unarmed, no control is marked: the eyes are reading, and a highlight the user
+        // did not ask for is the thing that fights them. The look comes up with the
+        // thumb on the pad or the latch, and the presenter fades it out when it goes.
+        // Reading eyes near a scroll band get the dot and the zone instead, so a scroll
+        // is seen coming.
+        let pointer = gaze.filter(|_| armed || zone.is_some()).map(|g| {
             let refining = refined.filter(|r| r.engaged);
             // Hysteresis on the near gate: it opens at `--near-deg` and closes at half
             // as much again, so a gaze sitting at the edge does not flicker the dot.
@@ -777,6 +794,7 @@ pub fn run(args: &Args) -> Result<()> {
             };
 
             let (near, target) = match verdict {
+                _ if !armed                       => (false, None),
                 Verdict::Control { id, rect, .. } => (true, Some(Target { id: id, rect: rect })),
                 Verdict::Static                   => (false, None),
                 Verdict::Unknown if holding       => (engine.ranked().any(close), None),
@@ -800,8 +818,9 @@ pub fn run(args: &Args) -> Result<()> {
 
             Pointer {
                 gaze   : refining.map_or(g, |r| r.point()),
-                near   : refining.is_some() || near,
+                near   : refining.is_some() || near || zone.is_some(),
                 target : target.filter(|_| !hidden && near),
+                zone   : zone,
             }
         });
 
@@ -810,6 +829,7 @@ pub fn run(args: &Args) -> Result<()> {
 
         if moved || target_id != last_target || hidden != last_hidden || blocked != last_blocked
             || owner != last_owner || pointer_key != last_pointer || armed_now != last_armed
+            || zone != last_zone
         {
             let state = {
                 if args.overlay_debug {
@@ -846,6 +866,7 @@ pub fn run(args: &Args) -> Result<()> {
 
             last_pointer = pointer_key;
             last_armed   = armed_now;
+            last_zone    = zone;
             last_hidden  = hidden;
             last_blocked = blocked;
             last_owner   = owner;
@@ -1071,17 +1092,6 @@ fn commit(
     click_at
 }
 
-/// Whether eyes on this element are aiming at it rather than reading past it: a control no
-/// bigger than [`AIM_TARGET_PX`] either way. Text is never aimed at, whatever its size: a
-/// scrolled page is words all the way to its edge, and every one of them snapped in the
-/// band and held the scroller off, which made scrolling text jerky and stop-start. A link
-/// or a button in the text is still a control.
-fn aiming_at(element: &Element) -> bool {
-    element.kind != ElementKind::Text
-        && element.bbox.w <= AIM_TARGET_PX
-        && element.bbox.h <= AIM_TARGET_PX
-}
-
 // --- Click feedback ---
 
 /// Hands every new real press to the source and tallies what it made of it. One log
@@ -1242,16 +1252,17 @@ fn scroll_under_gaze(
 
 /// One sample of edge scrolling: the surface under the gaze from the cache, the
 /// scroller's verdict, and the injection it asks for. Returns whether a scroll stopped on
-/// this sample, which the caller turns into a re-detection.
+/// this sample, which the caller turns into a re-detection, and the surface the scroller
+/// was shown, which the caller draws the zone on.
 ///
 /// A start puts the pointer inside the surface first, at the gaze point, unless it is
 /// already there: the wheel goes to the surface under the pointer, and the user's pointer
 /// is wherever they left it. Units then go out as high-resolution wheel motion without
 /// moving the pointer again, so gaze jitter during the scroll does not drag it about.
 ///
-/// `quiet` (a refine in progress, or eyes aiming at a small target) shows the scroller no
-/// surface and no eyes, which stops a running scroll and arms nothing, without the gaze
-/// ever reaching it.
+/// `quiet` (the eyes are pointing: a thumb on the pad or the latch on, or the mouse has
+/// the pointer) shows the scroller no surface and no eyes, which stops a running scroll
+/// and arms nothing, without the gaze ever reaching it.
 #[allow(clippy::too_many_arguments)]
 fn edge_scroll(
     scroller : &mut EdgeScroller,
@@ -1263,7 +1274,7 @@ fn edge_scroll(
     gaze     : Option<GlobalPx>,
     quiet    : bool,
 )
-    -> bool
+    -> (bool, Option<Scrollable>)
 {
     let mut injector = injector;
     let surface      = match quiet {
@@ -1286,7 +1297,7 @@ fn edge_scroll(
         _                      => Eyes::Lost,
     };
 
-    match scroller.update(filtered.sample.t_s, eyes, surface.as_ref()) {
+    let stopped = match scroller.update(filtered.sample.t_s, eyes, surface.as_ref()) {
         EdgeAction::Nothing => false,
 
         EdgeAction::Start { dir, point } => {
@@ -1343,7 +1354,9 @@ fn edge_scroll(
 
             true
         }
-    }
+    };
+
+    (stopped, surface)
 }
 
 /// Warps the pointer to a dwelled-on gaze point when that point is on a different output

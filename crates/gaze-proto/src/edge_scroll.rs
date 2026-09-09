@@ -20,6 +20,12 @@
 //! edge so the boundary does not chatter. The top band, where titles and toolbars live,
 //! gets a longer dwell.
 //!
+//! The scroller only sees the eyes while the thumb is off the controller's pad and F14
+//! has not latched the pointer look on: a thumb down is input, and input never scrolls
+//! (the session hands it nothing in that case). The overlay shows the band the eyes are
+//! in or approaching as a faint zone, from [`EdgeScroller::near_band`], so the user can
+//! see where a scroll would start before it does.
+//!
 //! Everything here is pure: timestamps arrive on the samples, and the caller injects.
 
 use gaze_core::{GlobalPx, Rect};
@@ -99,6 +105,11 @@ pub const MAX_STEP_S : f64 = 0.1;
 
 /// High-resolution wheel units per line, the kernel's `REL_WHEEL_HI_RES` convention.
 pub const UNITS_PER_LINE : f64 = 120.0;
+
+/// How far inside the viewport past a band's inner edge, as a share of the band's height,
+/// the eyes count as approaching it: the overlay shows the zone from here so it is up by
+/// the time the eyes reach the band, and keeps it up to 1.5x this on the way out.
+pub const APPROACH_FRACTION : f64 = 0.75;
 
 /// The scroller's tunables.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -368,8 +379,72 @@ impl EdgeScroller {
         }
     }
 
-    /// The band the point is in, if any. A band whose direction has no room left is not
-    /// a band: at the end of the page the lower band is page, with things to click in it.
+    /// The direction of the scroll in progress, if one is.
+    pub fn direction(&self) -> Option<Direction> {
+        match self.state {
+            State::Scrolling { dir, .. } => Some(dir),
+            _                            => None,
+        }
+    }
+
+    /// The band for `dir` on a surface, global logical pixels. `None` when the band has
+    /// no height or its direction has no room left: at the end of the page the lower
+    /// band is page, with things to click in it.
+    pub fn band(&self, s: &Scrollable, dir: Direction) -> Option<Rect> {
+        let v        = &s.viewport;
+        let fraction = match dir {
+            Direction::Down => self.params.band_fraction,
+            Direction::Up   => self.params.top_band_fraction,
+        };
+        let h = v.h * fraction;
+
+        if h <= 0.0 || !s.room(dir) {
+            return None;
+        }
+
+        let y = match dir {
+            Direction::Down => v.y + v.h - h,
+            Direction::Up   => v.y,
+        };
+
+        Some(Rect { x: v.x, y: y, w: v.w, h: h })
+    }
+
+    /// The band the eyes are in or approaching: within the surface's width, and no
+    /// further inside the viewport than `slack` band heights past the band's inner edge.
+    /// A scroll in progress names its own band whatever the eyes do, since they may be
+    /// past the screen's edge sustaining it. This is what the overlay draws.
+    pub fn near_band(&self, g: Option<GlobalPx>, s: &Scrollable, slack: f64) -> Option<(Direction, Rect)> {
+        if let Some(dir) = self.direction() {
+            return self.band(s, dir).map(|r| (dir, r));
+        }
+
+        let g = g?;
+        let v = &s.viewport;
+
+        if g.x < v.x || g.x > v.x + v.w {
+            return None;
+        }
+
+        for dir in [Direction::Down, Direction::Up] {
+            let Some(r) = self.band(s, dir) else {
+                continue;
+            };
+
+            let (lo, hi) = match dir {
+                Direction::Down => (r.y - r.h * slack, v.y + v.h),
+                Direction::Up   => (v.y, r.y + r.h + r.h * slack),
+            };
+
+            if g.y >= lo && g.y <= hi {
+                return Some((dir, r));
+            }
+        }
+
+        None
+    }
+
+    /// The band the point is in, if any (see [`EdgeScroller::band`]).
     fn zone(&self, g: GlobalPx, s: &Scrollable) -> Zone {
         let v = &s.viewport;
 
@@ -377,18 +452,16 @@ impl EdgeScroller {
             return Zone::Off;
         }
 
-        let lower_h   = v.h * self.params.band_fraction;
-        let lower_top = v.y + v.h - lower_h;
-
-        if g.y > lower_top && lower_h > 0.0 && s.room(Direction::Down) {
-            return Zone::Band { dir: Direction::Down, depth: ((g.y - lower_top) / lower_h).min(1.0) };
+        if let Some(r) = self.band(s, Direction::Down)
+            && g.y > r.y
+        {
+            return Zone::Band { dir: Direction::Down, depth: ((g.y - r.y) / r.h).min(1.0) };
         }
 
-        let upper_h      = v.h * self.params.top_band_fraction;
-        let upper_bottom = v.y + upper_h;
-
-        if g.y < upper_bottom && upper_h > 0.0 && s.room(Direction::Up) {
-            return Zone::Band { dir: Direction::Up, depth: ((upper_bottom - g.y) / upper_h).min(1.0) };
+        if let Some(r) = self.band(s, Direction::Up)
+            && g.y < r.y + r.h
+        {
+            return Zone::Band { dir: Direction::Up, depth: ((r.y + r.h - g.y) / r.h).min(1.0) };
         }
 
         Zone::Off
@@ -845,5 +918,50 @@ mod tests {
 
         assert!((capped - MAX_LINES_S_CAP * UNITS_PER_LINE).abs() < 0.02 * MAX_LINES_S_CAP * UNITS_PER_LINE,
                 "{capped:.0} units/s vs cap");
+    }
+
+    /// The zone the overlay draws: the lower band from three quarters of its height above
+    /// its inner edge, the upper band likewise, nothing in the middle or off the surface,
+    /// and no band in a direction with no room.
+    #[test]
+    fn near_band_covers_the_approach_to_each_band() {
+        let s = EdgeScroller::new(EdgeParams::default());
+        let d = discord();
+        let v = d.viewport;
+
+        let band_h    = v.h * DEFAULT_BAND_FRACTION;
+        let lower_top = v.y + v.h - band_h;
+
+        let at = |y: f64| s.near_band(Some(GlobalPx { x: 500.0, y: y }), &d, APPROACH_FRACTION);
+
+        assert_eq!(at(lower_top + 1.0).map(|(d, _)| d), Some(Direction::Down));
+        assert_eq!(at(lower_top - band_h * 0.5).map(|(d, _)| d), Some(Direction::Down), "approaching");
+        assert_eq!(at(lower_top - band_h * 1.0), None, "still reading");
+        assert_eq!(at(v.y + 1.0).map(|(d, _)| d), Some(Direction::Up));
+        assert_eq!(at(v.y + v.h * 0.5), None);
+        assert_eq!(s.near_band(Some(GlobalPx { x: 10.0, y: lower_top + 1.0 }), &d, 1.0), None, "off the surface");
+
+        let top = Scrollable { above_px: 0.0, ..d };
+
+        assert_eq!(s.near_band(Some(GlobalPx { x: 500.0, y: v.y + 1.0 }), &top, 1.0), None, "nothing above");
+
+        let (_, r) = at(lower_top + 1.0).unwrap();
+
+        assert!((r.y - lower_top).abs() < 1e-9 && (r.h - band_h).abs() < 1e-9);
+    }
+
+    /// A scroll in progress names its band even with the eyes lost or off the screen.
+    #[test]
+    fn near_band_follows_a_running_scroll() {
+        let mut s = EdgeScroller::new(EdgeParams::default());
+        let d     = discord();
+        let v     = d.viewport;
+        let deep  = at(500.0, v.y + v.h - 5.0);
+
+        s.update(0.0, deep, Some(&d));
+        s.update(1.0, deep, Some(&d));
+
+        assert!(s.scrolling());
+        assert_eq!(s.near_band(None, &d, 0.0).map(|(dir, _)| dir), Some(Direction::Down));
     }
 }

@@ -1226,6 +1226,12 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   point after a 120 ms settle (12 px of summed travel started a refine on every touch:
   the finger flattening onto the pad moves its centroid that much on its own), so a
   resting thumb shows where the eyes are and gaze keeps driving until the thumb nudges.
+  With input on intent, edge scrolling went the same way: thumb down or latched, the
+  eyes point and the scroller sees nothing; thumb up, the eyes read and may scroll, no
+  control is marked, and the band they are in or approaching is drawn as a faint zone
+  with the dot, deeper while the scroll runs. The old aiming guard (eyes on a small
+  control hold the scroller off) went with it: it was gating on the recogniser's boxes,
+  which the near gate and the tree verdicts had since stopped trusting.
 
 ## 11. Open questions
 

@@ -72,7 +72,7 @@ pub use draw::render;
 pub use error::OverlayError;
 pub use mapping::OutputMapping;
 pub use present::{PointerStyle, Presenter};
-pub use state::{OverlayState, Pointer, Target};
+pub use state::{OverlayState, Pointer, Target, Zone};
 pub use theme::{Theme, ThemeWatch};
 pub use tiny_skia::Pixmap;
 pub use wayland::{Overlay, OverlayHandle};

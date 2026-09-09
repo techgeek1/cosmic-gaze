@@ -51,6 +51,19 @@ pub struct Pointer {
     pub near   : bool,
     /// The element the snap engine currently favours, when it is one worth marking.
     pub target : Option<Target>,
+    /// The scroll band the eyes are in or approaching, when the eyes are scrolling
+    /// rather than pointing. Drawn as a faint zone under the dot.
+    pub zone   : Option<Zone>,
+}
+
+/// A scroll band the overlay marks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Zone {
+    /// The band, global logical pixels: the strip of a scroll surface's viewport a dwell
+    /// in scrolls it.
+    pub rect   : Rect,
+    /// Whether a scroll is running in it right now.
+    pub active : bool,
 }
 
 /// The element the highlight marks.
