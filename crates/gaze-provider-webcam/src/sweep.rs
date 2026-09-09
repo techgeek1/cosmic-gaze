@@ -351,6 +351,7 @@ impl CalibrationSweep {
             truth      : Some(target.px),
             label      : Some(format!("look here {}/{}", index + 1, total)),
             background : None,
+            pointer    : None,
         };
 
         // A dead overlay thread is not a reason to abandon the sweep: the terminal still

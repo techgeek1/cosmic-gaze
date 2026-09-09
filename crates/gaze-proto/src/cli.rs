@@ -231,6 +231,18 @@ pub struct Args {
     #[arg(long)]
     pub show_truth: bool,
 
+    /// Draw the debug overlay (gaze ring, raw candidate box, state caption) instead of
+    /// the pointer look. The pointer look shows a dot only near something clickable and
+    /// a themed highlight on the favoured control; the debug look shows everything.
+    #[arg(long)]
+    pub overlay_debug: bool,
+
+    /// Let the pointer look mark text elements (OCR words, labels) as well as controls.
+    /// Off, a target that is text gets no highlight and no dot, so a page of prose stays
+    /// unmarked while it is read; a commit on an OCR word still lands, unmarked.
+    #[arg(long)]
+    pub highlight_text: bool,
+
     /// Read the Daydream controller (`gaze-daydream`) alongside the mouse: its pad
     /// commits, Home exits, App holds the voice stack's push-to-talk (forwarded as F13),
     /// the volume keys are a wheel, and a thumb on the pad refines the commit point (see

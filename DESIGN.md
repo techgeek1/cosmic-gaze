@@ -1178,6 +1178,22 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   offset file). Reason: a bias past the 3° gate rejected every click forever and the
   filter could never recover; adopting was ruled over merely warning. Nothing driven
   yet; the first flywheel day will say what the reject rate actually is.
+- 2026-09-09, **The overlay stops shouting (PLAN-UX.md U1).** The debug overlay (cyan
+  ring on the fovea, amber box on whatever the engine favoured, a caption) made text
+  hard to read for the movement around it. The session now sends an intent, where the
+  gaze is, whether it is moving, whether anything clickable is near and which element
+  is favoured, and the overlay presents it on its own clock: an 8 px accent dot with a
+  contrast halo that exists only near an interactive element and thins to a ghost once
+  a fixation has held 150 ms on a target, a 150 ms tapering trail behind it in flight
+  for the feel of motion, and a rounded accent highlight 3 px outside the element that
+  crossfades between elements (60 ms in, 140 ms out). Text elements are not marked
+  unless asked (`--highlight-text`), so prose stays unmarked while read; the price is
+  that a commit on an OCR word is blind. Accent and radius come from the COSMIC theme
+  via cosmic-config and follow it live. Frames: the presenter keeps a surface dirty
+  while a fade or trail is in progress and stops asking for frame callbacks when it
+  settles, so a settled gaze costs no repaints. Debug look still behind
+  `--overlay-debug`; the ceremonies still draw with it. Verified with
+  `gaze-overlay-cli --pointer` live and `--render`; not yet driven with the tracker.
 
 ## 11. Open questions
 

@@ -42,7 +42,9 @@ use gaze_core::Rect;
 use crate::draw::{self, PixelBox};
 use crate::error::OverlayError;
 use crate::mapping::OutputMapping;
+use crate::present::Presenter;
 use crate::state::OverlayState;
+use crate::theme::{Theme, ThemeWatch};
 
 /// Layer shell namespace. Compositors show this in debug output and rules can key off it.
 const NAMESPACE: &str = "gaze-overlay";
@@ -117,7 +119,15 @@ impl Overlay {
             qh             : qh,
             surfaces       : Vec::new(),
             state          : OverlayState::default(),
+            presenter      : Presenter::new(Theme::cosmic()),
+            theme_watch    : ThemeWatch::start(),
+            clock          : Instant::now(),
         };
+
+        match &app.theme_watch {
+            Some(w) => debug!(configs = w.watching(), "watching the cosmic theme"),
+            None    => debug!("cosmic theme not watchable, the look is fixed for this run"),
+        }
 
         // Two round trips: the first delivers the output globals and their `zxdg_output`
         // information, which is what `new_output` needs to place a surface; the second
@@ -289,6 +299,13 @@ struct App {
     qh             : QueueHandle<App>,
     surfaces       : Vec<OutputSurface>,
     state          : OverlayState,
+    /// Animates the pointer look from the intents in `state`.
+    presenter      : Presenter,
+    /// Reloads the theme when cosmic-settings writes it. `None` without a COSMIC
+    /// config directory to watch.
+    theme_watch    : Option<ThemeWatch>,
+    /// The presenter's timeline starts when the overlay does.
+    clock          : Instant,
 }
 
 /// One output's layer surface and the buffers behind it.
@@ -344,6 +361,7 @@ impl App {
             return;
         }
 
+        self.presenter.observe(state.pointer.as_ref(), self.seconds());
         self.state = state;
 
         for surface in &mut self.surfaces {
@@ -351,9 +369,23 @@ impl App {
         }
     }
 
+    /// Seconds since the overlay started: the presenter's clock.
+    fn seconds(&self) -> f64 {
+        self.clock.elapsed().as_secs_f64()
+    }
+
     /// Draws every surface that has pending work and is allowed to draw now.
     fn redraw_pending(&mut self) {
         let now = Instant::now();
+
+        // A theme change repaints everything in the new colours on the next frame.
+        if self.theme_watch.as_ref().is_some_and(ThemeWatch::take_changed) {
+            self.presenter.set_theme(Theme::cosmic());
+
+            for surface in &mut self.surfaces {
+                surface.dirty = true;
+            }
+        }
 
         for i in 0..self.surfaces.len() {
             let ready = {
@@ -412,7 +444,13 @@ impl App {
             }
         }
 
-        let items      = draw::scene(&self.state, &self.surfaces[index].mapping);
+        // The presenter is stepped per draw rather than per tick so a surface drawn
+        // from its frame callback sees the fades as of now, not of the last tick.
+        let animating = self.presenter.step(self.seconds());
+        let mut items = draw::scene(&self.state, &self.surfaces[index].mapping);
+
+        items.extend(self.presenter.scene(&self.surfaces[index].mapping));
+
         let wanted     = draw::bounds(&items).unwrap_or(PixelBox::EMPTY).clip_to(width, height);
         let background = self.state.background;
         let whole      = PixelBox { x: 0, y: 0, w: width as i32, h: height as i32 };
@@ -486,8 +524,11 @@ impl App {
             "overlay commit"
         );
 
+        // While a fade or a trail is in progress the surface stays dirty, so the
+        // frame callback just requested draws the next step; the animation is paced
+        // by the compositor and stops asking for frames the moment it settles.
         surface.buffers.as_mut().unwrap().next = 1 - slot_index;
-        surface.dirty                          = false;
+        surface.dirty                          = animating;
         surface.frame_sent                     = Some(Instant::now());
         surface.on_screen                      = wanted;
         surface.on_screen_bg                   = background;

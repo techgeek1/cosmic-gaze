@@ -2060,7 +2060,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "cosmic-config",
  "gaze-core",
+ "notify",
+ "ron",
+ "serde",
  "smithay-client-toolkit",
  "thiserror 2.0.20",
  "tiny-skia 0.12.0",

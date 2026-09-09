@@ -116,6 +116,37 @@ pub enum Item {
         px    : f32,
         text  : String,
     },
+    /// The pointer look's dot: a filled disc with a halo ring of `halo` width outside
+    /// it, so it stays visible on a background the colour of the disc.
+    Marker {
+        cx         : f32,
+        cy         : f32,
+        radius     : f32,
+        halo       : f32,
+        color      : [u8; 4],
+        halo_color : [u8; 4],
+    },
+    /// The pointer look's highlight: a rounded rectangle with a faint interior, a
+    /// stroke, and a halo either side of the stroke.
+    RoundBox {
+        x          : f32,
+        y          : f32,
+        w          : f32,
+        h          : f32,
+        radius     : f32,
+        stroke     : f32,
+        halo       : f32,
+        color      : [u8; 4],
+        fill       : [u8; 4],
+        halo_color : [u8; 4],
+    },
+    /// The pointer look's trail: a polyline oldest first, drawn tapering in width and
+    /// alpha from nothing at the tail to `width` and `color` at the head.
+    Trail {
+        points : Vec<(f32, f32)>,
+        width  : f32,
+        color  : [u8; 4],
+    },
 }
 
 // --- Api ---
@@ -305,6 +336,54 @@ pub fn draw(pixmap: &mut PixmapMut, items: &[Item]) {
             Item::Label { x, y, px, text } => {
                 draw_label(pixmap, *x, *y, *px, text);
             }
+
+            Item::Marker { cx, cy, radius, halo, color, halo_color } => {
+                // The halo is a larger disc underneath rather than a stroke, so the
+                // two antialiased edges do not leave a seam between them.
+                for (r, c) in [(radius + halo, halo_color), (*radius, color)] {
+                    let Some(path) = PathBuilder::from_circle(*cx, *cy, r) else {
+                        continue;
+                    };
+
+                    pixmap.fill_path(
+                        &path,
+                        &paint(*c),
+                        FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
+                }
+            }
+
+            Item::RoundBox { x, y, w, h, radius, stroke, halo, color, fill, halo_color } => {
+                let Some(path) = rounded_rect(*x, *y, *w, *h, *radius) else {
+                    continue;
+                };
+
+                pixmap.fill_path(
+                    &path,
+                    &paint(*fill),
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
+
+                // A wide halo stroke under the accent stroke leaves `halo` showing on
+                // each side of it.
+                for (width, c) in [(stroke + halo * 2.0, halo_color), (*stroke, color)] {
+                    pixmap.stroke_path(
+                        &path,
+                        &paint(*c),
+                        &stroke_of(width),
+                        Transform::identity(),
+                        None,
+                    );
+                }
+            }
+
+            Item::Trail { points, width, color } => {
+                draw_trail(pixmap, points, *width, *color);
+            }
         }
     }
 }
@@ -417,6 +496,40 @@ fn item_bounds(item: &Item) -> PixelBox {
 
             PixelBox::around(*x, *y, w, h)
         }
+
+        Item::Marker { cx, cy, radius, halo, .. } => {
+            let r = radius + halo;
+
+            PixelBox::around(cx - r, cy - r, r * 2.0, r * 2.0)
+        }
+
+        Item::RoundBox { x, y, w, h, stroke, halo, .. } => {
+            let s = stroke * 0.5 + halo;
+
+            PixelBox::around(x - s, y - s, w + s * 2.0, h + s * 2.0)
+        }
+
+        Item::Trail { points, width, .. } => {
+            let mut x0 = f32::INFINITY;
+            let mut y0 = f32::INFINITY;
+            let mut x1 = f32::NEG_INFINITY;
+            let mut y1 = f32::NEG_INFINITY;
+
+            for (x, y) in points {
+                x0 = x0.min(*x);
+                y0 = y0.min(*y);
+                x1 = x1.max(*x);
+                y1 = y1.max(*y);
+            }
+
+            if points.is_empty() {
+                return PixelBox::EMPTY;
+            }
+
+            let s = width * 0.5;
+
+            PixelBox::around(x0 - s, y0 - s, x1 - x0 + width, y1 - y0 + width)
+        }
     }
 }
 
@@ -494,6 +607,71 @@ fn draw_label(pixmap: &mut PixmapMut, x: f32, y: f32, px: f32, text: &str) {
 
         fill_solid(pixmap, cell.clip_to(width, height), premul);
     });
+}
+
+/// A rounded rectangle path. The radius is clamped to half the shorter side, so a
+/// highlight on a thin element degrades to a pill rather than to a broken path.
+fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
+    let r = radius.max(0.0).min(w * 0.5).min(h * 0.5);
+
+    if r <= 0.0 {
+        return SkRect::from_xywh(x, y, w, h).map(PathBuilder::from_rect);
+    }
+
+    // Circular arcs as cubics: the standard control distance for a quarter circle.
+    let k  = 0.5523 * r;
+    let x1 = x + w;
+    let y1 = y + h;
+
+    let mut pb = PathBuilder::new();
+
+    pb.move_to(x + r, y);
+    pb.line_to(x1 - r, y);
+    pb.cubic_to(x1 - r + k, y, x1, y + r - k, x1, y + r);
+    pb.line_to(x1, y1 - r);
+    pb.cubic_to(x1, y1 - r + k, x1 - r + k, y1, x1 - r, y1);
+    pb.line_to(x + r, y1);
+    pb.cubic_to(x + r - k, y1, x, y1 - r + k, x, y1 - r);
+    pb.line_to(x, y + r);
+    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
+    pb.close();
+
+    pb.finish()
+}
+
+/// Draws the trail one segment at a time, each thinner and fainter than the one after
+/// it. A handful of segments, so per-segment paint setup is nothing.
+fn draw_trail(pixmap: &mut PixmapMut, points: &[(f32, f32)], width: f32, color: [u8; 4]) {
+    let n = points.len().saturating_sub(1);
+
+    for (i, pair) in points.windows(2).enumerate() {
+        // The newest segment gets the full width and alpha; the oldest almost none.
+        let t     = (i + 1) as f32 / n as f32;
+        let alpha = (f32::from(color[3]) * t).round() as u8;
+
+        let mut pb = PathBuilder::new();
+
+        pb.move_to(pair[0].0, pair[0].1);
+        pb.line_to(pair[1].0, pair[1].1);
+
+        let Some(path) = pb.finish() else {
+            continue;
+        };
+
+        let stroke = Stroke {
+            width    : (width * t).max(1.0),
+            line_cap : LineCap::Round,
+            ..Stroke::default()
+        };
+
+        pixmap.stroke_path(
+            &path,
+            &paint([color[0], color[1], color[2], alpha]),
+            &stroke,
+            Transform::identity(),
+            None,
+        );
+    }
 }
 
 /// Writes a premultiplied RGBA colour over every pixel of an already clipped box.

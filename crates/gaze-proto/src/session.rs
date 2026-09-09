@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use gaze_core::{DesktopGeometry, Element, ElementKind, GazeSample, GlobalPx};
 use gaze_inject::{Button as InjectButton, Injector, Key};
-use gaze_overlay::{Overlay, OverlayState};
+use gaze_overlay::{Motion, Overlay, OverlayState, Pointer, Target};
 use gaze_provider_et5::{ClickFeedback, ClickVia};
 use gaze_provider_synthetic::to_jsonl_line;
 use gaze_snap::{FilterStack, FixationState, Filtered, SnapEngine};
@@ -54,6 +54,11 @@ use crate::warp::{WARP_COOLDOWN, WarpReason, Warper};
 /// How far the filtered gaze point must move before the overlay is repainted. Below this
 /// the ring would jitter in place and cost a frame per sample for no visible change.
 const OVERLAY_MOVE_PX: f64 = 2.0;
+
+/// How long a fixation must have held before the pointer look treats it as settled and
+/// thins the dot. Shorter than a dwell, longer than the filter's first fixating sample,
+/// so a glance that is still deciding keeps a full dot.
+const SETTLE_S: f64 = 0.15;
 
 /// Capture passes per second on the perception thread. Capture is ~35 ms per ultrawide, so
 /// this leaves the cores to the detector and the gaze loop.
@@ -307,6 +312,9 @@ pub fn run(args: &Args) -> Result<()> {
     let mut last_hidden                      = false;
     let mut last_blocked                     = false;
     let mut last_owner  : Option<Owner>      = None;
+    // The pointer look's state apart from position, so a change of motion or of what is
+    // near repaints even when the eyes have not moved.
+    let mut last_pointer : Option<(Motion, bool, Option<u64>)> = None;
     let mut stale_gen   : Option<u64>        = None;
     // Set when a scroll starts or stops; retargeting stays off until a fixation that began
     // later than this, which is the eyes having moved on purpose.
@@ -669,27 +677,64 @@ pub fn run(args: &Args) -> Result<()> {
         let hidden  = scrolling || stale_gen.is_some();
         let blocked = retarget_block.is_some();
 
+        // The pointer look's intent. The highlight goes down during a scroll and until
+        // the detector has caught up with it, since every box is where the content was;
+        // the dot is drawn where the fine channel has moved the commit point while a
+        // thumb is on the pad, and at the gaze otherwise.
+        let pointer = gaze.map(|g| {
+            let refining = refined.filter(|r| r.engaged);
+
+            Pointer {
+                gaze   : refining.map_or(g, |r| r.point()),
+                motion : motion_of(&filtered),
+                near   : refining.is_some()
+                    || engine.ranked().any(|c| worth_marking(&elements[c.index], args)),
+                target : target
+                    .as_ref()
+                    .filter(|t| !hidden && worth_marking(&t.element, args))
+                    .map(|t| Target { id: t.element.id, rect: t.element.bbox }),
+            }
+        });
+
+        let pointer_key = pointer.map(|p| (p.motion, p.near, p.target.map(|t| t.id)));
+
         if moved || target_id != last_target || hidden != last_hidden || blocked != last_blocked
-            || owner != last_owner
+            || owner != last_owner || pointer_key != last_pointer
         {
-            // A highlight flickering across moving text, or parked on where text used to
-            // be, is noise; the label says what is happening instead.
-            let state = OverlayState {
-                gaze       : gaze,
-                highlight  : target.as_ref().filter(|_| !hidden).map(|t| t.element.bbox),
-                truth      : if args.show_truth { source.truth() } else { None },
-                label      : Some(match (scrolling, hidden, retarget_block) {
-                    _ if refined.is_some_and(|r| r.engaged) => "refine".to_string(),
-                    _ if owner == Some(Owner::Mouse)  => "mouse".to_string(),
-                    _ if owner == Some(Owner::Nobody) => "controller down".to_string(),
-                    (true, _, _)        => "edge scroll".to_string(),
-                    (false, true, _)    => "redetecting".to_string(),
-                    (false, false, Some(_)) => "move eyes to retarget".to_string(),
-                    _                   => label(&target, &filtered),
-                }),
-                background : None,
+            let state = {
+                if args.overlay_debug {
+                    // A highlight flickering across moving text, or parked on where text
+                    // used to be, is noise; the label says what is happening instead.
+                    OverlayState {
+                        gaze       : gaze,
+                        highlight  : target.as_ref().filter(|_| !hidden).map(|t| t.element.bbox),
+                        truth      : if args.show_truth { source.truth() } else { None },
+                        label      : Some(match (scrolling, hidden, retarget_block) {
+                            _ if refined.is_some_and(|r| r.engaged) => "refine".to_string(),
+                            _ if owner == Some(Owner::Mouse)  => "mouse".to_string(),
+                            _ if owner == Some(Owner::Nobody) => "controller down".to_string(),
+                            (true, _, _)        => "edge scroll".to_string(),
+                            (false, true, _)    => "redetecting".to_string(),
+                            (false, false, Some(_)) => "move eyes to retarget".to_string(),
+                            _                   => label(&target, &filtered),
+                        }),
+                        background : None,
+                        pointer    : None,
+                    }
+                }
+                else {
+                    OverlayState {
+                        gaze       : None,
+                        highlight  : None,
+                        truth      : if args.show_truth { source.truth() } else { None },
+                        label      : None,
+                        background : None,
+                        pointer    : pointer,
+                    }
+                }
             };
 
+            last_pointer = pointer_key;
             last_hidden  = hidden;
             last_blocked = blocked;
             last_owner   = owner;
@@ -1361,6 +1406,30 @@ fn log_candidates(engine: &SnapEngine, elements: &[Element], gaze: Option<Global
             gaze_y     = gaze.map(|g| g.y),
             "snap candidate",
         );
+    }
+}
+
+/// What the eyes are doing, for the pointer look. A fixation is settled once it has held
+/// for [`SETTLE_S`]; a lost sample never gets here because the pointer is `None` then.
+fn motion_of(filtered: &Filtered) -> Motion {
+    match filtered.state {
+        FixationState::Fixating { since_s } if filtered.sample.t_s - since_s >= SETTLE_S => {
+            Motion::Settled
+        }
+        FixationState::Fixating { .. } => Motion::Settling,
+        FixationState::Saccade | FixationState::Lost => Motion::Moving,
+    }
+}
+
+/// Whether the pointer look should show an element. Controls are; text is not unless
+/// asked for, because most text on a screen is being read, not aimed at, and marking it
+/// is exactly the distraction the pointer look exists to avoid. The snap engine still
+/// targets whatever it targets; this only decides what is drawn.
+fn worth_marking(element: &Element, args: &Args) -> bool {
+    match element.kind {
+        ElementKind::Text    => args.highlight_text,
+        ElementKind::Unknown => false,
+        _                    => true,
     }
 }
 

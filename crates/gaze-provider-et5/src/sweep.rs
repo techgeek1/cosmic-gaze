@@ -543,6 +543,7 @@ pub fn run_sweep(
         truth      : None,
         label      : None,
         background : None,
+        pointer    : None,
     });
 
     if entries.is_empty() {
@@ -1013,6 +1014,7 @@ pub(crate) fn show_target(overlay: &OverlayHandle, px: GlobalPx, label: &str)
         truth      : Some(px),
         label      : Some(label.to_string()),
         background : overlay_background(),
+        pointer    : None,
     }).map_err(|e| SweepError::Overlay(e.to_string()))
 }
 
@@ -2137,6 +2139,7 @@ pub fn run_collect(
         truth      : None,
         label      : None,
         background : None,
+        pointer    : None,
     });
 
     save_pass(&raw_out.to_path_buf(), out_name, &pass)

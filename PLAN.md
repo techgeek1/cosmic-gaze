@@ -115,7 +115,7 @@ pub struct SnapTarget { pub element: Element, pub point: GlobalPx, pub score: f6
 Scoring: `cost = 0.6*kind_penalty + 0.15*ln(1+area_deg2) + 1.0*distance_deg` (controls 0, Text 1, Unknown 2).
 Bails to `None` when `sigma_deg > radius_deg` or the sample is invalid.
 
-### gaze-overlay (DONE; `Overlay::spawn() -> (OverlayHandle, JoinHandle)`, `OverlayHandle::set(OverlayState)` / `stop()`, `OverlayState { gaze, highlight, truth, label }`)
+### gaze-overlay (DONE; `Overlay::spawn() -> (OverlayHandle, JoinHandle)`, `OverlayHandle::set(OverlayState)` / `stop()`, `OverlayState { gaze, highlight, truth, label, background, pointer }`; the pointer look is PLAN-UX.md U1, built 2026-09-09)
 ```rust
 pub struct Overlay;  // Overlay::connect()? ; fn set(&mut self, state: OverlayState); OverlayState { gaze: Option<GlobalPx>, highlight: Option<Rect>, truth: Option<GlobalPx> }
 ```

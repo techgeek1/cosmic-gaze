@@ -1,11 +1,20 @@
-//! A transparent, click-through debug overlay for the COSMIC desktop.
+//! A transparent, click-through overlay for the COSMIC desktop.
 //!
 //! The overlay puts one `zwlr_layer_shell_v1` surface on the overlay layer of every
-//! output, anchored to all four edges with an exclusive zone of -1, and draws a gaze
-//! marker, a highlighted candidate box and a ground-truth marker on top of whatever is
-//! already on screen. Every surface has an empty input region, so pointer events pass
-//! straight through and the desktop underneath stays fully usable while the overlay is
-//! up.
+//! output, anchored to all four edges with an exclusive zone of -1, and draws on top of
+//! whatever is already on screen. Every surface has an empty input region, so pointer
+//! events pass straight through and the desktop underneath stays fully usable while the
+//! overlay is up.
+//!
+//! It has two looks. The debug look draws exactly what it is given, the frame it is
+//! given it: a gaze ring, a candidate box, a truth cross, a caption, in fixed colours.
+//! The pointer look ([`Pointer`]) is for daily use: the producer sends an intent, where
+//! the gaze is, whether it is moving, whether anything clickable is near and which
+//! element is favoured, and the overlay presents it on its own clock ([`Presenter`]).
+//! The dot appears only near something clickable and thins once the eyes settle on a
+//! target, the highlight is a rounded box in the desktop's accent colour that
+//! crossfades from element to element, and a short faint trail follows a saccade. The
+//! accent and corner radius come from the COSMIC theme ([`Theme`]) and follow it live.
 //!
 //! Everything the caller passes in is in global logical pixels, the same space
 //! `gaze_core::Rect` and the snap engine use. The mapping onto individual outputs is
@@ -54,12 +63,16 @@ mod draw;
 mod error;
 mod font;
 mod mapping;
+mod present;
 mod state;
+mod theme;
 mod wayland;
 
 pub use draw::render;
 pub use error::OverlayError;
 pub use mapping::OutputMapping;
-pub use state::OverlayState;
+pub use present::Presenter;
+pub use state::{Motion, OverlayState, Pointer, Target};
+pub use theme::{Theme, ThemeWatch};
 pub use tiny_skia::Pixmap;
 pub use wayland::{Overlay, OverlayHandle};

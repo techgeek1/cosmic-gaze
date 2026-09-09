@@ -468,6 +468,7 @@ fn probe(models: PathBuf, seconds: Option<f64>, hz: f64, luma_px: f64) -> Result
             truth      : Some(sample.global),
             label      : Some(label),
             background : None,
+            pointer    : None,
         })
         .context("the overlay thread exited")?;
     }

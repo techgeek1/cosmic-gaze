@@ -18,3 +18,20 @@ tiny-skia = "0.12"
 # the overlay never takes keyboard focus. `calloop` gives us the event loop and the
 # wayland event source, and re-exports every wayland crate so versions cannot skew.
 smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
+serde = { workspace = true }
+
+# The watcher type `cosmic-config` hands back, so it can be kept alive by name. Pinned to
+# the same major as cosmic-config's.
+notify = "8"
+
+[dev-dependencies]
+ron = "0.12"
+
+# Accent colour and corner radius from the COSMIC theme, read the way every COSMIC
+# app reads them (`~/.config/cosmic/<name>/v1/<key>` in RON, with a watcher). Same pin
+# as `gaze-trainer`'s libcosmic so the checkout is shared. No default features: the
+# subscription feature pulls iced, and the overlay has no use for it.
+[dependencies.cosmic-config]
+git              = "https://github.com/pop-os/libcosmic.git"
+rev              = "c1897c01aa8a25776ceadeddcb161bb59ccffd79"
+default-features = false

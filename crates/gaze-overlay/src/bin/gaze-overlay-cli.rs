@@ -1,5 +1,8 @@
 //! Manual test for the overlay: animates a gaze marker along a figure-eight across the
-//! union of every output, with a highlight box following it, then exits cleanly.
+//! union of every output, with a highlight box following it, then exits cleanly. With
+//! `--pointer` it shows the pointer look instead: a gaze hopping between three fake
+//! controls, settling on each, so the dot's fade, ghosting, trail and the highlight's
+//! crossfade can all be seen in the desktop's own accent colour.
 //!
 //! There is nothing to assert here, the point is to look at the screen. While it runs the
 //! desktop underneath must stay fully usable: clicking, dragging and hovering should all
@@ -18,7 +21,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use gaze_core::{GlobalPx, Rect};
-use gaze_overlay::{Overlay, OverlayState, render};
+use gaze_overlay::{Motion, Overlay, OverlayState, Pointer, Presenter, Target, Theme, render};
 
 /// How often the animation pushes a new state. The overlay paces its own drawing off
 /// frame callbacks, so pushing faster than the display refreshes only coalesces.
@@ -36,6 +39,24 @@ const BOX_H: f64 = 90.0;
 /// Fraction of the desktop's half-width and half-height the lissajous sweeps over.
 const SWEEP: f64 = 0.8;
 
+/// Seconds the pointer look's gaze rests on each fake control.
+const HOP_DWELL_S: f64 = 1.4;
+
+/// Seconds the flight between two controls takes.
+const HOP_FLIGHT_S: f64 = 0.3;
+
+/// Seconds after landing before the fixation counts as settled, matching the session.
+const HOP_SETTLE_S: f64 = 0.15;
+
+/// Size of a fake control.
+const CONTROL_W: f64 = 160.0;
+
+/// Height of a fake control.
+const CONTROL_H: f64 = 44.0;
+
+/// How close to a control the gaze has to be for it to count as near.
+const NEAR_PX: f64 = 260.0;
+
 #[derive(Parser, Debug)]
 #[command(about = "animate a gaze marker across every output to test the overlay")]
 struct Args {
@@ -47,6 +68,11 @@ struct Args {
     /// from this one. Exercises the path the live prototype will use.
     #[arg(long)]
     threaded: bool,
+
+    /// Show the pointer look (dot, trail, themed highlight) hopping between three fake
+    /// controls instead of the debug figure-eight.
+    #[arg(long)]
+    pointer: bool,
 
     /// Print the outputs and their logical rectangles, then exit without drawing.
     #[arg(long)]
@@ -74,16 +100,27 @@ fn main() -> anyhow::Result<()> {
         return list_outputs();
     }
 
+    let look = if args.pointer { Look::Pointer } else { Look::Debug };
+
     if let Some(dir) = args.render {
-        return render_frames(&dir, args.at);
+        return render_frames(&dir, args.at, look);
     }
 
     if args.threaded {
-        run_threaded(args.seconds)
+        run_threaded(args.seconds, look)
     }
     else {
-        run_inline(args.seconds)
+        run_inline(args.seconds, look)
     }
+}
+
+/// Which animation to show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Look {
+    /// The figure-eight with the ring, the box, the cross and the caption.
+    Debug,
+    /// The pointer look hopping between controls.
+    Pointer,
 }
 
 // --- Modes ---
@@ -110,17 +147,39 @@ fn list_outputs() -> anyhow::Result<()> {
 /// Renders the frame the animation would show at `at` seconds, one PNG per output, and
 /// puts nothing on screen. The alpha channel is what the compositor would composite, so a
 /// mostly transparent image with a ring and a box in it is the expected result.
-fn render_frames(dir: &Path, at: f64) -> anyhow::Result<()> {
+fn render_frames(dir: &Path, at: f64, look: Look) -> anyhow::Result<()> {
     let overlay = Overlay::connect()?;
     let desk    = Desk::of(&overlay)?;
 
     fs::create_dir_all(dir)?;
 
-    let state = frame_at(&desk, at);
+    // The pointer look has state: fades and a trail that depend on the frames before
+    // `at`. Replaying the animation into a presenter up to that point gives the frame the
+    // screen would have shown.
+    let (state, presenter) = match look {
+        Look::Debug   => (frame_at(&desk, at), None),
+        Look::Pointer => {
+            let mut presenter = Presenter::new(Theme::cosmic());
+            let mut t         = 0.0;
+
+            while t <= at {
+                presenter.observe(pointer_at(&desk, t).as_ref(), t);
+                presenter.step(t);
+
+                t += STEP.as_secs_f64();
+            }
+
+            (OverlayState::default(), Some(presenter))
+        }
+    };
 
     for map in overlay.outputs() {
-        let Some(pixmap) = render(&state, map)
-        else {
+        let pixmap = match &presenter {
+            Some(p) => p.render(&state, map),
+            None    => render(&state, map),
+        };
+
+        let Some(pixmap) = pixmap else {
             eprintln!("{}: degenerate buffer size, skipped", map.name);
             continue;
         };
@@ -138,7 +197,7 @@ fn render_frames(dir: &Path, at: f64) -> anyhow::Result<()> {
 ///
 /// `run_until` blocks, so the animation runs on a helper thread that pushes state through
 /// the overlay's handle and sets the stop flag when the time is up.
-fn run_inline(seconds: f64) -> anyhow::Result<()> {
+fn run_inline(seconds: f64, look: Look) -> anyhow::Result<()> {
     let mut overlay = Overlay::connect()?;
     let desk        = Desk::of(&overlay)?;
 
@@ -149,7 +208,7 @@ fn run_inline(seconds: f64) -> anyhow::Result<()> {
 
     thread::scope(|scope| {
         scope.spawn(|| {
-            animate(&desk, seconds, |state| handle.set(state).is_ok());
+            animate(&desk, seconds, look, |state| handle.set(state).is_ok());
             handle.stop();
         });
 
@@ -160,7 +219,7 @@ fn run_inline(seconds: f64) -> anyhow::Result<()> {
 }
 
 /// Runs the overlay on its own thread and animates from this one.
-fn run_threaded(seconds: f64) -> anyhow::Result<()> {
+fn run_threaded(seconds: f64, look: Look) -> anyhow::Result<()> {
     // The overlay thread owns its connection and nothing exposes the geometry over the
     // handle, so ask a short lived probe connection where the outputs are first. It
     // attaches no buffers, so nothing appears on screen while it lives.
@@ -175,7 +234,7 @@ fn run_threaded(seconds: f64) -> anyhow::Result<()> {
 
     println!("desktop union: {} {} {} {}", b.x, b.y, b.w, b.h);
 
-    animate(&desk, seconds, |state| handle.set(state).is_ok());
+    animate(&desk, seconds, look, |state| handle.set(state).is_ok());
 
     handle.stop();
     let _ = join.join();
@@ -195,7 +254,7 @@ fn report(overlay: &Overlay, bounds: Rect) {
 
 /// Walks a lissajous figure-eight over `bounds` for `seconds`, calling `push` with each
 /// new state. Stops early if `push` returns false, which means the overlay has gone away.
-fn animate(desk: &Desk, seconds: f64, mut push: impl FnMut(OverlayState) -> bool) {
+fn animate(desk: &Desk, seconds: f64, look: Look, mut push: impl FnMut(OverlayState) -> bool) {
     let start = Instant::now();
 
     loop {
@@ -205,16 +264,70 @@ fn animate(desk: &Desk, seconds: f64, mut push: impl FnMut(OverlayState) -> bool
             break;
         }
 
-        if !push(frame_at(desk, t)) {
+        let state = match look {
+            Look::Debug   => frame_at(desk, t),
+            Look::Pointer => OverlayState { pointer: pointer_at(desk, t), ..OverlayState::default() },
+        };
+
+        if !push(state) {
             break;
         }
 
         thread::sleep(STEP);
     }
 
-    // Leave the screen clean on the way out.
+    // Leave the screen clean on the way out. The pointer look fades, so give it time.
     let _ = push(OverlayState::default());
-    thread::sleep(STEP * 4);
+    thread::sleep(STEP * 30);
+}
+
+/// The pointer look's intent at time `t`: the gaze rests on one of three controls laid
+/// across the middle of the desktop, then flies to the next with an ease-out, so each
+/// hop shows a saccade with a trail, a landing, and the dot thinning once settled.
+fn pointer_at(desk: &Desk, t: f64) -> Option<Pointer> {
+    let controls = desk.controls();
+    let period   = HOP_DWELL_S + HOP_FLIGHT_S;
+    let hop      = (t / period).floor() as usize;
+    let phase    = t - hop as f64 * period;
+    let from     = controls[hop % controls.len()];
+    let to       = controls[(hop + 1) % controls.len()];
+
+    let (gaze, motion) = {
+        if phase < HOP_DWELL_S {
+            let motion = if phase < HOP_SETTLE_S { Motion::Settling } else { Motion::Settled };
+
+            (from.center(), motion)
+        }
+        else {
+            // Ease out: fast off the mark, slowing into the target, like a saccade.
+            let u = (phase - HOP_DWELL_S) / HOP_FLIGHT_S;
+            let e = 1.0 - (1.0 - u) * (1.0 - u);
+            let a = from.center();
+            let b = to.center();
+
+            (GlobalPx { x: a.x + (b.x - a.x) * e, y: a.y + (b.y - a.y) * e }, Motion::Moving)
+        }
+    };
+
+    // Nearest control, and whether it is close enough to be a target or merely near.
+    let (nearest, dist) = controls
+        .iter()
+        .map(|c| {
+            let p = c.clamp(gaze);
+
+            (*c, (p.x - gaze.x).hypot(p.y - gaze.y))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))?;
+
+    Some(Pointer {
+        gaze   : gaze,
+        motion : motion,
+        near   : dist < NEAR_PX,
+        target : (dist < CONTROL_H).then(|| Target {
+            id   : controls.iter().position(|c| *c == nearest).unwrap_or(0) as u64,
+            rect : nearest,
+        }),
+    })
 }
 
 /// The state the animation shows at time `t`.
@@ -236,6 +349,7 @@ fn frame_at(desk: &Desk, t: f64) -> OverlayState {
         truth      : Some(figure_eight(desk, t + 0.25)),
         label      : Some(format!("GAZE {:.0} {:.0}", gaze.x, gaze.y)),
         background : None,
+        pointer    : None,
     }
 }
 
@@ -282,6 +396,26 @@ impl Desk {
         };
 
         Ok(Desk { outputs: outputs, bounds: bounds })
+    }
+
+    /// Three fake controls in a row across the middle of the largest output, spaced so
+    /// a hop between neighbours is a real saccade and the middle one is near both.
+    fn controls(&self) -> [Rect; 3] {
+        let widest = self
+            .outputs
+            .iter()
+            .copied()
+            .max_by(|a, b| a.w.total_cmp(&b.w))
+            .unwrap_or(self.bounds);
+
+        let cy = widest.y + widest.h * 0.5 - CONTROL_H * 0.5;
+
+        [0.25, 0.5, 0.75].map(|f| Rect {
+            x : widest.x + widest.w * f - CONTROL_W * 0.5,
+            y : cy,
+            w : CONTROL_W,
+            h : CONTROL_H,
+        })
     }
 
     /// Moves a point onto the nearest output if it is not already on one.
