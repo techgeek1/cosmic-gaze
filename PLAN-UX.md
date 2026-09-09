@@ -23,7 +23,9 @@ thread presents it on its own clock (`present.rs`). Rules:
   It fades in and out (60 ms in, 200 ms out) rather than popping, holds one weight while
   shown, and stays up for a linger (`--pointer-linger-s`, 0.3 s) after nothing is near,
   with the near gate itself closing at 1.5x the distance it opens at, so the edge of the
-  gate does not blink it.
+  gate does not blink it. A saccade never opens the gate: the return sweep to the next
+  line of a paragraph crosses controls the eye is not aiming at, so only a fixation can
+  bring the dot up, and in flight it can only stay or go.
 - **The dot moves on a critically damped spring** stepped at the display's frame rate
   (`--pointer-settle-s`, 0.2 s to close 95% of a step), the VR laser-pointer treatment:
   continuous velocity between the tracker's 33 Hz samples, no overshoot, drift followed

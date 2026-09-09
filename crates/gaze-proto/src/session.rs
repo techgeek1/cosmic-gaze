@@ -744,10 +744,19 @@ pub fn run(args: &Args) -> Result<()> {
                 ),
             };
 
+            // A saccade never brings the dot up. The eye in flight sweeps over whatever
+            // lies between two fixations, and the return sweep to the start of the next
+            // line of a paragraph crosses controls it is not aiming at; only a fixation
+            // opens the gate. In flight the dot may stay up (it was near and still is)
+            // or go down, never come up.
+            let in_flight = !matches!(filtered.state, FixationState::Fixating { .. });
+            let was_near  = matches!(last_pointer, Some((true, _)));
+            let near      = near && (was_near || !in_flight);
+
             Pointer {
                 gaze   : refining.map_or(g, |r| r.point()),
                 near   : refining.is_some() || near,
-                target : target.filter(|_| !hidden),
+                target : target.filter(|_| !hidden && near),
             }
         });
 
