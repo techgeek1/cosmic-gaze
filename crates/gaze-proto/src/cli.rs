@@ -112,6 +112,16 @@ pub struct Args {
     #[arg(long)]
     pub freeze_offset: bool,
 
+    /// Where the ET5 flywheel writes every attributed click with its features, one
+    /// JSONL file per UTC day (`gaze-et5-cli flywheel` reads them). Only meaningful
+    /// with a residual model.
+    #[arg(long, default_value = "config/flywheel")]
+    pub flywheel: PathBuf,
+
+    /// Write no flywheel records this run.
+    #[arg(long)]
+    pub no_flywheel: bool,
+
     /// I-VT saccade velocity threshold, deg/s. Default 30 (tracker) or 80 (webcam).
     #[arg(long)]
     pub filter_velocity_deg_s: Option<f64>,

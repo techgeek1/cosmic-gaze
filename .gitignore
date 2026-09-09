@@ -20,3 +20,5 @@ __pycache__/
 /config/offset*.json
 # Local experiments and captures; not part of the tree.
 /scratchpad/
+# The flywheel: every attributed click, one JSONL file per day.
+/config/flywheel/

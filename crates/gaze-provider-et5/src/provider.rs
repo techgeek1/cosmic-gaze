@@ -48,9 +48,10 @@ use crate::blob::BlobReport;
 use crate::calibration::{Et5Calibration, VIRTUAL_AREA};
 use crate::dataset::{firmware_ray, local_yaw_pitch_deg};
 use crate::device::{ConnectOptions, Device, DeviceError};
+use crate::flywheel::{ClickRecord, ClickVia, FLYWHEEL_FORMAT, FlywheelLog, Verdict};
 use crate::gaze::{Et5Frame, EyeCombiner, filtered_ray};
-use crate::model::{Features, HeadHistory, Prediction, ResidualModel, correct_direction};
-use crate::offset::{ClickFeedback, OffsetParams, OnlineOffset};
+use crate::model::{FEATURE_COUNT, Features, HeadHistory, Prediction, ResidualModel, correct_direction};
+use crate::offset::{ClickFeedback, Observation, OffsetParams, OnlineOffset};
 use crate::sweep::desk_to_sensor;
 use crate::ttp::DisplayArea;
 
@@ -170,6 +171,8 @@ pub struct Et5ProviderBuilder {
     offset_path       : Option<PathBuf>,
     /// The online offset's tunables.
     offset_params     : OffsetParams,
+    /// Where attributed clicks are written down (the flywheel), `None` for nowhere.
+    flywheel_dir      : Option<PathBuf>,
     geometry          : Option<DesktopGeometry>,
     calibration       : Option<Et5Calibration>,
     tracker_pitch_deg : f64,
@@ -184,6 +187,7 @@ impl Et5Provider {
             model             : None,
             offset_path       : None,
             offset_params     : OffsetParams::default(),
+            flywheel_dir      : None,
             geometry          : None,
             calibration       : None,
             tracker_pitch_deg : 0.0,
@@ -261,8 +265,14 @@ impl Et5Provider {
     /// point and the leftover, if believable, nudges the offset every later sample is
     /// corrected by. `None` when there is no model, the point is on no configured
     /// panel, or too few corrected rays fell in the window.
-    pub fn observe_click(&mut self, px: GlobalPx, t_s: f64) -> Option<ClickFeedback> {
-        self.convert.model.as_mut()?.observe_click(px, t_s)
+    pub fn observe_click(&mut self, px: GlobalPx, t_s: f64, via: ClickVia)
+        -> Option<ClickFeedback>
+    {
+        // The press's wall-clock time, for the flywheel's day file: the provider's
+        // clock started `t0.elapsed()` ago, and the press is `t_s` after that.
+        let unix_s = Et5Calibration::now_unix_s() - (self.t0.elapsed().as_secs_f64() - t_s);
+
+        self.convert.model.as_mut()?.observe_click(px, t_s, via, unix_s)
     }
 
     /// How many times this provider has had a live session, starting at one. A change
@@ -479,6 +489,14 @@ impl Et5ProviderBuilder {
         self
     }
 
+    /// Where every attributed click is written down with its features (the flywheel,
+    /// `flywheel.rs`). `None` (the default) writes nothing.
+    pub fn flywheel_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.flywheel_dir = dir;
+
+        self
+    }
+
     /// A fitted residual model (`gaze-et5-cli fit`). Applied to the firmware's ray in
     /// direct mode, in place of the correction field and the head gain; ignored, with
     /// a warning, when its blob hash is not the calibration's or there is no direct
@@ -592,7 +610,18 @@ impl Et5ProviderBuilder {
                 }
             };
 
-            Some(ModelState::new(model, *area, &desk, offset))
+            let flywheel = self.flywheel_dir.as_ref().and_then(|dir| {
+                match FlywheelLog::open(dir) {
+                    Ok(log) => Some(log),
+                    Err(e)  => {
+                        warn!("flywheel disabled: {e}");
+
+                        None
+                    }
+                }
+            });
+
+            Some(ModelState::new(model, *area, &desk, offset, flywheel))
         });
 
         if let Some(state) = &model {
@@ -715,10 +744,34 @@ struct ModelState {
     /// Half the vector from the left eye to the right, from the last frame that had
     /// both, so a frame with one eye still yields the midpoint (see [`posture_origin`]).
     half_ipd       : Option<DVec3>,
-    /// Recent corrected rays in the sensor frame, oldest first: host time, ray origin,
-    /// corrected direction and the posture origin the offset was read at. What a click
-    /// is attributed against.
-    recent         : VecDeque<(f64, DVec3, DVec3, DVec3)>,
+    /// Recent corrected rays in the sensor frame, oldest first. What a click is
+    /// attributed against.
+    recent         : VecDeque<RecentRay>,
+    /// Where attributed clicks are written down, when they are.
+    flywheel       : Option<FlywheelLog>,
+}
+
+/// One corrected ray as the click attribution needs it: everything the record of a
+/// click on it will carry.
+#[derive(Clone, Copy, Debug)]
+struct RecentRay {
+    /// Host time, seconds.
+    t_s       : f64,
+    /// Ray origin, sensor frame.
+    origin    : DVec3,
+    /// The firmware's own direction, before any correction: what the label is
+    /// measured against.
+    dir       : DVec3,
+    /// The direction after model and offset: what the user saw the pointer follow.
+    corrected : DVec3,
+    /// The posture origin the offset was read at.
+    posture   : DVec3,
+    /// The features the model predicted from.
+    features  : Features,
+    /// The faded model correction, yaw and pitch degrees.
+    model_deg : [f64; 2],
+    /// The model's fade, 1 inside the training data.
+    fade      : f64,
 }
 
 // --- ModelState ---
@@ -726,10 +779,11 @@ struct ModelState {
 impl ModelState {
     /// Wraps a model for the desk it will run on.
     fn new(
-        model  : ResidualModel,
-        area   : DisplayArea,
-        desk   : &DesktopGeometry,
-        offset : OnlineOffset,
+        model    : ResidualModel,
+        area     : DisplayArea,
+        desk     : &DesktopGeometry,
+        offset   : OnlineOffset,
+        flywheel : Option<FlywheelLog>,
     )
         -> Self
     {
@@ -746,6 +800,7 @@ impl ModelState {
             offset         : offset,
             half_ipd       : None,
             recent         : VecDeque::new(),
+            flywheel       : flywheel,
         }
     }
 
@@ -772,9 +827,18 @@ impl ModelState {
             p.pitch_deg * p.fade + off_pitch,
         );
 
-        self.recent.push_back((t_s, origin, corrected, posture));
+        self.recent.push_back(RecentRay {
+            t_s       : t_s,
+            origin    : origin,
+            dir       : dir,
+            corrected : corrected,
+            posture   : posture,
+            features  : features,
+            model_deg : [p.yaw_deg * p.fade, p.pitch_deg * p.fade],
+            fade      : p.fade,
+        });
 
-        while self.recent.front().is_some_and(|(t, _, _, _)| t_s - t > RAY_HISTORY_S) {
+        while self.recent.front().is_some_and(|r| t_s - r.t_s > RAY_HISTORY_S) {
             self.recent.pop_front();
         }
 
@@ -787,41 +851,117 @@ impl ModelState {
     }
 
     /// Attributes a click at `px`, pressed at `t_s`, to the corrected rays just before
-    /// it and offers the median leftover to the offset. See
+    /// it, offers the median leftover to the offset, and writes the click down. See
     /// [`Et5Provider::observe_click`].
-    fn observe_click(&mut self, px: GlobalPx, t_s: f64) -> Option<ClickFeedback> {
+    fn observe_click(&mut self, px: GlobalPx, t_s: f64, via: ClickVia, unix_s: f64)
+        -> Option<ClickFeedback>
+    {
         // The clicked point in the frame the labels were measured in: the configured
         // desk, rotated by the mount pitch, exactly as `dataset::rows` builds targets.
-        let pitch  = self.model.tracker_pitch_deg;
-        let target = DVec3::from_array(desk_to_sensor(self.desk.px_to_world(px)?.to_array(), pitch));
+        let pitch   = self.model.tracker_pitch_deg;
+        let display = self.desk.output_at(px)?.name.clone();
+        let target  = DVec3::from_array(desk_to_sensor(self.desk.px_to_world(px)?.to_array(), pitch));
 
         // Each ray's leftover: where the corrected ray still points relative to the
         // clicked point, in the tangent frame at the truth, the label's own convention.
-        let mut yaws    = Vec::with_capacity(64);
-        let mut pitchs  = Vec::with_capacity(64);
-        let mut origins = DVec3::ZERO;
+        // The firmware ray's own miss is the label a retrain will want.
+        let window: Vec<&RecentRay> = self.recent.iter()
+            .filter(|r| r.t_s >= t_s - CLICK_LOOKBACK_S && r.t_s <= t_s)
+            .collect();
 
-        for (t, origin, dir, posture) in &self.recent {
-            if *t < t_s - CLICK_LOOKBACK_S || *t > t_s {
-                continue;
-            }
-
-            let (yaw, pitch) = local_yaw_pitch_deg(*dir, target - origin);
-
-            yaws.push(yaw);
-            pitchs.push(pitch);
-            origins += *posture;
-        }
-
-        if yaws.len() < CLICK_MIN_RAYS {
+        if window.len() < CLICK_MIN_RAYS {
             return None;
         }
 
-        // The eyes' mean position over the same window keys the click to its posture.
-        let leftover = [median(&mut yaws), median(&mut pitchs)];
-        let origin   = origins / yaws.len() as f64;
+        let rays = window.len();
 
-        Some(self.offset.observe(leftover, origin.to_array()))
+        let mut leftover_yaw   = Vec::with_capacity(rays);
+        let mut leftover_pitch = Vec::with_capacity(rays);
+        let mut residual_yaw   = Vec::with_capacity(rays);
+        let mut residual_pitch = Vec::with_capacity(rays);
+        let mut model_yaw      = Vec::with_capacity(rays);
+        let mut model_pitch    = Vec::with_capacity(rays);
+        let mut fades          = Vec::with_capacity(rays);
+        let mut postures       = DVec3::ZERO;
+
+        for r in &window {
+            let want = target - r.origin;
+
+            let (yaw, pitch) = local_yaw_pitch_deg(r.corrected, want);
+            leftover_yaw.push(yaw);
+            leftover_pitch.push(pitch);
+
+            let (yaw, pitch) = local_yaw_pitch_deg(r.dir, want);
+            residual_yaw.push(yaw);
+            residual_pitch.push(pitch);
+
+            model_yaw.push(r.model_deg[0]);
+            model_pitch.push(r.model_deg[1]);
+            fades.push(r.fade);
+            postures += r.posture;
+        }
+
+        // The eyes' mean position over the same window keys the click to its posture.
+        let leftover = [median(&mut leftover_yaw), median(&mut leftover_pitch)];
+        let posture  = postures / rays as f64;
+
+        // What the offset was saying at this posture before the click moves it: the
+        // record has to say what the user was steering against.
+        let offset_deg = self.offset.offset_deg(posture.to_array());
+
+        let feedback = self.offset.observe(&Observation {
+            leftover_deg : leftover,
+            origin_mm    : posture.to_array(),
+            target_mm    : target.to_array(),
+        });
+
+        if let Some(log) = &mut self.flywheel {
+            let mut features = [f64::NAN; FEATURE_COUNT];
+
+            for (i, slot) in features.iter_mut().enumerate() {
+                let mut column: Vec<f64> = window.iter()
+                    .map(|r| r.features.values[i])
+                    .filter(|v| v.is_finite())
+                    .collect();
+
+                if !column.is_empty() {
+                    *slot = median(&mut column);
+                }
+            }
+
+            let record = ClickRecord {
+                format             : FLYWHEEL_FORMAT,
+                unix_s             : unix_s,
+                t_s                : t_s,
+                via                : via,
+                display            : display,
+                px                 : [px.x, px.y],
+                target_mm          : target.to_array(),
+                rays               : rays,
+                window_s           : CLICK_LOOKBACK_S,
+                device_blob_sha256 : self.model.device_blob_sha256.clone(),
+                features           : features,
+                residual_deg       : [median(&mut residual_yaw), median(&mut residual_pitch)],
+                model_deg          : [median(&mut model_yaw), median(&mut model_pitch)],
+                fade               : median(&mut fades),
+                posture_mm         : posture.to_array(),
+                offset_deg         : offset_deg,
+                leftover_deg       : leftover,
+                verdict            : {
+                    match feedback {
+                        ClickFeedback::Accepted { .. } => Verdict::Accepted,
+                        ClickFeedback::Rejected { .. } => Verdict::Rejected,
+                        ClickFeedback::Adopted { .. }  => Verdict::Adopted,
+                    }
+                },
+            };
+
+            if let Err(e) = log.write(&record) {
+                warn!("flywheel record not written: {e}");
+            }
+        }
+
+        Some(feedback)
     }
 
     /// Drops the ray history, for a link that went away.
@@ -1336,7 +1476,7 @@ mod tests {
         let desk  = converter().geometry;
         let state = ModelState::new(
             model, DisplayArea::from_rect(VIRTUAL_AREA), &desk,
-            OnlineOffset::new(OffsetParams::default(), None),
+            OnlineOffset::new(OffsetParams::default(), None), None,
         );
 
         let p      = DVec3::new(-38.0, 200.0, 687.0);
@@ -1377,7 +1517,7 @@ mod tests {
         let area  = DisplayArea::from_rect(VIRTUAL_AREA);
 
         c.model = Some(ModelState::new(
-            model, area, &c.geometry, OnlineOffset::new(OffsetParams::default(), None),
+            model, area, &c.geometry, OnlineOffset::new(OffsetParams::default(), None), None,
         ));
 
         c
@@ -1394,7 +1534,7 @@ mod tests {
         }
 
         let px = point.expect("the model path lands on the panel");
-        let fed = c.model.as_mut().unwrap().observe_click(px, 0.4).expect("attributed");
+        let fed = c.model.as_mut().unwrap().observe_click(px, 0.4, ClickVia::Mouse, 0.0).expect("attributed");
 
         match fed {
             ClickFeedback::Accepted { leftover_deg, .. } => {
@@ -1403,6 +1543,54 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn an_attributed_click_is_written_to_the_flywheel() {
+        let dir = std::env::temp_dir().join(format!("gaze-provider-flywheel-{}", std::process::id()));
+        let _   = std::fs::remove_dir_all(&dir);
+
+        let mut c = converter_with_model();
+        c.model.as_mut().unwrap().flywheel = Some(FlywheelLog::open(&dir).unwrap());
+
+        let mut point = None;
+
+        for i in 0..40 {
+            point = c.sample(&frame_2d(0.5, 0.5), i as f64 * 0.01).point;
+        }
+
+        let px    = point.expect("point");
+        let click = GlobalPx { x: px.x + 30.0, y: px.y };
+        let day   = 1_788_926_253.0;
+
+        c.model.as_mut().unwrap().observe_click(click, 0.4, ClickVia::Pad, day).expect("attributed");
+
+        let files = crate::flywheel::day_files(&dir).unwrap();
+        assert_eq!(files.len(), 1, "{files:?}");
+
+        let records = crate::flywheel::load(&files[0]).unwrap();
+        assert_eq!(records.len(), 1);
+
+        let r = &records[0];
+
+        assert_eq!(r.via, ClickVia::Pad);
+        assert_eq!(r.verdict, Verdict::Accepted);
+        assert_eq!(r.px, [click.x, click.y]);
+        assert_eq!(r.window_s, CLICK_LOOKBACK_S);
+        assert!(r.rays >= CLICK_MIN_RAYS && r.rays <= 41, "{}", r.rays);
+        assert_eq!(r.display, c.geometry.output_at(click).unwrap().name);
+
+        // No offset was in force yet, and the model's part is zero on this fixture, so
+        // the leftover is the firmware residual.
+        assert_eq!(r.offset_deg, [0.0, 0.0]);
+        assert!((r.leftover_deg[0] - r.residual_deg[0]).abs() < 1e-9, "{r:?}");
+        assert!((1.3..2.0).contains(&r.leftover_deg[0].abs()), "{:?}", r.leftover_deg);
+
+        // The features are the frame's: both eyes valid, origins where the fixture put them.
+        assert_eq!(r.feature("valid_l"), Some(1.0));
+        assert!(r.feature("origin_l_z_mm").is_some_and(|z| z > 100.0), "{:?}", r.features);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1420,7 +1608,7 @@ mod tests {
         let before = point.expect("point");
         let click  = GlobalPx { x: before.x + 30.0, y: before.y };
 
-        let fed = c.model.as_mut().unwrap().observe_click(click, 0.4).expect("attributed");
+        let fed = c.model.as_mut().unwrap().observe_click(click, 0.4, ClickVia::Mouse, 0.0).expect("attributed");
 
         let ClickFeedback::Accepted { leftover_deg, offset_deg, anchors } = fed else {
             panic!("{fed:?}");
@@ -1446,7 +1634,7 @@ mod tests {
         // Well past the gate: refused, and the offset stays put.
         let far = GlobalPx { x: before.x + 200.0, y: before.y };
 
-        assert!(matches!(c.model.as_mut().unwrap().observe_click(far, 0.5),
+        assert!(matches!(c.model.as_mut().unwrap().observe_click(far, 0.5, ClickVia::Mouse, 0.0),
                          Some(ClickFeedback::Rejected { .. })));
         let held = c.model.as_ref().unwrap().offset.global_deg();
 
@@ -1454,7 +1642,7 @@ mod tests {
                 "{held:?} vs {offset_deg:?}");
 
         // A click with no rays in its window is not attributed at all.
-        assert!(c.model.as_mut().unwrap().observe_click(click, 9.0).is_none());
+        assert!(c.model.as_mut().unwrap().observe_click(click, 9.0, ClickVia::Mouse, 0.0).is_none());
     }
 
     #[test]

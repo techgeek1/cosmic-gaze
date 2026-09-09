@@ -1,5 +1,5 @@
-//! Real clicks as gaze labels for the running session (PLAN-ET5 D5's feed, the first
-//! slice of E1).
+//! Real clicks as gaze labels for the running session (PLAN-ET5 D5's feed and E1's
+//! source; the record itself is written by the provider, `flywheel.rs`).
 //!
 //! People look at what they click. `gaze-clicks` collects that as training data; this
 //! feeds it straight back into the live provider instead, so the day's bias is learnt
@@ -40,6 +40,9 @@ pub struct ClickFeed {
     pub offered  : u64,
     /// Presses the source folded into its offset.
     pub accepted : u64,
+    /// Presses past the gate that, with the rejects before them, made a consensus
+    /// the offset jumped to.
+    pub adopted  : u64,
     /// Presses the source attributed but refused.
     pub rejected : u64,
     /// Presses the source could not attribute at all.
@@ -84,6 +87,7 @@ impl ClickFeed {
             pointer  : None,
             offered  : 0,
             accepted : 0,
+            adopted  : 0,
             rejected : 0,
             unplaced : 0,
             skipped  : 0,
@@ -142,6 +146,7 @@ impl ClickFeed {
             info!(
                 offered  = self.offered,
                 accepted = self.accepted,
+                adopted  = self.adopted,
                 rejected = self.rejected,
                 unplaced = self.unplaced,
                 skipped  = self.skipped,

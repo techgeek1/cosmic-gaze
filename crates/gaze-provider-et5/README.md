@@ -207,6 +207,9 @@ nottobii keeps one session across its whole init; nothing observed here needs th
   wander on white, stop grid on white) written to `config/sessions/`. With `--daydream`
   the pad advances, App skips a stop and Home ends the phase. This is where data for the
   model comes from; nothing is fitted and nothing is uploaded.
+- `flywheel [--dir DIR]` — the flywheel by day: clicks by channel and verdict, the
+  median leftover after model and offset, and the median firmware residual a pooled
+  fit would see, plus the device blobs the days were recorded under.
 - `dataset export --csv out.csv` — every session under `config/sessions/` as one
   row per surviving frame plus one aggregated (median) row per stop or click, for the
   Python harness under `model/`.
@@ -251,6 +254,23 @@ persists to `config/offset-et5.json`, keyed to the blob like the model; `gaze-pr
 --freeze-offset` attributes and logs without moving it, and deleting the file starts
 cold. Leave-one-session-out on the click sessions puts the model alone at 1.44° and
 the model with a single bias at 1.20° (`model/loso_clicks.py`).
+
+The 3° gate has a way to be wrong: a bias larger than it (glasses moved, a knocked
+mount, a posture the anchors have not seen) rejects every click and the filter can
+never learn its way out. So rejects are held (PLAN-ET5 E2): when four recent rejects
+near one eye position agree to within 1° *and* were clicks on places at least 30 mm
+apart, their median is the truth, the anchor jumps to it in one unclipped step, and
+the session log says so (`click adopted`). Scattered rejects, and one widget clicked
+four times, stay rejected. A jump count lives in the offset file; a day with several
+wants a retrain, not a filter.
+
+Every click the offset is offered is also written down (`flywheel.rs`, PLAN-ET5 E1):
+one JSONL line per click under `config/flywheel/<UTC date>.jsonl` with the click,
+the median feature vector of its window, the firmware ray's own residual against the
+clicked point (the label a fit wants), the model and offset that were applied, the
+leftover, and the verdict. `ClickRecord::row` turns one into the row the session
+exporter writes, so a pooled fit needs no second reader. `gaze-proto --no-flywheel`
+writes nothing; `--flywheel DIR` moves it.
 
 Calibration files, blobs, the pass history, the model and the offset are gitignored
 (`/config/calibration*`, `/config/model*.json`, `/config/offset*.json`).

@@ -36,7 +36,7 @@ use anyhow::{Context, Result};
 use gaze_core::{DesktopGeometry, Element, ElementKind, GazeSample, GlobalPx};
 use gaze_inject::{Button as InjectButton, Injector, Key};
 use gaze_overlay::{Overlay, OverlayState};
-use gaze_provider_et5::ClickFeedback;
+use gaze_provider_et5::{ClickFeedback, ClickVia};
 use gaze_provider_synthetic::to_jsonl_line;
 use gaze_snap::{FilterStack, FixationState, Filtered, SnapEngine};
 use tracing::{debug, error, info, warn};
@@ -389,7 +389,7 @@ pub fn run(args: &Args) -> Result<()> {
                     if from_pad
                         && let (Some(px), Some(sample)) = (clicked, last_sample)
                     {
-                        let feedback = source.observe_click(px, sample.t_s);
+                        let feedback = source.observe_click(px, sample.t_s, ClickVia::Pad);
 
                         log_click_feedback("pad", px, feedback);
                     }
@@ -927,12 +927,13 @@ fn offer_clicks(feed: &mut ClickFeed, source: &mut GazeSource, presses: Vec<Pres
     for press in presses {
         feed.offered += 1;
 
-        let feedback = source.observe_click(press.px, press.t_s);
+        let feedback = source.observe_click(press.px, press.t_s, ClickVia::Mouse);
 
         log_click_feedback("mouse", press.px, feedback);
 
         match feedback {
             Some(ClickFeedback::Accepted { .. }) => feed.accepted += 1,
+            Some(ClickFeedback::Adopted { .. })  => feed.adopted += 1,
             Some(ClickFeedback::Rejected { .. }) => feed.rejected += 1,
             None                                 => feed.unplaced += 1,
         }
@@ -961,6 +962,21 @@ fn log_click_feedback(via: &str, px: GlobalPx, feedback: Option<ClickFeedback>) 
                 leftover_yaw_deg   = format_args!("{:+.2}", leftover_deg[0]),
                 leftover_pitch_deg = format_args!("{:+.2}", leftover_deg[1]),
                 "click rejected: past the gate",
+            );
+        }
+        Some(ClickFeedback::Adopted { leftover_deg, jump_deg, offset_deg, anchors, clicks }) => {
+            warn!(
+                via = via,
+                x = px.x, y = px.y,
+                leftover_yaw_deg   = format_args!("{:+.2}", leftover_deg[0]),
+                leftover_pitch_deg = format_args!("{:+.2}", leftover_deg[1]),
+                jump_yaw_deg       = format_args!("{:+.2}", jump_deg[0]),
+                jump_pitch_deg     = format_args!("{:+.2}", jump_deg[1]),
+                offset_yaw_deg     = format_args!("{:+.2}", offset_deg[0]),
+                offset_pitch_deg   = format_args!("{:+.2}", offset_deg[1]),
+                anchors            = anchors,
+                clicks             = clicks,
+                "click adopted: the last few rejects agreed, the bias jumped",
             );
         }
         None => {

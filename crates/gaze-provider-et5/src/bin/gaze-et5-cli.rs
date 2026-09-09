@@ -25,6 +25,7 @@ use gaze_provider_et5::calibration::{
     OutputPose, VIRTUAL_AREA,
 };
 use gaze_provider_et5::field::FieldMap;
+use gaze_provider_et5::flywheel::{self, ClickRecord, ClickVia, DEFAULT_FLYWHEEL_DIR, Verdict};
 use gaze_provider_et5::device::{ConnectOptions, Device};
 use gaze_provider_et5::dataset;
 use gaze_provider_et5::gaze::combined_ray;
@@ -446,6 +447,16 @@ enum Command {
         dry_run : bool,
     },
 
+    /// Summarise the flywheel: the clicks the running sessions wrote down
+    /// (`gaze-proto --provider et5`, see `flywheel.rs`), per day and verdict, with the
+    /// median leftover after model and offset and the median firmware residual the
+    /// next fit would see.
+    Flywheel {
+        /// The flywheel directory.
+        #[arg(long, default_value = DEFAULT_FLYWHEEL_DIR)]
+        dir : PathBuf,
+    },
+
     /// Session-file utilities.
     Sessions {
         #[command(subcommand)]
@@ -658,6 +669,7 @@ fn main() -> Result<()> {
 
             fit_cmd(&cli.config, &sessions, &out, &calibration, &params, dry_run)
         }
+        Command::Flywheel { dir }           => flywheel_cmd(&dir),
         Command::Sessions { command }       => sessions_cmd(&cli.config, command),
         Command::Dataset { command }        => dataset_cmd(&cli.config, command),
         Command::Health { calibration, blob, grid, daydream, daydream_address } => {
@@ -2256,6 +2268,82 @@ fn fit_cmd(
              out.display(), model.centers(), model.var_fade_lo, model.var_fade_hi);
 
     Ok(())
+}
+
+fn flywheel_cmd(dir: &std::path::Path) -> Result<()> {
+    let files = flywheel::day_files(dir)
+        .with_context(|| format!("listing {}", dir.display()))?;
+
+    if files.is_empty() {
+        println!("no flywheel days under {}", dir.display());
+
+        return Ok(());
+    }
+
+    let magnitude = |v: [f64; 2]| v[0].hypot(v[1]);
+
+    let mut all: Vec<ClickRecord> = Vec::new();
+
+    for file in &files {
+        let records = flywheel::load(file)
+            .with_context(|| format!("reading {}", file.display()))?;
+
+        let name = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+
+        let count = |v: Verdict| records.iter().filter(|r| r.verdict == v).count();
+        let mut leftover: Vec<f64> = records.iter().map(|r| magnitude(r.leftover_deg)).collect();
+        let mut residual: Vec<f64> = records.iter().map(|r| magnitude(r.residual_deg)).collect();
+
+        println!(
+            "{name}: {} clicks (mouse {}, pad {}); accepted {}, rejected {}, adopted {}; \
+             median leftover {:.2} deg, median firmware residual {:.2} deg",
+            records.len(),
+            records.iter().filter(|r| r.via == ClickVia::Mouse).count(),
+            records.iter().filter(|r| r.via == ClickVia::Pad).count(),
+            count(Verdict::Accepted), count(Verdict::Rejected), count(Verdict::Adopted),
+            median_or_nan(&mut leftover), median_or_nan(&mut residual),
+        );
+
+        all.extend(records);
+    }
+
+    let mut blobs: Vec<String> = all.iter()
+        .filter_map(|r| r.device_blob_sha256.clone())
+        .collect();
+    blobs.sort();
+    blobs.dedup();
+
+    let mut leftover: Vec<f64> = all.iter().map(|r| magnitude(r.leftover_deg)).collect();
+    let mut residual: Vec<f64> = all.iter().map(|r| magnitude(r.residual_deg)).collect();
+
+    println!(
+        "total: {} clicks over {} days under {} device blob(s); median leftover {:.2} deg, \
+         median firmware residual {:.2} deg",
+        all.len(), files.len(), blobs.len(),
+        median_or_nan(&mut leftover), median_or_nan(&mut residual),
+    );
+
+    for blob in blobs {
+        println!("  blob {}: {} clicks", &blob[..blob.len().min(12)],
+                 all.iter().filter(|r| r.device_blob_sha256.as_deref() == Some(&blob)).count());
+    }
+
+    Ok(())
+}
+
+/// Median of the finite values, NaN when there are none.
+fn median_or_nan(values: &mut Vec<f64>) -> f64 {
+    values.retain(|v| v.is_finite());
+
+    if values.is_empty() {
+        return f64::NAN;
+    }
+
+    values.sort_by(f64::total_cmp);
+
+    let n = values.len();
+
+    if n % 2 == 1 { values[n / 2] } else { 0.5 * (values[n / 2 - 1] + values[n / 2]) }
 }
 
 fn sessions_cmd(config: &std::path::Path, command: SessionsCommand) -> Result<()> {

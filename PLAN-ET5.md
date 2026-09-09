@@ -338,13 +338,21 @@ acquisition.
   stats) to `config/flywheel/<date>.jsonl`. Snap commits log the same record.
   **Partly built 2026-09-04** (`gaze-proto/src/feedback.rs`): the real mouse, the
   pointer and the attribution (0.4 s before the press, the window `label_timing.py`
-  found flat) feed D5 directly, one log line per press. Not built: the JSONL record with
-  features. Mouse-button snap commits are *not* offered (they are the gaze clicking, and
-  the feed already sees the physical press); Daydream pad commits are, since 2026-09-05,
-  refined or not.
+  found flat) feed D5 directly, one log line per press. Mouse-button snap commits are
+  *not* offered (they are the gaze clicking, and the feed already sees the physical
+  press); Daydream pad commits are, since 2026-09-05, refined or not.
+  **Built 2026-09-09** (`gaze-provider-et5/src/flywheel.rs`): the record, one JSONL
+  line per attributed click under `config/flywheel/<UTC date>.jsonl`, carries the
+  window's median features, the firmware residual label, model, offset, leftover and
+  verdict; `ClickRecord::row` rebuilds the exporter's row for E3.
+  `gaze-et5-cli flywheel` summarises the days.
 ### E2. Acceptance: foveal tolerance against the current prediction (start at 3°); rejects go
   to an error buffer whose overflow raises "recalibrate" in the log; RANSAC over the recent
   buffer before any parameter update; ≥ 4 observations and a spatial-spread check.
+  **Built 2026-09-09** (`offset.rs`, consensus): rejects are buffered per posture for ten
+  minutes; four that agree to within 1° on targets spanning 30 mm are adopted as one
+  unclipped jump, logged at warn with a running jump count in the offset file. A median
+  and a spread check stand in for RANSAC at this size.
 ### E3. Retrain pooling sessions plus accepted pairs (down-weighted), on provider start or a
   timer; the previous calibration is kept as a fallback and the new one must not be worse on
   the held sessions.

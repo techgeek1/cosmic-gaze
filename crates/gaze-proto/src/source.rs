@@ -27,7 +27,7 @@ use gaze_provider_synthetic::{
     ReplayProvider,
     SyntheticProvider,
 };
-use gaze_provider_et5::{ClickFeedback, Et5Calibration, Et5Provider, OffsetParams, ResidualModel};
+use gaze_provider_et5::{ClickFeedback, ClickVia, Et5Calibration, Et5Provider, OffsetParams, ResidualModel};
 use gaze_provider_webcam::{CameraPose, DEFAULT_SIGMA_DEG, SampleMeta, WebcamProvider};
 use tracing::{info, warn};
 
@@ -248,9 +248,9 @@ impl GazeSource {
 
     /// Hands a real click to the source's online offset. See
     /// `Et5Provider::observe_click`; every other source ignores it.
-    pub fn observe_click(&mut self, px: GlobalPx, t_s: f64) -> Option<ClickFeedback> {
+    pub fn observe_click(&mut self, px: GlobalPx, t_s: f64, via: ClickVia) -> Option<ClickFeedback> {
         match self {
-            GazeSource::Et5 { provider, .. } => provider.observe_click(px, t_s),
+            GazeSource::Et5 { provider, .. } => provider.observe_click(px, t_s, via),
             _                                => None,
         }
     }
@@ -497,12 +497,17 @@ fn open_et5(args: &Args, geometry: &DesktopGeometry) -> Result<GazeSource> {
         }
     };
 
+    // The flywheel writes every attributed click down, frozen offset or not: a run
+    // that only watches the leftovers is exactly the run whose clicks are worth keeping.
+    let flywheel_dir = (!args.no_flywheel).then(|| args.flywheel.clone());
+
     let provider = Et5Provider::create()
         .geometry(geometry.clone())
         .calibration(calibration)
         .model(model)
         .offset_path(offset_path)
         .offset_params(offset_params)
+        .flywheel_dir(flywheel_dir.clone())
         .start()
         .context("starting the ET5 provider (tracker on the bus, nothing else holding it?)")?;
 
@@ -518,6 +523,7 @@ fn open_et5(args: &Args, geometry: &DesktopGeometry) -> Result<GazeSource> {
         model       = ?model_path.as_ref().map(|p| p.display().to_string()),
         offset      = %args.offset.display(),
         frozen      = args.freeze_offset,
+        flywheel    = ?flywheel_dir.as_ref().map(|p| p.display().to_string()),
         device      = %buttons.path().display(),
         grabbed     = buttons.grabbed(),
         commits     = commit_note(buttons.grabbed()),

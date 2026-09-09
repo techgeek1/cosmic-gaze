@@ -1167,6 +1167,17 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   Stream 0x500 is "gaze"; the device also lists 0x501 image, 0x504 presence, 0x508
   image_collection, 0x50e primary_camera_image, and 6000-6004 algodbg / is5_sync_stream
   / log / custom (op 0x4b0). Nothing here subscribes to any of them.
+- 2026-09-09, **The flywheel writes, and the gate can be outvoted.** E1: every click
+  the online offset is offered is now a JSONL record under `config/flywheel/<UTC
+  day>.jsonl` with the window's median features, the firmware ray's residual against
+  the clicked point, the model and offset in force, the leftover and the verdict;
+  `ClickRecord::row` rebuilds the exporter's row so E3 can pool days with sessions.
+  E2: rejects are no longer dropped. Four within ten minutes at one posture that agree
+  to within 1° on targets 30 mm apart are a consensus, and the posture's anchor jumps
+  to their median in one unclipped step (`click adopted` in the log, `jumps` in the
+  offset file). Reason: a bias past the 3° gate rejected every click forever and the
+  filter could never recover; adopting was ruled over merely warning. Nothing driven
+  yet; the first flywheel day will say what the reject rate actually is.
 
 ## 11. Open questions
 
