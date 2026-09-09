@@ -33,6 +33,7 @@ pub mod cli;
 pub mod daydream;
 pub mod edge_scroll;
 pub mod feedback;
+pub mod keys;
 pub mod surface;
 pub mod perception;
 pub mod score;

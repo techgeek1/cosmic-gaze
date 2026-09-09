@@ -9,9 +9,11 @@
 //!   **App** is the voice stack's push-to-talk for as long as it is held (forwarded as
 //!   F13, see [`Control::PushToTalk`]), and the **volume** keys are a wheel, one detent
 //!   per press and repeating while held;
-//! * the thumb resting on the pad is the **clutch**: while it is down the wrist (gyro) or the
-//!   thumb itself (touch) moves the commit point, and lifting it stops. Pressing the pad to
-//!   click implies touching it, so a refine always ends in a commit if one is wanted.
+//! * the thumb resting on the pad is the **clutch**: landing on it arms the pointer look
+//!   ([`Control::Arm`]), so the eyes' target shows while the thumb rests; once the thumb
+//!   (touch) or the wrist (gyro) has travelled [`REFINE_START_PX`] the refine begins and
+//!   from then on moves the commit point until the thumb lifts. Pressing the pad to click
+//!   implies touching it, so a refine always ends in a commit if one is wanted.
 //!
 //! The controller also says whether it *owns the pointer* ([`Daydream::owner`]). Two
 //! things take it away: the controller being put down (a held controller never reads a
@@ -87,6 +89,12 @@ pub const HELD_WINDOW: Duration = Duration::from_secs(6);
 /// rad/s. Above the tremor of a hand that is resting around it while the other hand
 /// works the mouse; a lift off the desk sweeps well past it.
 pub const PICKUP_GYRO_RAD_S: f32 = 0.25;
+
+/// How far the fine channel must have moved, logical pixels, before a touch becomes a
+/// refine. Under this the thumb is resting on the pad to see where the eyes are, and the
+/// gaze keeps driving; over it the thumb has taken the point. A resting thumb wanders a
+/// few pixels' worth at the default touch gain; this is a deliberate nudge.
+pub const REFINE_START_PX: f64 = 12.0;
 
 /// Angular rate below which the gyro is noise, rad/s. At rest on the desk the peak over a
 /// second was 0.01 to 0.03.
@@ -186,6 +194,9 @@ struct Mapper {
     touch_since   : Option<(Instant, glam::Vec2)>,
     /// Whether the pad was clicked during the current touch, which makes it not a tap.
     touch_clicked : bool,
+    /// Fine-channel travel since the thumb landed, before the refine began, logical
+    /// pixels; `None` once it has begun (or between touches).
+    pending_move  : Option<(f64, f64)>,
     /// When the last report arrived, for the gyro's `dt`.
     last_at       : Option<Instant>,
     /// When the controller last moved, was touched or had a button pressed.
@@ -273,6 +284,7 @@ impl Mapper {
             touch         : None,
             touch_since   : None,
             touch_clicked : false,
+            pending_move  : None,
             last_at       : None,
             last_active   : None,
             last_pickup   : None,
@@ -343,46 +355,75 @@ impl Mapper {
             self.touch_clicked = true;
         }
 
-        // Refine before the buttons, so a press in the same report lands after the motion
-        // that led up to it.
-        if self.config.mode != RefineMode::Off {
-            match (self.touch, p.touch) {
-                (None, Some(_)) => out.push(Control::Refine(Refine::Begin)),
-                (Some(_), None) => out.push(Control::Refine(Refine::End)),
-                _               => {}
+        // The thumb landing arms the pointer look; lifting disarms it, and ends the
+        // refine if one began. Before the buttons, so a press in the same report lands
+        // after the motion that led up to it.
+        match (self.touch, p.touch) {
+            (None, Some(_)) => {
+                out.push(Control::Arm { down: true });
+                self.pending_move = Some((0.0, 0.0));
             }
+            (Some(_), None) => {
+                if self.pending_move.take().is_none() && self.config.mode != RefineMode::Off {
+                    out.push(Control::Refine(Refine::End));
+                }
 
-            if let Some(now) = p.touch {
-                let (dx, dy) = match self.config.mode {
-                    RefineMode::Gyro => {
-                        let dt = dt.min(MAX_DT).as_secs_f64();
-                        let (ax, ay) = self.config.axes;
-                        let (rx, ry) = (ax.of(p.gyro), ay.of(p.gyro));
+                out.push(Control::Arm { down: false });
+            }
+            _ => {}
+        }
 
-                        let rx = if rx.abs() < GYRO_DEADZONE_RAD_S { 0.0 } else { rx };
-                        let ry = if ry.abs() < GYRO_DEADZONE_RAD_S { 0.0 } else { ry };
+        if self.config.mode != RefineMode::Off
+            && let Some(now) = p.touch
+        {
+            let (dx, dy) = match self.config.mode {
+                RefineMode::Gyro => {
+                    let dt = dt.min(MAX_DT).as_secs_f64();
+                    let (ax, ay) = self.config.axes;
+                    let (rx, ry) = (ax.of(p.gyro), ay.of(p.gyro));
 
-                        (f64::from(rx) * dt * self.config.gyro_gain_px_rad,
-                         f64::from(ry) * dt * self.config.gyro_gain_px_rad)
+                    let rx = if rx.abs() < GYRO_DEADZONE_RAD_S { 0.0 } else { rx };
+                    let ry = if ry.abs() < GYRO_DEADZONE_RAD_S { 0.0 } else { ry };
+
+                    (f64::from(rx) * dt * self.config.gyro_gain_px_rad,
+                     f64::from(ry) * dt * self.config.gyro_gain_px_rad)
+                }
+
+                RefineMode::Touch => match self.touch {
+                    Some(prev) => {
+                        let d = now - prev;
+
+                        (f64::from(d.x) * self.config.touch_gain_px,
+                         f64::from(d.y) * self.config.touch_gain_px)
                     }
 
-                    RefineMode::Touch => match self.touch {
-                        Some(prev) => {
-                            let d = now - prev;
+                    None => (0.0, 0.0),
+                },
 
-                            (f64::from(d.x) * self.config.touch_gain_px,
-                             f64::from(d.y) * self.config.touch_gain_px)
-                        }
+                RefineMode::Off => (0.0, 0.0),
+            };
 
-                        None => (0.0, 0.0),
-                    },
+            // Motion accumulates silently until it amounts to a nudge; then the refine
+            // begins with the travel so far, and every later move passes straight on.
+            match self.pending_move.as_mut() {
+                Some((px, py)) => {
+                    *px += dx;
+                    *py += dy;
 
-                    RefineMode::Off => (0.0, 0.0),
-                };
+                    if px.hypot(*py) >= REFINE_START_PX {
+                        let (px, py) = (*px, *py);
 
-                if dx != 0.0 || dy != 0.0 {
+                        self.pending_move = None;
+                        out.push(Control::Refine(Refine::Begin));
+                        out.push(Control::Refine(Refine::Move { dx_px: px, dy_px: py }));
+                    }
+                }
+
+                None if dx != 0.0 || dy != 0.0 => {
                     out.push(Control::Refine(Refine::Move { dx_px: dx, dy_px: dy }));
                 }
+
+                None => {}
             }
         }
 
@@ -527,14 +568,16 @@ mod tests {
         let t0         = Instant::now();
         let step       = Duration::from_millis(16);
 
+        // Landing arms; the refine waits for travel, then begins with it.
         mapper.step(touch_report(t0, Some((0.20, 0.50))), &mut out);
-        assert_eq!(out, vec![Control::Refine(Refine::Begin)]);
+        assert_eq!(out, vec![Control::Arm { down: true }]);
 
         out.clear();
         mapper.step(touch_report(t0 + step, Some((0.30, 0.50))), &mut out);
 
-        let [Control::Refine(Refine::Move { dx_px, dy_px })] = out[..] else {
-            panic!("expected one move, got {out:?}");
+        let [Control::Refine(Refine::Begin), Control::Refine(Refine::Move { dx_px, dy_px })] = out[..]
+        else {
+            panic!("expected a begin and one move, got {out:?}");
         };
 
         assert!((dx_px - 100.0).abs() < 1.0, "dx {dx_px}");
@@ -552,7 +595,35 @@ mod tests {
 
         out.clear();
         mapper.step(touch_report(t0 + 3 * step, None), &mut out);
-        assert_eq!(out, vec![Control::Refine(Refine::End)]);
+        assert_eq!(out, vec![Control::Refine(Refine::End), Control::Arm { down: false }]);
+    }
+
+    /// A thumb that rests on the pad arms the look and never starts a refine: the
+    /// gaze keeps driving, and lifting only disarms.
+    #[test]
+    fn a_resting_thumb_arms_without_refining() {
+        let config = DaydreamConfig {
+            mode              : RefineMode::Touch,
+            gyro_gain_px_rad  : DEFAULT_GYRO_GAIN_PX_PER_RAD,
+            touch_gain_px     : DEFAULT_TOUCH_GAIN_PX,
+            axes              : parse_axes(DEFAULT_AXES).unwrap(),
+        };
+
+        let mut mapper = Mapper::new(config);
+        let mut out    = Vec::new();
+        let t0         = Instant::now();
+        let step       = Duration::from_millis(16);
+
+        mapper.step(touch_report(t0, Some((0.50, 0.50))), &mut out);
+        mapper.step(touch_report(t0 + step, Some((0.51, 0.50))), &mut out);
+        mapper.step(touch_report(t0 + 2 * step, Some((0.50, 0.51))), &mut out);
+
+        assert_eq!(out, vec![Control::Arm { down: true }]);
+
+        out.clear();
+        mapper.step(touch_report(t0 + 20 * step, None), &mut out);
+
+        assert_eq!(out, vec![Control::Arm { down: false }]);
     }
 
     #[test]
@@ -575,8 +646,8 @@ mod tests {
 
         assert_eq!(out.iter().filter(|c| **c == Control::Context).count(), 1);
         assert!(out.iter().position(|c| *c == Control::Context)
-                   < out.iter().position(|c| *c == Control::Refine(Refine::End)),
-                "the context commit precedes the refine end: {out:?}");
+                   < out.iter().position(|c| *c == Control::Arm { down: false }),
+                "the context commit precedes the disarm: {out:?}");
 
         // A drag of the same duration is not a tap.
         out.clear();

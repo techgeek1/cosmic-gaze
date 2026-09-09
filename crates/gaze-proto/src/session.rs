@@ -45,6 +45,7 @@ use crate::cli::{Args, Provider};
 use crate::daydream::{Daydream, DaydreamConfig, Owner, parse_axes};
 use crate::edge_scroll::{Action as EdgeAction, EdgeScroller, Eyes};
 use crate::feedback::{self, ClickFeed, Press};
+use crate::keys::LatchKeys;
 use crate::perception::{ElementStore, Perception, PerceptionConfig};
 use crate::score::{Scoreboard, classify};
 use crate::source::{Control, GazeSource, Refine};
@@ -279,6 +280,27 @@ pub fn run(args: &Args) -> Result<()> {
         .radius_deg(args.snap_deg)
         .build();
 
+    // --- overlay arming ---
+
+    // The pointer look shows while a thumb rests on the pad or the latch is on; F14
+    // toggles the latch. Without a readable keyboard the pad is the only switch, which
+    // is logged rather than fatal: the session is no worse off than with no latch key.
+    let mut latch_keys = match args.overlay_always {
+        true  => None,
+        false => match LatchKeys::open() {
+            Ok(keys) => {
+                info!(nodes = keys.paths().len(), "overlay latch: F14 toggles the pointer look");
+
+                Some(keys)
+            }
+            Err(e)   => {
+                warn!("overlay latch key unavailable, the pad is the only switch: {e:#}");
+
+                None
+            }
+        },
+    };
+
     // --- a11y verdicts ---
 
     // What the application says the eyes are on, for the pointer look; its own tree
@@ -330,11 +352,16 @@ pub fn run(args: &Args) -> Result<()> {
     // The pointer look's state apart from position, so a change in what is near
     // repaints even when the eyes have not moved.
     let mut last_pointer : Option<(bool, Option<u64>)> = None;
+    let mut last_armed   = false;
     let mut stale_gen   : Option<u64>        = None;
     // Set when a scroll starts or stops; retargeting stays off until a fixation that began
     // later than this, which is the eyes having moved on purpose.
     let mut retarget_block : Option<f64>     = None;
     let mut refined     : Option<Refined>    = None;
+    // Whether a thumb is on the pad, and whether F14 has latched the look on. Either
+    // arms the pointer look; `--overlay-always` arms it for the whole run.
+    let mut pad_down    = false;
+    let mut latched     = false;
     // Whether push-to-talk is forwarded down right now, so an exit mid-hold releases it.
     let mut ptt_down    = false;
     let mut samples     = 0u64;
@@ -372,6 +399,10 @@ pub fn run(args: &Args) -> Result<()> {
 
         if let Some(daydream) = daydream.as_mut() {
             controls.extend(daydream.controls());
+        }
+
+        if let Some(keys) = latch_keys.as_ref() {
+            controls.extend(keys.events());
         }
 
         for (i, control) in controls.into_iter().enumerate() {
@@ -523,6 +554,16 @@ pub fn run(args: &Args) -> Result<()> {
                             debug!(dx_px = r.dx_px, dy_px = r.dy_px, "refined point stands for the next commit");
                         }
                     }
+                }
+
+                Control::Arm { down } => {
+                    pad_down = down;
+                }
+
+                Control::ToggleOverlay => {
+                    latched = !latched;
+
+                    info!(on = latched, "overlay latch toggled");
                 }
 
                 Control::Redetect => {
@@ -703,15 +744,19 @@ pub fn run(args: &Args) -> Result<()> {
         // The tree, when it answers, outranks the recogniser: a control it names is
         // marked with its own box, and text it names is not marked whatever the
         // recogniser called it.
-        let aim = target.as_ref().map(|t| t.point).or(gaze);
+        let aim   = target.as_ref().map(|t| t.point).or(gaze);
+        let armed = args.overlay_always || pad_down || latched;
 
         if let Some(v) = verifier.as_mut() {
             let settled = matches!(filtered.state, FixationState::Fixating { .. });
 
-            v.update(aim.filter(|_| settled && !locked));
+            v.update(aim.filter(|_| armed && settled && !locked));
         }
 
-        let pointer = gaze.map(|g| {
+        // Unarmed, nothing is drawn: the eyes are reading, and a highlight the user did
+        // not ask for is the thing that fights them. The look comes up with the thumb
+        // on the pad or the latch, and the presenter fades it out when it goes.
+        let pointer = gaze.filter(|_| armed).map(|g| {
             let refining = refined.filter(|r| r.engaged);
             // Hysteresis on the near gate: it opens at `--near-deg` and closes at half
             // as much again, so a gaze sitting at the edge does not flicker the dot.
@@ -761,9 +806,10 @@ pub fn run(args: &Args) -> Result<()> {
         });
 
         let pointer_key = pointer.map(|p| (p.near, p.target.map(|t| t.id)));
+        let armed_now   = pointer.is_some();
 
         if moved || target_id != last_target || hidden != last_hidden || blocked != last_blocked
-            || owner != last_owner || pointer_key != last_pointer
+            || owner != last_owner || pointer_key != last_pointer || armed_now != last_armed
         {
             let state = {
                 if args.overlay_debug {
@@ -799,6 +845,7 @@ pub fn run(args: &Args) -> Result<()> {
             };
 
             last_pointer = pointer_key;
+            last_armed   = armed_now;
             last_hidden  = hidden;
             last_blocked = blocked;
             last_owner   = owner;
@@ -873,6 +920,10 @@ pub fn run(args: &Args) -> Result<()> {
     overlay.stop();
 
     let _ = overlay_join.join();
+
+    if let Some(keys) = latch_keys.as_mut() {
+        keys.stop();
+    }
 
     perception.stop();
 

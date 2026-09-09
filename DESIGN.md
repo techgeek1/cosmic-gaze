@@ -1217,6 +1217,13 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   1 Hz; the spring is where the smoothing lives, the stack only steadies the snap point.
   The dot also blinked at the edge of the near gate; it now lingers 0.3 s after nothing
   is near and the gate closes at 1.5x the distance it opens at.
+  Then the overlay went intent-only: shown while a thumb rests on the Daydream pad or
+  F14 has latched it on, nothing otherwise. Reason: half of the remaining noise (titles,
+  punctuation runs the recogniser calls controls, a dot on prose before the tree
+  answers) is only noise while reading, and while aiming the same marks are the point.
+  Tobii's desktop software and Talon both settled on show-on-intent. The thumb landing
+  now only arms; the refine begins after 12 px of travel, so a resting thumb shows
+  where the eyes are and gaze keeps driving until the thumb nudges.
 
 ## 11. Open questions
 

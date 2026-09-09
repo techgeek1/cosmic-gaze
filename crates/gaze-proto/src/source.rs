@@ -69,6 +69,16 @@ pub enum Control {
     /// The fine channel moved: the controller's thumb or wrist adjusting where the next
     /// commit lands, relative to where gaze put it. See [`Refine`].
     Refine(Refine),
+    /// The thumb landed on the controller's pad (`true`) or lifted off it. Arms the
+    /// pointer look for as long as it is down; a refine begins only once the thumb has
+    /// travelled, so a resting thumb shows where the eyes are without taking over.
+    Arm {
+        /// Down when true, up when false.
+        down : bool,
+    },
+    /// The overlay latch key (F14) was pressed: toggle whether the pointer look is shown
+    /// with no thumb on the pad.
+    ToggleOverlay,
 }
 
 /// The fine channel's gesture, as the session sees it.

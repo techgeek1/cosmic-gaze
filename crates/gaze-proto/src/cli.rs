@@ -249,6 +249,12 @@ pub struct Args {
     #[arg(long, default_value_t = 2.0)]
     pub snap_deg: f64,
 
+    /// Show the pointer look for the whole run. The default shows it only while a thumb
+    /// rests on the Daydream pad or F14 has latched it on, so reading is never marked
+    /// and the mouse is never fought; the look comes up when a commit is being aimed.
+    #[arg(long)]
+    pub overlay_always: bool,
+
     /// How long the pointer dot takes to settle on a new gaze point, seconds. The dot
     /// follows the gaze on a critically damped spring stepped at the display's frame
     /// rate; shorter is more responsive and passes more of the tracker's jitter.
@@ -275,8 +281,8 @@ pub struct Args {
 
     /// Read the Daydream controller (`gaze-daydream`) alongside the mouse: its pad
     /// commits, Home exits, App holds the voice stack's push-to-talk (forwarded as F13),
-    /// the volume keys are a wheel, and a thumb on the pad refines the commit point (see
-    /// `--refine`). Pair it once with
+    /// the volume keys are a wheel, a thumb resting on the pad shows the pointer look,
+    /// and a thumb that travels refines the commit point (see `--refine`). Pair it once with
     /// `bluetoothctl` and wake it with Home before starting.
     #[arg(long)]
     pub daydream: bool,
