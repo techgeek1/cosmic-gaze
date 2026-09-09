@@ -371,6 +371,9 @@ pub fn run(args: &Args) -> Result<()> {
     // what a pad press clicks, and the hover the app shows agrees.
     let mut mark        : Option<(u64, GlobalPx)> = None;
     let mut marked      : Option<GlobalPx>        = None;
+    // Where the pointer was before the thumb borrowed it; it goes back there when the
+    // thumb lifts, so the mouse hand finds it where it left it.
+    let mut borrowed    : Option<GlobalPx>        = None;
     // Whether the perception thread is capturing and detecting. Off while the eyes are
     // only reading or scrolling, since no box is wanted then and the detector is the
     // hot part of the session.
@@ -513,6 +516,10 @@ pub fn run(args: &Args) -> Result<()> {
 
                     match anchor {
                         Some(anchor) => {
+                            if borrowed.is_none() {
+                                borrowed = pointer_position(injector.as_mut(), &warper);
+                            }
+
                             refined = Some(Refined {
                                 anchor  : anchor,
                                 dx_px   : 0.0,
@@ -581,6 +588,22 @@ pub fn run(args: &Args) -> Result<()> {
 
                 Control::Arm { down } => {
                     pad_down = down;
+
+                    // The thumb lifting gives the pointer back, after any commit in
+                    // the same report has clicked where it was.
+                    if !down
+                        && let Some(home) = borrowed.take()
+                    {
+                        do_warp(
+                            injector.as_mut(),
+                            &mut warper,
+                            home,
+                            last_sample.map(|s| s.sigma_deg).unwrap_or(f64::NAN),
+                            None,
+                            WarpReason::Return,
+                            Instant::now(),
+                        );
+                    }
                 }
 
                 Control::ToggleOverlay => {
@@ -866,13 +889,17 @@ pub fn run(args: &Args) -> Result<()> {
         marked = mark_now.map(|(_, p)| p);
 
         // Thumb down borrows the pointer: it goes to the mark when one appears or
-        // changes, and stays put while nothing is marked or a refine has it. Nobody
-        // holds the mouse and the controller at once, so nothing gives it back.
+        // changes, and stays put while nothing is marked or a refine has it. The
+        // thumb lifting gives it back (see `Control::Arm`).
         if pad_down
             && !refined.is_some_and(|r| r.engaged)
             && let Some((id, point)) = mark_now
             && mark.is_none_or(|(last, _)| last != id)
         {
+            if borrowed.is_none() {
+                borrowed = pointer_position(injector.as_mut(), &warper);
+            }
+
             do_warp(
                 injector.as_mut(),
                 &mut warper,
@@ -1429,7 +1456,7 @@ fn edge_scroll(
                         home,
                         filtered.sample.sigma_deg,
                         None,
-                        WarpReason::EdgeScrollReturn,
+                        WarpReason::Return,
                         Instant::now(),
                     );
                 }
