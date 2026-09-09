@@ -366,9 +366,11 @@ pub fn run(args: &Args) -> Result<()> {
     // Where the pointer was before an edge scroll warped it into the surface; it goes
     // back there when the scroll stops, so scrolling by eye leaves the pointer alone.
     let mut parked      : Option<GlobalPx> = None;
-    // The centre of the element the overlay is marking, as of the last sample. A commit
-    // lands on it: what is highlighted is what is selected.
-    let mut marked      : Option<GlobalPx> = None;
+    // The element the overlay is marking, as of the last sample, and its centre. With a
+    // thumb on the pad the pointer is borrowed and sits on it: what is highlighted is
+    // what a pad press clicks, and the hover the app shows agrees.
+    let mut mark        : Option<(u64, GlobalPx)> = None;
+    let mut marked      : Option<GlobalPx>        = None;
     // Whether the perception thread is capturing and detecting. Off while the eyes are
     // only reading or scrolling, since no box is wanted then and the detector is the
     // hot part of the session.
@@ -859,7 +861,30 @@ pub fn run(args: &Args) -> Result<()> {
         let pointer_key = pointer.map(|p| (p.near, p.target.map(|t| t.id)));
         let armed_now   = pointer.is_some();
 
-        marked = pointer.and_then(|p| p.target).map(|t| t.rect.center());
+        let mark_now = pointer.and_then(|p| p.target).map(|t| (t.id, t.rect.center()));
+
+        marked = mark_now.map(|(_, p)| p);
+
+        // Thumb down borrows the pointer: it goes to the mark when one appears or
+        // changes, and stays put while nothing is marked or a refine has it. Nobody
+        // holds the mouse and the controller at once, so nothing gives it back.
+        if pad_down
+            && !refined.is_some_and(|r| r.engaged)
+            && let Some((id, point)) = mark_now
+            && mark.is_none_or(|(last, _)| last != id)
+        {
+            do_warp(
+                injector.as_mut(),
+                &mut warper,
+                point,
+                filtered.sample.sigma_deg,
+                None,
+                WarpReason::Mark,
+                Instant::now(),
+            );
+        }
+
+        mark = mark_now;
 
         if moved || target_id != last_target || hidden != last_hidden || blocked != last_blocked
             || pointer_key != last_pointer || armed_now != last_armed

@@ -36,6 +36,9 @@ pub enum WarpReason {
     /// The controller's refine gesture began: the pointer goes to the snap point so the
     /// hand can take it from there.
     Refine,
+    /// A thumb is on the pad and the marked element changed: the pointer goes to it, so
+    /// the pad press lands on what is highlighted.
+    Mark,
 }
 
 /// Warp policy and the counters the exit summary reports.

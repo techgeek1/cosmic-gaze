@@ -73,7 +73,11 @@ thread presents it on its own clock (`present.rs`). Rules:
   pointer was and puts it back when the scroll stops, unless something else moved it
   meanwhile. **A commit lands on what is marked**: the highlight's centre, whatever the
   snap engine's own pick or the pointer's place; the refine point still outranks it,
-  and with nothing marked the engine's pick is clicked as before. The controller's
+  and with nothing marked the engine's pick is clicked as before. **Thumb down borrows
+  the pointer**: it warps to the mark when one appears or changes and sits on it while
+  the thumb rests, so the app's hover agrees with the highlight, the pad press clicks
+  what is marked, and a refine nudges from there; the thumb lifting leaves it where it
+  is, since nobody holds the mouse and the controller at once. The controller's
   held/idle arbitration against the mouse (gyro thresholds, a six-second window) is
   gone: the thumb is the intent, and nothing gaze-side moves the pointer otherwise.
 - **The tree outranks the recogniser.** Once per place the eyes settle, the session asks
