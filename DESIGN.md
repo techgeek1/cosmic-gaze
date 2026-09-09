@@ -1253,6 +1253,12 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   over the mix list and the wheel goes to the innermost scroller under it; and a refine
   anchors on the marked element when there is one, because a pad press moves the thumb
   enough to begin a refine, and the click it ends in must start from what is marked.
+  Live, the mix list's band then scrolled the page: the surface cache served an answer
+  for as long as its viewport contained the gaze, and the page contains the list, so
+  eyes arriving in the list kept "page" for up to two seconds and the dwell started a
+  page scroll. The cache is now keyed by where it asked: an answer is served within 48
+  px of that point, a gaze further away is asked about again within 100 ms and gets
+  nothing until the reply lands.
 
 ## 11. Open questions
 

@@ -5,9 +5,13 @@
 //! the sample loop, so the question goes to `gaze_clicks::TreeService`'s thread, which has
 //! the watchdog for the second problem, and the answer is polled for on later samples.
 //!
-//! The cache is keyed by containment, not by window: a viewport that contains the gaze
-//! point is the current answer until it stops containing it or goes stale, and a scroll in
-//! progress freezes it, because the content moves and the viewport does not.
+//! The cache is keyed by where it asked: the answer stands while the gaze stays within
+//! [`MOVE_REASK_PX`] of the point it was asked at and the viewport still contains it, and
+//! is asked again once the gaze has moved further, because a viewport that contains the
+//! point may hold a smaller one that also does (YouTube's mix list inside its page, whose
+//! lower bands overlap; keyed by containment alone the page stayed the answer for two
+//! seconds after the eyes reached the list, and the list's band scrolled the page). A
+//! scroll in progress freezes it, because the content moves and the viewport does not.
 
 use std::time::{Duration, Instant};
 
@@ -27,6 +31,16 @@ pub const REASK_AFTER: Duration = Duration::from_millis(300);
 /// or resized window does not keep serving its old rectangle.
 pub const REFRESH_AFTER: Duration = Duration::from_secs(2);
 
+/// How far the gaze may move from the point the current answer was asked at before it
+/// is asked again. A fixation's worth: reading along a line stays within it, a look to
+/// another region does not.
+pub const MOVE_REASK_PX: f64 = 48.0;
+
+/// Shortest interval before a moved gaze is asked about. Well under the scroller's entry
+/// dwell, so a band reached from elsewhere on the page is asked about before it can
+/// start anything.
+pub const MOVED_REASK_AFTER: Duration = Duration::from_millis(100);
+
 /// While a scroll is running the viewport holds but the content moves under it, so the
 /// room left each way is re-asked at this rate: it is what ends a scroll at the page's end.
 pub const REFRESH_SCROLLING: Duration = Duration::from_millis(400);
@@ -40,6 +54,9 @@ pub struct SurfaceCache {
     /// The last answer, which may have been "nothing scrolls here".
     current  : Option<Surface>,
     asked_at : Option<Instant>,
+    /// Where the outstanding or last question was asked. The answer is only served near
+    /// it.
+    asked_for : Option<GlobalPx>,
     /// Questions asked over the session.
     pub asked    : u64,
     /// Answers that named a surface.
@@ -57,6 +74,7 @@ impl SurfaceCache {
             pending  : None,
             current  : None,
             asked_at : None,
+            asked_for : None,
             asked    : 0,
             found    : 0,
         }
@@ -66,8 +84,9 @@ impl SurfaceCache {
     /// current answer whether or not it contains the point, and refreshes it at
     /// [`REFRESH_SCROLLING`] so the room left tracks the moving content.
     ///
-    /// Non-blocking: a fresh point gets a question sent and `None` back until the reply
-    /// lands on a later call, which the scroller's entry dwell comfortably covers.
+    /// Non-blocking: a fresh point, or one that has moved [`MOVE_REASK_PX`] from the last
+    /// one asked about, gets a question sent and `None` back until the reply lands on a
+    /// later call, which the scroller's entry dwell comfortably covers.
     pub fn scrollable(&mut self, gaze: Option<GlobalPx>, scrolling: bool) -> Option<Scrollable> {
         self.collect(scrolling);
 
@@ -87,17 +106,26 @@ impl SurfaceCache {
         let gaze = gaze?;
 
         let contains = self.current.as_ref().is_some_and(|s| s.viewport.contains(gaze));
+        let moved    = self.asked_for.is_none_or(|p| (p.x - gaze.x).hypot(p.y - gaze.y) > MOVE_REASK_PX);
 
-        let due = match contains {
-            true  => age >= REFRESH_AFTER,
-            false => age >= REASK_AFTER,
+        let due = match (moved, contains) {
+            (true, _)      => age >= MOVED_REASK_AFTER,
+            (false, true)  => age >= REFRESH_AFTER,
+            (false, false) => age >= REASK_AFTER,
         };
 
         if due && self.pending.is_none() {
             self.ask(gaze);
         }
 
-        contains.then(|| self.current.as_ref().map(scrollable)).flatten()
+        // An answer is served only near the point it was asked at, and not while the
+        // question for a new point is still out: the old answer may be an outer surface
+        // of the one under the eyes now.
+        let near = self.asked_for.is_some_and(|p| (p.x - gaze.x).hypot(p.y - gaze.y) <= MOVE_REASK_PX);
+
+        (contains && near && self.pending.is_none())
+            .then(|| self.current.as_ref().map(scrollable))
+            .flatten()
     }
 
     /// Forgets when the current answer was fetched, so the next call asks again: after a
@@ -118,6 +146,7 @@ impl SurfaceCache {
         self.asked    += 1;
         self.pending   = Some(id);
         self.asked_at  = Some(Instant::now());
+        self.asked_for = Some(gaze);
 
         self.tree.ask_surface(id, gaze);
     }
