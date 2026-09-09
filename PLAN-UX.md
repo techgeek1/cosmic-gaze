@@ -50,9 +50,14 @@ thread presents it on its own clock (`present.rs`). Rules:
   marked with the tree's own box; text, a heading or nothing actionable is never marked
   whatever the recogniser called it; a control taller than 56 px and wider than 240 is
   a row or a picture and is treated as text. No answer (an application off the bus)
-  leaves the recogniser's kind in charge. Found on Discord 2026-09-09: the recogniser
+  leaves the recogniser's kind in charge, but an accessible window answering nothing at
+  the point (Firefox over a page it has a tree for) is text: the application would have
+  named a control if it had one, and the recogniser guessing over an accessible page is
+  what the tree is there to overrule. Found on Discord 2026-09-09: the recogniser
   called a message's last line a `Button` at 0.9 and the channel list `Text`; the tree
-  says `list item` 880x71 and `link` 286x32. `--no-a11y` turns this off.
+  says `list item` 880x71 and `link` 286x32. `--no-a11y` turns this off. The first few
+  empty answers per session are logged at info with where; `gaze-a11y-cli at X,Y
+  --window TITLE` probes a window even under another.
 - **Theme** from cosmic-config (`com.system76.CosmicTheme.{Mode,Dark,Light}`), watched,
   so an accent change in cosmic-settings is picked up live. Stock COSMIC colours when
   there is no theme to read.
@@ -65,9 +70,10 @@ the frame the screen would show.
 Not done here, on purpose: easing the dot's position (it would add lag to a channel that
 already feels heavy), and any caption in the pointer look. Still open: the detector's
 own boxes on web content are looser than the widgets they mark, which the 1 px inflation
-does not fix and the tree fixes only where it answers; and Firefox answered nothing on a
-Reddit tab on 2026-09-09 while Discord answered everything, so web content in Firefox
-runs on the recogniser until that is understood.
+does not fix and the tree fixes only where it answers. Firefox answered nothing at
+three points on a Reddit tab on 2026-09-09 and everything on GitHub, a PR page and a
+Reddit thread an hour later, probed the same way; not reproduced since, and the session
+now logs the first few such answers so the next one says which page.
 
 ## U2. Daemon (`gazed`)
 

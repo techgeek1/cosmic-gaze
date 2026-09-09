@@ -29,7 +29,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use gaze_a11y::{A11y, Hit, Surface};
+use gaze_a11y::{A11y, Answer, Hit, Miss, Surface};
 use gaze_capture::ToplevelTracker;
 use gaze_core::GlobalPx;
 use tracing::{debug, info, warn};
@@ -76,6 +76,11 @@ pub struct TreeReply {
     /// The scroll surface under the point, for a [`Question::Surface`]; `None` for the
     /// same reasons as `hit`, and when nothing above the point overflows.
     pub surface : Option<Surface>,
+    /// Why `hit` is `None` for a [`Question::Hit`] when the tree was asked and said
+    /// so: the window was found and its application is off the bus, or answered
+    /// nothing there. `None` when there was a hit, the point was on no window, or the
+    /// tree was never there.
+    pub miss    : Option<Miss>,
     /// Round trip on the thread, milliseconds.
     pub ms      : f64,
 }
@@ -293,14 +298,14 @@ fn run(requests: Receiver<TreeRequest>, replies: Sender<TreeReply>) {
     }
 
     for request in requests {
-        let started        = Instant::now();
-        let (hit, surface) = answer(&mut windows, &mut a11y, request.px, request.kind);
-        let ms             = started.elapsed().as_secs_f64() * 1000.0;
+        let started              = Instant::now();
+        let (hit, surface, miss) = answer(&mut windows, &mut a11y, request.px, request.kind);
+        let ms                   = started.elapsed().as_secs_f64() * 1000.0;
 
         debug!(id = request.id, kind = ?request.kind, ms = ms,
-               answered = hit.is_some() || surface.is_some(), "tree reply");
+               answered = hit.is_some() || surface.is_some(), miss = ?miss, "tree reply");
 
-        let reply = TreeReply { id: request.id, hit: hit, surface: surface, ms: ms };
+        let reply = TreeReply { id: request.id, hit: hit, surface: surface, miss: miss, ms: ms };
 
         if replies.send(reply).is_err() {
             break;
@@ -315,38 +320,43 @@ fn answer(
     px      : GlobalPx,
     kind    : Question,
 )
-    -> (Option<Hit>, Option<Surface>)
+    -> (Option<Hit>, Option<Surface>, Option<Miss>)
 {
     let (Some(windows), Some(a11y)) = (windows.as_mut(), a11y.as_mut()) else {
-        return (None, None);
+        return (None, None, None);
     };
 
     if let Err(e) = windows.pump() {
         warn!(error = %e, "toplevel list stopped");
 
-        return (None, None);
+        return (None, None, None);
     }
 
     let Some(window) = windows.at(px) else {
-        return (None, None);
+        return (None, None, None);
     };
 
     match kind {
-        Question::Hit => match a11y.at(px, &window) {
-            Ok(hit) => (hit, None),
+        Question::Hit => match a11y.ask(px, &window) {
+            Ok(Answer::Hit(hit))   => (Some(hit), None, None),
+            Ok(Answer::Miss(miss)) => {
+                debug!(?miss, app_id = %window.app_id, title = %window.title, "tree has no node at the point");
+
+                (None, None, Some(miss))
+            }
             Err(e)  => {
                 debug!(error = %e, app_id = %window.app_id, "tree query failed");
 
-                (None, None)
+                (None, None, None)
             }
         },
 
         Question::Surface => match a11y.scroll_surface(px, &window) {
-            Ok(surface) => (None, surface),
+            Ok(surface) => (None, surface, None),
             Err(e)      => {
                 debug!(error = %e, app_id = %window.app_id, "surface query failed");
 
-                (None, None)
+                (None, None, None)
             }
         },
     }

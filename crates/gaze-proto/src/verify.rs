@@ -20,10 +20,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
-use gaze_a11y::Hit;
+use gaze_a11y::{Hit, Miss};
 use gaze_clicks::TreeService;
 use gaze_core::{ElementKind, GlobalPx, Rect};
-use tracing::debug;
+use tracing::{debug, info};
 
 /// Shortest interval between two questions about places the tree has not answered
 /// for. Each ask costs the tree thread a few milliseconds and a moving gaze would
@@ -55,6 +55,11 @@ pub const CONTROL_MAX_H_PX: f64 = 56.0;
 /// sides: a tall narrow thing is a scrollbar thumb, a colour swatch, a toolbar button
 /// at a big scale.
 pub const CONTROL_MAX_SIDE_PX: f64 = 240.0;
+
+/// How many times per session an accessible window answering nothing at the gaze is
+/// reported at info level, with where. Beyond that it is debug: the first few say
+/// which page it is, the rest would say the same.
+const REPORT_EMPTY_ANSWERS: u64 = 5;
 
 /// What the tree said about a place.
 #[derive(Clone, Debug, PartialEq)]
@@ -92,6 +97,8 @@ pub struct Verifier {
     pub controls : u64,
     /// Answers that said text or nothing actionable.
     pub statics  : u64,
+    /// Answers from an accessible window that had no node at the point at all.
+    pub empty    : u64,
 }
 
 // --- Verifier ---
@@ -109,6 +116,7 @@ impl Verifier {
             asked    : 0,
             controls : 0,
             statics  : 0,
+            empty    : 0,
         }
     }
 
@@ -182,7 +190,25 @@ impl Verifier {
 
         self.pending = None;
 
-        let verdict = verdict_of(reply.hit.as_ref());
+        let verdict = verdict_of(reply.hit.as_ref(), reply.miss);
+
+        // An accessible window with nothing at the point is worth a line the first few
+        // times: it is either a page whose tree really has nothing there, or a toolkit
+        // reporting extents that exclude the point, and the difference is a bug report.
+        if reply.hit.is_none() && matches!(reply.miss, Some(Miss::Nothing | Miss::Outside)) {
+            self.empty += 1;
+
+            if self.empty <= REPORT_EMPTY_ANSWERS {
+                info!(
+                    x    = asked.x,
+                    y    = asked.y,
+                    miss = ?reply.miss,
+                    ms   = reply.ms,
+                    "a11y: an accessible window has no node under the gaze; treating it as text \
+                     (RUST_LOG=gaze_a11y=debug says why)",
+                );
+            }
+        }
 
         match &verdict {
             Verdict::Control { role, name, rect, .. } => {
@@ -220,11 +246,17 @@ impl Verifier {
 /// Folds a tree answer into a verdict.
 ///
 /// A hit whose actionable ancestor is a control names it; one whose nearest actionable
-/// ancestor is a text-like role, or that has none, is static. No hit at all is unknown:
-/// the window is not on the bus, and that is not evidence about the pixels.
-pub fn verdict_of(hit: Option<&Hit>) -> Verdict {
+/// ancestor is a text-like role, or that has none, is static. No hit from a window
+/// whose application is off the bus is unknown, since that says nothing about the
+/// pixels; no hit from an accessible window is static, since the application would
+/// have named a control there if it had one, and the recogniser's guess over an
+/// accessible page is the thing the tree is there to overrule.
+pub fn verdict_of(hit: Option<&Hit>, miss: Option<Miss>) -> Verdict {
     let Some(hit) = hit else {
-        return Verdict::Unknown;
+        return match miss {
+            Some(Miss::Nothing | Miss::Outside) => Verdict::Static,
+            Some(Miss::Unreachable) | None      => Verdict::Unknown,
+        };
     };
 
     let Some(target) = &hit.target else {
@@ -334,7 +366,7 @@ mod tests {
     #[test]
     fn a_link_row_is_a_control_with_its_own_box() {
         let rect = Rect { x: 10.0, y: 20.0, w: 200.0, h: 32.0 };
-        let v    = verdict_of(Some(&hit("static", Some(node("link", Some(rect))))));
+        let v    = verdict_of(Some(&hit("static", Some(node("link", Some(rect))))), None);
 
         match v {
             Verdict::Control { rect: r, kind, .. } => {
@@ -350,9 +382,19 @@ mod tests {
     /// it is not marked.
     #[test]
     fn text_and_no_ancestor_are_static_and_no_answer_is_unknown() {
-        assert_eq!(verdict_of(Some(&hit("text", Some(node("text", None))))), Verdict::Static);
-        assert_eq!(verdict_of(Some(&hit("section", None))), Verdict::Static);
-        assert_eq!(verdict_of(None), Verdict::Unknown);
+        assert_eq!(verdict_of(Some(&hit("text", Some(node("text", None)))), None), Verdict::Static);
+        assert_eq!(verdict_of(Some(&hit("section", None)), None), Verdict::Static);
+        assert_eq!(verdict_of(None, None), Verdict::Unknown);
+        assert_eq!(verdict_of(None, Some(Miss::Unreachable)), Verdict::Unknown);
+    }
+
+    /// An accessible window that answers nothing at the point (Firefox on a page, a
+    /// toolkit whose extents exclude the point) is text, not a licence for the
+    /// recogniser; an application off the bus leaves the recogniser in charge.
+    #[test]
+    fn nothing_from_an_accessible_window_is_static() {
+        assert_eq!(verdict_of(None, Some(Miss::Nothing)), Verdict::Static);
+        assert_eq!(verdict_of(None, Some(Miss::Outside)), Verdict::Static);
     }
 
     /// Discord's message row is a `list item` 880x71 and an attachment an `image`
@@ -364,10 +406,10 @@ mod tests {
         let line  = Rect { x: 86.0, y: 674.0, w: 286.0, h: 32.0 };
         let tall  = Rect { x: 0.0, y: 0.0, w: 24.0, h: 120.0 };
 
-        assert_eq!(verdict_of(Some(&hit("section", Some(node("list item", Some(row)))))), Verdict::Static);
-        assert_eq!(verdict_of(Some(&hit("image", Some(node("image", Some(image)))))), Verdict::Static);
-        assert!(matches!(verdict_of(Some(&hit("section", Some(node("link", Some(line)))))), Verdict::Control { .. }));
-        assert!(matches!(verdict_of(Some(&hit("push button", Some(node("push button", Some(tall)))))), Verdict::Control { .. }));
+        assert_eq!(verdict_of(Some(&hit("section", Some(node("list item", Some(row))))), None), Verdict::Static);
+        assert_eq!(verdict_of(Some(&hit("image", Some(node("image", Some(image))))), None), Verdict::Static);
+        assert!(matches!(verdict_of(Some(&hit("section", Some(node("link", Some(line))))), None), Verdict::Control { .. }));
+        assert!(matches!(verdict_of(Some(&hit("push button", Some(node("push button", Some(tall))))), None), Verdict::Control { .. }));
     }
 
     /// The same object gets the same id, a different one does not, and no id can be

@@ -903,6 +903,7 @@ pub fn run(args: &Args) -> Result<()> {
         a11y_asked      = verifier.as_ref().map(|v| v.asked),
         a11y_controls   = verifier.as_ref().map(|v| v.controls),
         a11y_statics    = verifier.as_ref().map(|v| v.statics),
+        a11y_empty      = verifier.as_ref().map(|v| v.empty),
         daydream_reports = daydream.as_ref().map(|d| d.reports),
         cpu_percent     = ?cpu_percent,
         "session summary"

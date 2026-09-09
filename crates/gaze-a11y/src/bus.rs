@@ -160,6 +160,37 @@ pub struct Hit {
     pub coord   : CoordMode,
 }
 
+/// Why the tree had no node for a point. The distinction matters to a caller deciding
+/// whether the pixels should stand in: an application off the bus says nothing about
+/// what is on screen, while an accessible window answering null says there is nothing
+/// there it knows of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Miss {
+    /// No application on the bus matches the window: not accessible, pixels only.
+    Unreachable,
+    /// The window answered null in every coordinate interpretation.
+    Nothing,
+    /// A node came back in some interpretation but its own extents excluded the point
+    /// in every one, so no answer was trusted.
+    Outside,
+}
+
+/// What the tree said about a point: a node, or why there is none.
+// A hit is a few strings and a miss is a byte; the value lives for one call.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Answer {
+    Hit(Hit),
+    Miss(Miss),
+}
+
+/// What [`A11y::resolve`] found: the leaf with the interpretation that produced it, or
+/// why there is none.
+enum Resolved {
+    Leaf(Node, CoordMode, FrameOrigin),
+    Miss(Miss),
+}
+
 /// The scrollable region under a point: the nearest ancestor whose content overflows
 /// it vertically. See [`A11y::scroll_surface`] and [`clip_surface`].
 #[derive(Clone, Debug, PartialEq)]
@@ -247,19 +278,28 @@ impl A11y {
     ///
     /// `Ok(None)` when no application on the bus matches the window, or the window
     /// answers null in every coordinate interpretation: the application is not
-    /// accessible, and the pixels are all there is.
+    /// accessible, and the pixels are all there is. [`A11y::ask`] says which.
     pub fn at(&mut self, p: GlobalPx, window: &Toplevel) -> Result<Option<Hit>, A11yError> {
+        Ok(match self.ask(p, window)? {
+            Answer::Hit(hit) => Some(hit),
+            Answer::Miss(_)  => None,
+        })
+    }
+
+    /// [`A11y::at`] with the reason when there is no node.
+    pub fn ask(&mut self, p: GlobalPx, window: &Toplevel) -> Result<Answer, A11yError> {
         let started = Instant::now();
 
-        let Some((leaf, mode, origin)) = self.resolve(p, window)? else {
-            return Ok(None);
+        let (leaf, mode, origin) = match self.resolve(p, window)? {
+            Resolved::Leaf(leaf, mode, origin) => (leaf, mode, origin),
+            Resolved::Miss(miss)               => return Ok(Answer::Miss(miss)),
         };
 
         let (target, climbed) = self.climb(&leaf, mode, origin, window)?;
 
         debug!(?mode, role = %leaf.role, ms = started.elapsed().as_secs_f64() * 1000.0, "a11y hit");
 
-        Ok(Some(Hit {
+        Ok(Answer::Hit(Hit {
             leaf    : leaf,
             target  : target,
             climbed : climbed,
@@ -273,7 +313,7 @@ impl A11y {
     /// it is called, what its extents are against its children's) can be read off the
     /// desk instead of guessed. Empty when the tree has no answer.
     pub fn ancestors(&mut self, p: GlobalPx, window: &Toplevel) -> Result<Vec<Node>, A11yError> {
-        let Some((leaf, mode, origin)) = self.resolve(p, window)? else {
+        let Resolved::Leaf(leaf, mode, origin) = self.resolve(p, window)? else {
             return Ok(Vec::new());
         };
 
@@ -314,13 +354,15 @@ impl A11y {
     /// The leaf under `p`, with the coordinate interpretation and frame origin that
     /// produced it. Shared by [`A11y::at`] and [`A11y::ancestors`].
     fn resolve(&mut self, p: GlobalPx, window: &Toplevel)
-        -> Result<Option<(Node, CoordMode, FrameOrigin)>, A11yError>
+        -> Result<Resolved, A11yError>
     {
         let Some((bus, frame)) = self.frame_for(window)? else {
             debug!(app_id = %window.app_id, title = %window.title, "no accessible application for the window");
 
-            return Ok(None);
+            return Ok(Resolved::Miss(Miss::Unreachable));
         };
+
+        let mut outside = false;
 
         for mode in [CoordMode::Window, CoordMode::Screen] {
             // The frame's own origin is the offset between the toolkit's space and the
@@ -357,16 +399,17 @@ impl A11y {
                 && !contains(extents, x, y)
             {
                 debug!(?mode, x, y, ?extents, "node does not contain the query point");
+                outside = true;
 
                 continue;
             }
 
             let leaf = self.node(&leaf_bus, &leaf_path, mode, origin, window)?;
 
-            return Ok(Some((leaf, mode, origin)));
+            return Ok(Resolved::Leaf(leaf, mode, origin));
         }
 
-        Ok(None)
+        Ok(Resolved::Miss(if outside { Miss::Outside } else { Miss::Nothing }))
     }
 
     /// The application frame that is `window`, as (bus, path).
