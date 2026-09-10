@@ -1,0 +1,32 @@
+[package]
+name              = "gaze-daemon"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+gaze-core   = { workspace = true }
+gaze-config = { workspace = true }
+gaze-proto  = { workspace = true }
+
+anyhow             = { workspace = true }
+clap               = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# The control interface is served on the session bus with the blocking API: the
+# session loop is synchronous and the daemon has no executor of its own. Same features
+# as every other zbus user in the workspace, so the reactor never skews.
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+
+# SIGTERM and SIGINT stop the session cleanly (the pointer is returned, the offset is
+# saved) instead of killing the process mid-warp.
+signal-hook = "0.3"
+
+[[bin]]
+name = "gazed"
+path = "src/main.rs"
+
+[lints.clippy]
+# The workspace style mandates explicit `Foo { x: x }` field syntax everywhere.
+redundant_field_names = "allow"
