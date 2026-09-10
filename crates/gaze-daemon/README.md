@@ -28,7 +28,9 @@ whether by the applet's Advanced section or by hand.
 
 `just install` from the workspace root puts `gazed` and the applet under `~/.local/bin`
 and installs the autostart entry (`data/dev.techgeek1.CosmicGaze.desktop`) that
-cosmic-session honours.
+cosmic-session honours; `just install-desk` copies the desk's files from the checkout
+to the XDG locations above. After both, `gazed` from a terminal is the installed daemon
+on the installed files, and the next login starts it by itself.
 
 ## Control interface
 
