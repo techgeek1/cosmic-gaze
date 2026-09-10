@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Exec=cosmic-ext-applet-gaze
+Name=Gaze
+Comment=Status and tuning for gaze pointing
+Icon=preferences-desktop-accessibility-symbolic
+NoDisplay=true
+Categories=COSMIC;
+X-CosmicApplet=true
+X-CosmicAppletId=dev.techgeek1.CosmicGazeApplet
+X-CosmicHoverPopup=Auto
+X-OverflowPriority=5

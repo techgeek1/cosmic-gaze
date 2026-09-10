@@ -1,0 +1,35 @@
+[package]
+name              = "gaze-applet"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+gaze-config = { workspace = true }
+serde       = { workspace = true }
+
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# The daemon's properties and methods. `async-io` rather than `tokio` on purpose: zbus
+# then runs its reactor on a thread of its own, so the async proxy works under iced's
+# executor without the connection having to be built inside it, and every zbus user in
+# this workspace shares one feature set.
+zbus = { version = "5", default-features = false, features = ["async-io"] }
+
+# The same pin cosmic-term builds against on this machine, so the git checkout is
+# already local (and shared with `gaze-trainer` and `gaze-overlay`). `applet` brings
+# autosize, multi-window and cosmic-panel-config; `tokio` is iced's executor.
+[dependencies.libcosmic]
+git              = "https://github.com/pop-os/libcosmic.git"
+rev              = "c1897c01aa8a25776ceadeddcb161bb59ccffd79"
+default-features = false
+features         = ["applet", "tokio", "wayland"]
+
+[[bin]]
+name = "cosmic-ext-applet-gaze"
+path = "src/main.rs"
+
+[lints.clippy]
+# The workspace style mandates explicit `Foo { x: x }` field syntax everywhere.
+redundant_field_names = "allow"
