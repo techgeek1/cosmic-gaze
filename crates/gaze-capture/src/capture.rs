@@ -359,20 +359,49 @@ impl Capture {
 
     /// Dispatches events until `ready` holds or the deadline expires.
     ///
-    /// Blocking dispatch has no timeout of its own, so the deadline is enforced between
-    /// batches. A compositor that goes completely silent therefore blocks until it sends
-    /// something, which in practice it always does.
+    /// The wait is on the connection's socket with `poll`, so a compositor that goes
+    /// completely silent (an output that has gone to sleep never delivers its frame)
+    /// ends in `Timeout` rather than blocking the thread for as long as the output is
+    /// off. Everything already read is dispatched before waiting, and anything that
+    /// arrives is read and dispatched in one step.
     fn wait_for(&mut self, ready: impl Fn(&State) -> bool) -> Result<(), CaptureError> {
         let deadline = Instant::now() + self.timeout;
+        let protocol = |e: &dyn std::fmt::Display| CaptureError::Protocol { detail: e.to_string() };
 
         while !ready(&self.state) {
-            if Instant::now() >= deadline {
+            self.queue.dispatch_pending(&mut self.state).map_err(|e| protocol(&e))?;
+
+            if ready(&self.state) {
+                break;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+
+            if remaining.is_zero() {
                 return Err(CaptureError::Timeout { ms: self.timeout.as_millis() as u64 });
             }
 
-            self.queue
-                .blocking_dispatch(&mut self.state)
-                .map_err(|e| CaptureError::Protocol { detail: e.to_string() })?;
+            self.queue.flush().map_err(|e| protocol(&e))?;
+
+            // `None` means events landed in the buffer between the dispatch above and
+            // now; go round and dispatch them.
+            let Some(guard) = self.queue.prepare_read() else {
+                continue;
+            };
+
+            let fd    = guard.connection_fd();
+            let flags = rustix::event::PollFlags::IN;
+            let mut fds = [rustix::event::PollFd::new(&fd, flags)];
+
+            let woke = rustix::event::poll(&mut fds, Some(&rustix::time::Timespec::try_from(remaining).map_err(|e| protocol(&e))?))
+                .map_err(|e| protocol(&e))?;
+
+            if woke == 0 {
+                // Nothing arrived in time; the guard is dropped without reading.
+                return Err(CaptureError::Timeout { ms: self.timeout.as_millis() as u64 });
+            }
+
+            guard.read().map_err(|e| protocol(&e))?;
         }
 
         Ok(())

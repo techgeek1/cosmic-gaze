@@ -281,6 +281,7 @@ fn run(
     let mut capture = capture;
     let mut states  : HashMap<String, OutputState> = HashMap::new();
     let mut missing : HashSet<String>              = HashSet::new();
+    let mut failing : HashSet<String>              = HashSet::new();
 
     while !stop.load(Ordering::Relaxed) {
         let pass_start = Instant::now();
@@ -340,11 +341,24 @@ fn run(
                 info!(output = %name, "configured output came back");
             }
 
+            // A capture that fails is a warning once and debug until it works again:
+            // an output that has gone to sleep times out on every pass until it wakes.
             let frame = match capture.capture_output(name) {
-                Ok(frame) => frame,
+                Ok(frame) => {
+                    if failing.remove(name) {
+                        info!(output = %name, "capture works again");
+                    }
+
+                    frame
+                }
 
                 Err(e) => {
-                    warn!(output = %name, error = %e, "capture failed");
+                    if failing.insert(name.clone()) {
+                        warn!(output = %name, error = %e, "capture failed, retrying each pass");
+                    }
+                    else {
+                        debug!(output = %name, error = %e, "capture still failing");
+                    }
 
                     continue;
                 }
