@@ -1,33 +1,38 @@
 //! The gaze loop: a gaze source to filters to snap to overlay to click, scroll or warp.
 //!
-//! This runs on the main thread and owns the gaze source, the filter stack, the snap
-//! engine, the overlay handle and the injector. The perception thread feeds it element
-//! boxes through an [`ElementStore`], and with `--edge-scroll` a tree thread answers what
-//! scrolls under the gaze through a [`SurfaceCache`]; nothing else crosses a thread
-//! boundary.
+//! This runs on the caller's thread (the daemon's session thread, or the prototype's
+//! main thread) and owns the gaze source, the filter stack, the snap engine, the overlay
+//! handle and the injector. The perception thread feeds it element boxes through an
+//! [`ElementStore`], and a tree thread answers what scrolls under the gaze through a
+//! [`SurfaceCache`]; the owner reaches in through a [`Live`], polled once per sample.
+//! Nothing else crosses a thread boundary.
 //!
 //! Three buttons carry every control, on whichever device the active provider reads (see
-//! [`GazeSource`]): left commits, right exits, middle forces a redetect. With `--scroll`
-//! the wheel on that same device is the fourth control, and it does not commit anything:
-//! it routes the scroll to the window under the gaze point instead of the one under the
-//! pointer. With `--edge-scroll` the eyes alone scroll: a dwell in the lower or upper band
-//! of the surface being looked at moves it, and looking elsewhere stops it
-//! (`edge_scroll`). The eyes do one thing at a time: with a thumb on the pad or F14
-//! latched they point, and the scroller sees nothing; with the thumb up they scroll, and
-//! the overlay shows the band they are near as a faint zone instead of any control.
+//! [`GazeSource`]): left commits, right exits, middle forces a redetect. The eyes alone
+//! scroll: a dwell in the lower or upper band of the surface being looked at moves it,
+//! and looking elsewhere stops it (`edge_scroll`). The eyes do one thing at a time: with
+//! a thumb on the pad or F14 latched they point, and the scroller sees nothing; with the
+//! thumb up they scroll, and the overlay shows the band they are near as a faint zone
+//! instead of any control.
 //!
-//! With `--daydream` the controller is a second control source on top of the mouse, and
-//! the only one with a fine channel: a thumb on its pad captures the snap point (or the
-//! gaze point when nothing snapped), the wrist or thumb moves it, and the pad's click
-//! commits there instead of at the snap point (`daydream`, [`Refined`]).
+//! The Daydream controller, when one is paired, is a second control source on top of
+//! the mouse, and the only one with a fine channel: a thumb on its pad captures the snap
+//! point (or the gaze point when nothing snapped), the thumb moves it, and the pad's
+//! click commits there instead of at the snap point (`daydream`, [`Refined`]).
 //!
 //! # What reaches the real desktop
 //!
-//! `--dry-run` is the master off switch and gates all three of clicks, scrolls and warps.
-//! Without it, `--click` clicks, `--scroll` scrolls and warps, `--focus-follows-gaze`
-//! warps. Scrolling and warping are live by default when their flag is passed, because
-//! neither is a click: the worst case is a pointer somewhere the user did not ask for,
-//! which the next mouse move undoes.
+//! [`SessionConfig::click`] is the master switch. Off, there is no injector at all and
+//! commits, scrolls and warps are logged. On, all three are live: the warps and the
+//! edge scrolls are what carry the clicks to where they land, and nothing gaze-side
+//! moves the pointer except to borrow it for one of them and give it back.
+//!
+//! # While it runs
+//!
+//! The owner can pause it (nothing drawn or injected, the tracker still streaming),
+//! replace the tuning (the filter stack and snap engine are rebuilt, everything else
+//! takes its new parameters in place), ask for the offset to be forgotten, and stop it;
+//! it reports a [`Status`] in return. All through [`Live`].
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -35,31 +40,38 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use crossbeam_channel::{Receiver, TryRecvError};
+use gaze_config::{Mode, Status, Tuning};
 use gaze_core::{DesktopGeometry, Element, ElementKind, GazeSample, GlobalPx};
+use gaze_daydream::DaydreamError;
 use gaze_inject::{Button as InjectButton, Injector, Key};
-use gaze_overlay::{Overlay, OverlayState, Pointer, PointerStyle, Target, Zone};
+use gaze_overlay::{Overlay, OverlayState, Pointer, Target, Zone};
 use gaze_provider_et5::{ClickFeedback, ClickVia};
 use gaze_provider_synthetic::to_jsonl_line;
-use gaze_snap::{FilterStack, FixationState, Filtered, SnapEngine};
+use gaze_snap::{FixationState, Filtered, SnapEngine};
 use tracing::{debug, error, info, warn};
 
-use crate::cli::{Args, Provider};
-use crate::daydream::{Daydream, DaydreamConfig, parse_axes};
+use crate::config::{
+    DaydreamSpec, OverlayMode, SessionConfig, daydream_config, edge_params, engine_for, filter_for,
+    pointer_style,
+};
+use crate::daydream::{Daydream, DaydreamConfig};
 use crate::edge_scroll::{APPROACH_FRACTION, Action as EdgeAction, EdgeScroller, Eyes, Scrollable};
 use crate::feedback::{self, ClickFeed, Press};
 use crate::keys::LatchKeys;
+use crate::live::Live;
 use crate::perception::{ElementStore, Perception, PerceptionConfig};
 use crate::score::{Scoreboard, classify};
 use crate::source::{Control, GazeSource, Refine};
 use crate::surface::SurfaceCache;
 use crate::verify::{Verdict, Verifier};
-use crate::warp::{WARP_COOLDOWN, WarpReason, Warper};
+use crate::warp::{WarpReason, Warper};
 
 /// How far the filtered gaze point must move before the overlay is repainted. Below this
 /// the ring would jitter in place and cost a frame per sample for no visible change.
 const OVERLAY_MOVE_PX: f64 = 2.0;
 
-/// The near gate's closing distance as a multiple of its opening one (`--near-deg`).
+/// The near gate's closing distance as a multiple of its opening one (`near_deg`).
 const NEAR_HYSTERESIS: f64 = 1.5;
 
 /// Capture passes per second on the perception thread. Capture is ~35 ms per ultrawide, so
@@ -81,6 +93,31 @@ const RESUME_NEAR_PX: f64 = 24.0;
 /// The scroll zone's closing reach as a multiple of its opening one
 /// ([`APPROACH_FRACTION`] band heights), so its inner edge does not blink the zone.
 const ZONE_HYSTERESIS: f64 = 1.5;
+
+/// How long between attempts to open a paired controller that is asleep or away.
+const DAYDREAM_RETRY: Duration = Duration::from_secs(10);
+
+/// A paired controller, being opened, open, or given up on.
+///
+/// Opening blocks for the seconds BlueZ takes to connect, so it happens on a thread of
+/// its own and the loop polls for the result. A controller that is not paired at all is
+/// never retried: pairing is a ceremony, not something that happens while a session
+/// runs. One that is paired but asleep is retried every [`DAYDREAM_RETRY`] until Home
+/// wakes it.
+struct DaydreamSlot {
+    /// Which controller to open.
+    address  : Option<String>,
+    /// The mapping to open it with, kept current by the tuning.
+    config   : DaydreamConfig,
+    /// The open controller.
+    daydream : Option<Daydream>,
+    /// An attempt in flight.
+    pending  : Option<Receiver<Result<Daydream>>>,
+    /// When to try next; `None` means never.
+    retry_at : Option<Instant>,
+    /// Whether the first failure has been reported, so the retries stay at debug.
+    warned   : bool,
+}
 
 /// The fine channel's state: where the commit point is being moved from and by how much.
 #[derive(Clone, Copy, Debug)]
@@ -124,18 +161,17 @@ impl Refined {
     }
 }
 
-/// Runs a live session until the right mouse button, `--seconds`, or the sample stream
-/// ending.
-pub fn run(args: &Args) -> Result<()> {
+/// Runs a session until the exit button, the deadline, a stop through `live`, or the
+/// sample stream ending.
+pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
     // --- desk config ---
 
-    let text = std::fs::read_to_string(&args.config)
-        .with_context(|| format!("reading {}", args.config.display()))?;
+    let geometry   = &config.geometry;
+    let mut tuning = live.tuning();
 
-    let geometry = DesktopGeometry::from_toml(&text)
-        .with_context(|| format!("parsing {}", args.config.display()))?;
-
-    let model = args.noise_model(geometry.noise)?;
+    // Taken now so a change made before the loop started is not replayed on its first
+    // sample: everything below is built from `tuning` already.
+    let _ = live.take_tuning_change();
 
     // The recogniser watches the outputs the desk says to (`detect`), which on a desk
     // whose tracker reaches one panel is that panel; the rest stay in the geometry for
@@ -148,18 +184,14 @@ pub fn run(args: &Args) -> Result<()> {
         .collect();
 
     if outputs.is_empty() {
-        anyhow::bail!("{} has no enabled outputs with detect = true", args.config.display());
+        anyhow::bail!("the desk has no enabled outputs with detect = true");
     }
 
     info!(
         outputs        = ?outputs,
-        provider       = ?args.provider,
-        sigma_deg      = model.profile.sigma_deg,
-        rate_hz        = model.rate_hz,
-        commit_latency = args.commit_latency,
-        clicks         = args.click,
-        scroll         = args.scroll,
-        focus          = args.focus_follows_gaze,
+        source         = ?config.source,
+        commit_latency = tuning.commit_latency_s,
+        clicks         = config.click,
         "starting"
     );
 
@@ -170,9 +202,9 @@ pub fn run(args: &Args) -> Result<()> {
     let mut perception = Perception::spawn(
         PerceptionConfig {
             outputs            : outputs,
-            models_dir         : args.models.clone(),
-            redetect_threshold : args.redetect_threshold,
-            redetect_interval  : args.redetect_interval(),
+            models_dir         : config.models_dir.clone(),
+            redetect_threshold : tuning.redetect_threshold as f32,
+            redetect_interval  : Duration::from_secs_f64(tuning.redetect_interval_s.max(0.0)),
             period             : Duration::from_secs_f64(1.0 / PERCEPTION_HZ),
         },
         Arc::clone(&store),
@@ -180,29 +212,17 @@ pub fn run(args: &Args) -> Result<()> {
 
     // --- overlay ---
 
-    let (overlay, overlay_join) = Overlay::spawn_styled(PointerStyle {
-        settle_s : args.pointer_settle_s,
-        linger_s : args.pointer_linger_s,
-    })
-    .context("spawning the overlay")?;
+    let (overlay, overlay_join) = Overlay::spawn_styled(pointer_style(&tuning))
+        .context("spawning the overlay")?;
 
     // --- injector ---
 
     // Opened only when something is actually allowed to reach the real pointer. In a dry
-    // run there is no injector at all, so no tier can inject even by accident.
+    // run there is no injector at all, so nothing can inject even by accident.
     let mut injector = {
-        if args.injects() {
-            if args.click {
-                warn!("clicks are live: committed targets will be clicked for real");
-            }
-
-            if args.scroll || args.focus_follows_gaze || args.edge_scroll {
-                warn!("warps are live: the real pointer will move to the gaze point");
-            }
-
-            if args.edge_scroll {
-                warn!("edge scrolling is live: surfaces under a dwelling gaze will scroll for real");
-            }
+        if config.click {
+            warn!("clicks are live: committed targets will be clicked for real");
+            warn!("edge scrolling is live: surfaces under a dwelling gaze will scroll, and the pointer will be borrowed for it");
 
             Some(Injector::create().context("creating the uinput injector")?)
         }
@@ -215,79 +235,32 @@ pub fn run(args: &Args) -> Result<()> {
 
     // --- gaze source ---
 
-    let mut source = GazeSource::open(args, &geometry, model)?;
+    let mut source = GazeSource::open(&config.source, config.buttons.as_deref(), config.grab, geometry)?;
 
     // --- controller ---
 
-    let mut daydream = match args.daydream {
-        true => {
-            let config = DaydreamConfig {
-                mode             : args.refine,
-                gyro_gain_px_rad : args.refine_gyro_gain,
-                touch_gain_px    : args.refine_touch_gain,
-                axes             : parse_axes(&args.refine_axes).context("--refine-axes")?,
-            };
-
-            let daydream = Daydream::open(args.daydream_address.as_deref(), config)?;
-
-            info!(
-                address = daydream.address(),
-                refine  = ?args.refine,
-                "daydream controller: pad commits, Home exits, App holds push-to-talk, volume scrolls",
-            );
-
-            Some(daydream)
-        }
-
-        false => None,
-    };
+    let mut daydream = DaydreamSlot::new(&config.daydream, daydream_config(&tuning));
 
     // --- click feedback ---
 
-    // The real mouse is read when a source learns from its clicks, and when a controller
-    // shares the pointer with it and has to know when the hand is on the mouse. The feed
-    // stamps its own clock in the second case; nothing else reads those timestamps.
+    // The real mouse is read when a source learns from its clicks. The feed stamps
+    // the source's clock; nothing else reads those timestamps.
     let labels     = source.click_clock().is_some();
-    let mut clicks = feedback::open_if_useful(
-        source.click_clock().or_else(|| daydream.as_ref().map(|_| Instant::now())),
-    );
+    let mut clicks = feedback::open_if_useful(source.click_clock());
 
     // --- filters and snap ---
 
-    // The I-VT defaults (30 deg/s over 20 ms) assume tracker-class precision. A webcam
-    // source jitters ~1.5 deg per sample at 30 Hz, which reads as 60 deg/s and classifies
-    // every sample as a saccade, so the one-euro smoother never engages and the marker
-    // shows the raw jitter. Webcam mode measures velocity over a longer window and raises
-    // the threshold; explicit flags override either preset.
-    //
-    // The tracker's one-euro cutoff was 0.3 Hz, the gaze value from the literature, until
-    // 2026-09-09: inside a fixation that follows a drifting eye with a half-second lag,
-    // which read as weight. The overlay now smooths the dot on its own spring, so the
-    // stack's job is only to keep the snap point from jittering, and 1 Hz does that.
-    let (velocity_deg_s, window_s, min_cutoff_hz, beta) = match args.provider {
-        Provider::Webcam => (80.0, 0.10, 0.6, 0.02),
-        _                => (30.0, 0.02, 1.0, 0.30),
-    };
-    let mut filter = FilterStack::create()
-        .scale(Box::new(geometry.clone()))
-        .velocity_threshold_deg_s(args.filter_velocity_deg_s.unwrap_or(velocity_deg_s))
-        .window_s(args.filter_window_s.unwrap_or(window_s))
-        .one_euro(args.filter_min_cutoff_hz.unwrap_or(min_cutoff_hz), args.filter_beta.unwrap_or(beta))
-        .build();
-
-    let mut engine = SnapEngine::create()
-        .scale(Box::new(geometry.clone()))
-        .radius_deg(args.snap_deg)
-        .build();
+    let mut filter = filter_for(geometry, &tuning);
+    let mut engine = engine_for(geometry, &tuning);
 
     // --- overlay arming ---
 
     // The pointer look shows while a thumb rests on the pad or the latch is on; F14
     // toggles the latch. Without a readable keyboard the pad is the only switch, which
     // is logged rather than fatal: the session is no worse off than with no latch key.
-    let mut latch_keys = match args.overlay_always {
-        true  => None,
-        false => match LatchKeys::open() {
+    let mut latch_keys = match config.overlay {
+        OverlayMode::Always => None,
+        _                   => match LatchKeys::open() {
             Ok(keys) => {
                 info!(nodes = keys.paths().len(), "overlay latch: F14 toggles the pointer look");
 
@@ -304,22 +277,19 @@ pub fn run(args: &Args) -> Result<()> {
     // --- a11y verdicts ---
 
     // What the application says the eyes are on, for the pointer look; its own tree
-    // thread, since the edge scroller's exists only with `--edge-scroll`.
-    let mut verifier = (!args.no_a11y).then(Verifier::spawn);
+    // thread, separate from the edge scroller's.
+    let mut verifier = Verifier::spawn();
 
     // --- edge scrolling ---
 
-    // The scroller and its surface cache exist only when asked for: the cache owns an
-    // accessibility tree thread, which nothing else in this loop needs.
-    let mut edge = args.edge_scroll.then(|| {
-        info!(params = ?args.edge_params(), "edge scrolling on");
+    info!(params = ?edge_params(&tuning), "edge scrolling on");
 
-        (EdgeScroller::new(args.edge_params()), SurfaceCache::spawn())
-    });
+    let mut scroller = EdgeScroller::new(edge_params(&tuning));
+    let mut surfaces = SurfaceCache::spawn();
 
     // --- recording ---
 
-    let mut record = args
+    let mut record = config
         .record
         .as_ref()
         .map(|path| -> Result<_> {
@@ -336,13 +306,10 @@ pub fn run(args: &Args) -> Result<()> {
     let mut last_gen = store.generation();
 
     let mut board       = Scoreboard::default();
-    let mut warper      = Warper::new(args.scroll_warp_deg, WARP_COOLDOWN);
+    let mut warper      = Warper::new();
     let mut last_gaze   : Option<GlobalPx>   = None;
     let mut last_target : Option<u64>        = None;
     let mut last_sample : Option<GazeSample> = None;
-    // `since_s` of the fixation focus-follows-gaze has already warped for, so one dwell
-    // warps once however long the user keeps looking.
-    let mut focus_done  : Option<f64>        = None;
     // Whether the highlight is hidden: during a scroll, and after one until the perception
     // thread has published a detection newer than the scroll, because until then every
     // box is where the content was.
@@ -380,14 +347,52 @@ pub fn run(args: &Args) -> Result<()> {
     let mut perceiving  = true;
     // Whether push-to-talk is forwarded down right now, so an exit mid-hold releases it.
     let mut ptt_down    = false;
+    // Whether the owner has paused the session, as of the last sample.
+    let mut paused      = false;
     let mut samples     = 0u64;
     let mut reason      = "the provider stopped";
 
     let started      = Instant::now();
     let cpu_at_start = cpu_seconds();
-    let deadline     = args.seconds.map(|s| started + Duration::from_secs_f64(s));
+    let deadline     = config.seconds.map(|s| started + Duration::from_secs_f64(s));
 
     'session: loop {
+        if live.stopped() {
+            reason = "a stop request";
+
+            break;
+        }
+
+        // A tuning change rebuilds what is built from it and hands the rest their new
+        // parameters. The filter and the engine start cold, which costs one fixation.
+        if let Some(t) = live.take_tuning_change() {
+            info!("tuning changed, applying it");
+
+            filter = filter_for(geometry, &t);
+            engine = engine_for(geometry, &t);
+
+            scroller.set_params(edge_params(&t));
+            daydream.set_config(daydream_config(&t));
+            perception.set_redetect(
+                t.redetect_threshold as f32,
+                Duration::from_secs_f64(t.redetect_interval_s.max(0.0)),
+            );
+
+            if let Err(e) = overlay.set_style(pointer_style(&t)) {
+                warn!(error = %e, "overlay did not take the new style");
+            }
+
+            tuning = t;
+        }
+
+        if live.take_reset_offset() {
+            source.reset_offset();
+        }
+
+        // A paired controller that was asleep may have woken; a connect that finished
+        // lands here.
+        daydream.poll();
+
         // Only touch the lock when the perception thread published something new.
         let generation = store.generation();
 
@@ -413,7 +418,7 @@ pub fn run(args: &Args) -> Result<()> {
         let mut controls = source.controls();
         let mouse_n      = controls.len();
 
-        if let Some(daydream) = daydream.as_mut() {
+        if let Some(daydream) = daydream.daydream.as_mut() {
             controls.extend(daydream.controls());
         }
 
@@ -452,10 +457,10 @@ pub fn run(args: &Args) -> Result<()> {
                         &mut engine,
                         source.truth(),
                         &elements,
-                        if args.click { injector.as_mut() } else { None },
+                        if paused { None } else { injector.as_mut() },
                         &mut board,
                         last_sample,
-                        args.commit_latency,
+                        tuning.commit_latency_s,
                         at,
                         button,
                     );
@@ -550,12 +555,12 @@ pub fn run(args: &Args) -> Result<()> {
                     {
                         // Boxed around the anchor before the desk clamp: gaze put the
                         // point close, and the fine channel only covers the residual.
-                        let half = args.refine_range / 2.0;
+                        let half = tuning.refine_range_px / 2.0;
 
                         r.dx_px = (r.dx_px + dx_px).clamp(-half, half);
                         r.dy_px = (r.dy_px + dy_px).clamp(-half, half);
 
-                        let point = clamp_to_desk(&geometry, r.point());
+                        let point = clamp_to_desk(geometry, r.point());
 
                         r.dx_px = point.x - r.anchor.x;
                         r.dy_px = point.y - r.anchor.y;
@@ -629,17 +634,7 @@ pub fn run(args: &Args) -> Result<()> {
                 }
 
                 Control::Wheel(detents) => {
-                    if args.scroll {
-                        scroll_under_gaze(
-                            &geometry,
-                            &mut warper,
-                            injector.as_mut(),
-                            last_gaze,
-                            last_sample.map(|s| s.sigma_deg).unwrap_or(f64::NAN),
-                            detents,
-                            source.grabbed(),
-                        );
-                    }
+                    wheel(injector.as_mut(), &warper, detents, source.grabbed());
                 }
             }
         }
@@ -647,7 +642,7 @@ pub fn run(args: &Args) -> Result<()> {
         if let Some(deadline) = deadline
             && Instant::now() >= deadline
         {
-            reason = "--seconds";
+            reason = "the deadline";
 
             break;
         }
@@ -680,66 +675,66 @@ pub fn run(args: &Args) -> Result<()> {
         // filter still runs so the fixation state is current when the lock lifts.
         let locked = refined.is_some_and(|r| r.engaged);
 
+        // Paused: the eyes neither point nor scroll. The thumb and the latch are still
+        // tracked so a resume picks up where they are.
+        paused = live.paused();
+
         // Thumb down or latched: the eyes are pointing. Thumb up: they are reading, and
         // may scroll. One or the other, never both, so a scroll never fights a refine
         // and a control in the band never holds a scroll off.
-        let input = pad_down || latched;
+        let input = (pad_down || latched) && !paused;
 
         // Edge scrolling first: a scroll decides whether the snap engine may retarget at
         // all this sample, and a scroll that starts here takes the highlight down with it.
-        let (scrolling, zone) = match edge.as_mut() {
-            Some((scroller, surfaces)) => {
-                let was               = scroller.scrolling();
-                let quiet             = input;
-                let (stopped, surface) = edge_scroll(
-                    scroller,
-                    surfaces,
-                    &mut warper,
-                    injector.as_mut(),
-                    &geometry,
-                    &filtered,
-                    gaze,
-                    quiet,
-                    &mut parked,
-                );
+        let (scrolling, zone) = {
+            let was                = scroller.scrolling();
+            let quiet              = input || paused;
+            let (stopped, surface) = edge_scroll(
+                &mut scroller,
+                &mut surfaces,
+                &mut warper,
+                injector.as_mut(),
+                geometry,
+                &filtered,
+                gaze,
+                quiet,
+                &mut parked,
+            );
 
-                if scroller.scrolling() && !was {
-                    retarget_block = Some(filtered.sample.t_s);
-                    engine.reset();
-                }
-
-                if stopped {
-                    // The content moved; every box under it is stale until the output is
-                    // detected again. Ask for that output first, and hide the highlight
-                    // until the answer lands.
-                    match gaze.and_then(|g| output_at(&geometry, g)) {
-                        Some(name) => perception.force_redetect_output(name),
-                        None       => perception.force_redetect(),
-                    }
-
-                    surfaces.invalidate();
-                    stale_gen      = Some(store.generation());
-                    // Fixations begun while the content moved do not count as aiming.
-                    retarget_block = Some(filtered.sample.t_s);
-                }
-
-                // The band the eyes are in or approaching, for the overlay. It opens on
-                // a fixation only, like the dot, and closes at 1.5x the reach it opened
-                // at; a running scroll keeps it up whatever the eyes do.
-                let reach = match last_zone {
-                    Some(_) => APPROACH_FRACTION * ZONE_HYSTERESIS,
-                    None    => APPROACH_FRACTION,
-                };
-                let settled = matches!(filtered.state, FixationState::Fixating { .. });
-                let zone    = surface
-                    .filter(|_| scroller.scrolling() || last_zone.is_some() || settled)
-                    .and_then(|s| scroller.near_band(gaze, &s, reach))
-                    .map(|(_, rect)| Zone { rect: rect, active: scroller.scrolling() });
-
-                (scroller.scrolling(), zone)
+            if scroller.scrolling() && !was {
+                retarget_block = Some(filtered.sample.t_s);
+                engine.reset();
             }
 
-            None => (false, None),
+            if stopped {
+                // The content moved; every box under it is stale until the output is
+                // detected again. Ask for that output first, and hide the highlight
+                // until the answer lands.
+                match gaze.and_then(|g| output_at(geometry, g)) {
+                    Some(name) => perception.force_redetect_output(name),
+                    None       => perception.force_redetect(),
+                }
+
+                surfaces.invalidate();
+                stale_gen      = Some(store.generation());
+                // Fixations begun while the content moved do not count as aiming.
+                retarget_block = Some(filtered.sample.t_s);
+            }
+
+            // The band the eyes are in or approaching, for the overlay. It opens on
+            // a fixation only, like the dot, and closes at 1.5x the reach it opened
+            // at; a running scroll keeps it up whatever the eyes do.
+            let reach = match last_zone {
+                Some(_) => APPROACH_FRACTION * ZONE_HYSTERESIS,
+                None    => APPROACH_FRACTION,
+            };
+            let settled = matches!(filtered.state, FixationState::Fixating { .. });
+            let zone    = surface
+                .filter(|_| scroller.scrolling() || last_zone.is_some() || settled)
+                .and_then(|s| scroller.near_band(gaze, &s, reach))
+                .map(|(_, rect)| Zone { rect: rect, active: scroller.scrolling() });
+
+            (scroller.scrolling(), zone)
         };
 
         // Retargeting needs the eyes to have moved: a fixation that began after the scroll
@@ -788,7 +783,7 @@ pub fn run(args: &Args) -> Result<()> {
         // the detector has caught up with it, since every box is where the content was;
         // the dot is drawn where the fine channel has moved the commit point while a
         // thumb is on the pad, and at the gaze otherwise. Both are gated on the gaze
-        // being within `--near-deg` of the element: the engine will snap from further
+        // being within `near_deg` of the element: the engine will snap from further
         // out than that, but a highlight on an element the eyes are nowhere near reads
         // as the overlay guessing, not the eyes aiming.
         //
@@ -796,13 +791,13 @@ pub fn run(args: &Args) -> Result<()> {
         // marked with its own box, and text it names is not marked whatever the
         // recogniser called it.
         let aim   = target.as_ref().map(|t| t.point).or(gaze);
-        let armed = args.overlay_always || input;
+        let armed = (config.overlay == OverlayMode::Always && !paused) || input;
 
         // The detector runs only while its boxes can be wanted: the eyes are pointing,
         // or nothing on this desk can say when they are (no controller, no latch key).
         // Resuming asks for the output under the gaze first, so the thumb landing sees
         // fresh boxes within one detection rather than a full pass.
-        let want_boxes = armed || (daydream.is_none() && latch_keys.is_none());
+        let want_boxes = armed || (!paused && daydream.daydream.is_none() && latch_keys.is_none());
 
         if want_boxes != perceiving {
             perceiving = want_boxes;
@@ -810,7 +805,7 @@ pub fn run(args: &Args) -> Result<()> {
             perception.set_paused(!perceiving);
 
             if perceiving {
-                match gaze.and_then(|g| output_at(&geometry, g)) {
+                match gaze.and_then(|g| output_at(geometry, g)) {
                     Some(name) => perception.force_redetect_output(name),
                     None       => perception.force_redetect(),
                 }
@@ -819,10 +814,10 @@ pub fn run(args: &Args) -> Result<()> {
             debug!(on = perceiving, "perception");
         }
 
-        if let Some(v) = verifier.as_mut() {
+        {
             let settled = matches!(filtered.state, FixationState::Fixating { .. });
 
-            v.update(aim.filter(|_| armed && settled && !locked));
+            verifier.update(aim.filter(|_| armed && settled && !locked));
         }
 
         // Unarmed, no control is marked: the eyes are reading, and a highlight the user
@@ -832,23 +827,17 @@ pub fn run(args: &Args) -> Result<()> {
         // is seen coming.
         let pointer = gaze.filter(|_| armed || zone.is_some()).map(|g| {
             let refining = refined.filter(|r| r.engaged);
-            // Hysteresis on the near gate: it opens at `--near-deg` and closes at half
+            // Hysteresis on the near gate: it opens at `near_deg` and closes at half
             // as much again, so a gaze sitting at the edge does not flicker the dot.
             let reach    = match last_pointer {
-                Some((true, _)) => args.near_deg * NEAR_HYSTERESIS,
-                _               => args.near_deg,
+                Some((true, _)) => tuning.near_deg * NEAR_HYSTERESIS,
+                _               => tuning.near_deg,
             };
             let close    = |c: &gaze_snap::Candidate| {
-                c.distance_deg <= reach && worth_marking(&elements[c.index], args)
+                c.distance_deg <= reach && worth_marking(&elements[c.index], &tuning)
             };
-            let verdict  = match (&verifier, aim) {
-                (Some(v), Some(p)) => v.verdict(p),
-                _                  => Verdict::Unknown,
-            };
-            let holding  = match (&verifier, aim) {
-                (Some(v), Some(p)) => v.holding(p),
-                _                  => false,
-            };
+            let verdict  = aim.map_or(Verdict::Unknown, |p| verifier.verdict(p));
+            let holding  = aim.is_some_and(|p| verifier.holding(p));
 
             let (near, target) = match verdict {
                 _ if !armed                       => (false, None),
@@ -918,13 +907,13 @@ pub fn run(args: &Args) -> Result<()> {
             || zone != last_zone
         {
             let state = {
-                if args.overlay_debug {
+                if config.overlay == OverlayMode::Debug {
                     // A highlight flickering across moving text, or parked on where text
                     // used to be, is noise; the label says what is happening instead.
                     OverlayState {
                         gaze       : gaze,
                         highlight  : target.as_ref().filter(|_| !hidden).map(|t| t.element.bbox),
-                        truth      : if args.show_truth { source.truth() } else { None },
+                        truth      : if config.show_truth { source.truth() } else { None },
                         label      : Some(match (scrolling, hidden, retarget_block) {
                             _ if refined.is_some_and(|r| r.engaged) => "refine".to_string(),
                             (true, _, _)        => "edge scroll".to_string(),
@@ -940,7 +929,7 @@ pub fn run(args: &Args) -> Result<()> {
                     OverlayState {
                         gaze       : None,
                         highlight  : None,
-                        truth      : if args.show_truth { source.truth() } else { None },
+                        truth      : if config.show_truth { source.truth() } else { None },
                         label      : None,
                         background : None,
                         pointer    : pointer,
@@ -963,29 +952,12 @@ pub fn run(args: &Args) -> Result<()> {
             last_target = target_id;
         }
 
-        // Tracked every sample, not just on repaint: the scroll tier reads this the moment
-        // a wheel event arrives and wants the newest point, not the last one drawn.
+        // Tracked every sample, not just on repaint: a refine anchors on this the moment
+        // the thumb lands and wants the newest point, not the last one drawn.
         last_gaze = gaze;
 
-        // Focus-follows-gaze: one warp per dwell, and only when the eyes are on an output
-        // the pointer is not.
-        if args.focus_follows_gaze
-            && !locked
-            && let FixationState::Fixating { since_s } = filtered.state
-            && filtered.sample.t_s - since_s >= args.focus_dwell_s
-            && focus_done != Some(since_s)
-            && let Some(gaze) = gaze
-            && focus_warp(
-                &geometry,
-                &mut warper,
-                injector.as_mut(),
-                gaze,
-                filtered.sample.sigma_deg,
-                filtered.sample.t_s - since_s,
-            )
-        {
-            focus_done = Some(since_s);
-        }
+        // What the owner sees. Stored only on a change, so this is a compare per sample.
+        live.set_status(status_of(&source, &daydream, paused, input, scrolling));
     }
 
     // --- shutdown ---
@@ -1015,10 +987,7 @@ pub fn run(args: &Args) -> Result<()> {
     }
 
     source.stop();
-
-    if let Some(daydream) = daydream.as_mut() {
-        daydream.stop();
-    }
+    daydream.stop();
 
     overlay.stop();
 
@@ -1048,17 +1017,16 @@ pub fn run(args: &Args) -> Result<()> {
         misses          = board.misses,
         hit_rate        = board.hit_rate(),
         mean_latency_ms = board.mean_latency_s() * 1000.0,
-        scrolls         = warper.scrolls(),
         warps           = warper.warps(),
-        edge_starts     = edge.as_ref().map(|(e, _)| e.starts),
-        edge_units      = edge.as_ref().map(|(e, _)| e.units),
-        surfaces_asked  = edge.as_ref().map(|(_, s)| s.asked),
-        surfaces_found  = edge.as_ref().map(|(_, s)| s.found),
-        a11y_asked      = verifier.as_ref().map(|v| v.asked),
-        a11y_controls   = verifier.as_ref().map(|v| v.controls),
-        a11y_statics    = verifier.as_ref().map(|v| v.statics),
-        a11y_empty      = verifier.as_ref().map(|v| v.empty),
-        daydream_reports = daydream.as_ref().map(|d| d.reports),
+        edge_starts     = scroller.starts,
+        edge_units      = scroller.units,
+        surfaces_asked  = surfaces.asked,
+        surfaces_found  = surfaces.found,
+        a11y_asked      = verifier.asked,
+        a11y_controls   = verifier.controls,
+        a11y_statics    = verifier.statics,
+        a11y_empty      = verifier.empty,
+        daydream_reports = daydream.daydream.as_ref().map(|d| d.reports),
         cpu_percent     = ?cpu_percent,
         "session summary"
     );
@@ -1243,90 +1211,36 @@ fn log_click_feedback(via: &str, px: GlobalPx, feedback: Option<ClickFeedback>) 
 
 // --- Scroll and warp ---
 
-/// Routes one wheel event to the window under the gaze point.
+/// Injects one wheel event from the controller's volume keys at the pointer, wherever it
+/// is. No warp: with the thumb up the pointer is the user's, and a wheel where it sits
+/// is what a wheel on the mouse would do.
 ///
-/// Warps the pointer to the gaze point first when gaze is far enough away and the warp
-/// policy allows it, then scrolls. What "then scrolls" means depends on `grabbed`:
-///
-/// * On the grabbed device the compositor never saw the wheel, so the scroll has to be
-///   injected here or it is simply lost.
-/// * On an un-grabbed device (`--no-grab`) the compositor is already delivering the user's
-///   own wheel, so this only warps and lets that delivery land on the newly-pointed window.
-///   Injecting as well would scroll twice. The first detent of a burst still lands on the
-///   old window there, because the warp cannot happen before an event that has already been
-///   dispatched. Grabbing is the default precisely because it has no such gap.
-fn scroll_under_gaze(
-    geometry  : &DesktopGeometry,
-    warper    : &mut Warper,
-    injector  : Option<&mut Injector>,
-    gaze      : Option<GlobalPx>,
-    sigma_deg : f64,
-    detents   : i32,
-    grabbed   : bool,
-)
-{
-    warper.record_scroll();
-
-    let now = Instant::now();
+/// `grabbed` is whether the device the event came from is grabbed; it never is for the
+/// controller, so this is only kept honest for a grabbed mouse's wheel, which the
+/// compositor never saw and which therefore has to be re-injected here.
+fn wheel(injector: Option<&mut Injector>, warper: &Warper, detents: i32, grabbed: bool) {
     let mut injector = injector;
 
-    let pointer = pointer_position(injector.as_deref_mut(), warper);
-
-    // Both angles are `None` when the point is off every panel or unknown, which the warp
-    // policy reads as "far away".
-    let gap_deg = gaze.zip(pointer)
-        .and_then(|(gaze, pointer)| geometry.angle_between_deg(geometry.eye(), pointer, gaze));
-
-    let moved_deg = gaze.zip(warper.last_point())
-        .and_then(|(gaze, last)| geometry.angle_between_deg(geometry.eye(), last, gaze));
-
-    let warped = {
-        if let Some(gaze) = gaze
-            && warper.should_warp(now, gap_deg, moved_deg)
-        {
-            do_warp(injector.as_deref_mut(), warper, gaze, sigma_deg, gap_deg, WarpReason::Scroll, now)
-        }
-        else {
-            false
-        }
-    };
-
-    // After a warp the pointer is at the gaze point. Without one it is wherever it already
-    // was, and only gaze is left if nothing can say where that is.
-    let Some(point) = (if warped { gaze } else { pointer.or(gaze) }) else {
-        debug!(detents = detents, "wheel with no gaze point and no known pointer, dropped");
+    let Some(point) = pointer_position(injector.as_deref_mut(), warper) else {
+        debug!(detents = detents, "wheel with no known pointer position, dropped");
 
         return;
     };
 
-    match (grabbed, injector) {
-        (true, Some(injector)) => {
-            match injector.scroll(point, detents) {
-                Ok(())  => {}
-                Err(e)  => error!(error = %e, "scroll injection failed"),
+    match injector {
+        Some(injector) => {
+            if let Err(e) = injector.scroll(point, detents) {
+                error!(error = %e, "scroll injection failed");
             }
         }
 
-        (true, None) => {
+        None => {
             info!(
-                x         = %format_args!("{:.0}", point.x),
-                y         = %format_args!("{:.0}", point.y),
-                detents   = detents,
-                sigma_deg = sigma_deg,
-                warped    = warped,
-                "dry run: would scroll here"
-            );
-        }
-
-        // The compositor already has the user's own wheel event; the warp above is this
-        // tier's whole contribution.
-        (false, _) => {
-            debug!(
                 x       = %format_args!("{:.0}", point.x),
                 y       = %format_args!("{:.0}", point.y),
                 detents = detents,
-                warped  = warped,
-                "wheel passed through to the compositor"
+                grabbed = grabbed,
+                "dry run: would scroll here"
             );
         }
     }
@@ -1469,54 +1383,6 @@ fn edge_scroll(
     (stopped, surface)
 }
 
-/// Warps the pointer to a dwelled-on gaze point when that point is on a different output
-/// than the pointer.
-///
-/// Cross-output only, deliberately: within one output the pointer is already close enough
-/// that moving it buys nothing and costs the user their place, while crossing outputs is
-/// what drags keyboard focus along on a focus-follows-mouse desktop. Returns whether it
-/// warped, which is what stops one dwell from warping twice.
-fn focus_warp(
-    geometry  : &DesktopGeometry,
-    warper    : &mut Warper,
-    injector  : Option<&mut Injector>,
-    gaze      : GlobalPx,
-    sigma_deg : f64,
-    dwell_s   : f64,
-)
-    -> bool
-{
-    let mut injector = injector;
-
-    let pointer = pointer_position(injector.as_deref_mut(), warper);
-
-    let Some(gaze_output) = output_at(geometry, gaze) else {
-        return false;
-    };
-
-    // An unknown pointer output (off every panel, or nothing has reported one yet) counts
-    // as different: bringing the pointer onto the output being looked at is right either
-    // way.
-    if pointer.and_then(|p| output_at(geometry, p)) == Some(gaze_output) {
-        return false;
-    }
-
-    let gap_deg = pointer
-        .and_then(|pointer| geometry.angle_between_deg(geometry.eye(), pointer, gaze));
-
-    debug!(output = gaze_output, dwell_s = dwell_s, "focus dwell on another output");
-
-    do_warp(
-        injector,
-        warper,
-        gaze,
-        sigma_deg,
-        gap_deg,
-        WarpReason::Focus,
-        Instant::now(),
-    )
-}
-
 /// Moves the pointer to `point`, or logs the move in a dry run, and records it either way.
 ///
 /// Returns whether the warp counted. A failed injection does not: the pointer did not
@@ -1612,6 +1478,162 @@ fn output_at(geometry: &DesktopGeometry, p: GlobalPx) -> Option<&str> {
         .map(|output| output.name.as_str())
 }
 
+// --- Status ---
+
+/// What the owner is told, from what the loop knows this sample.
+fn status_of(
+    source    : &GazeSource,
+    daydream  : &DaydreamSlot,
+    paused    : bool,
+    input     : bool,
+    scrolling : bool,
+)
+    -> Status
+{
+    let tracker = source.connected();
+    let offset  = source.offset_summary();
+
+    let mode = match (tracker, paused, scrolling, input) {
+        (false, _, _, _)   => Mode::NoTracker,
+        (_, true, _, _)    => Mode::Paused,
+        (_, _, true, _)    => Mode::Scrolling,
+        (_, _, _, true)    => Mode::Pointing,
+        _                  => Mode::Reading,
+    };
+
+    Status {
+        tracker          : tracker,
+        calibrated       : source.calibrated(),
+        model            : source.has_model(),
+        controller       : daydream.daydream.as_ref().is_some_and(Daydream::connected),
+        paused           : paused,
+        mode             : mode,
+        offset_updates   : offset.map_or(0, |o| o.updates),
+        offset_jumps     : offset.map_or(0, |o| o.jumps),
+        offset_yaw_deg   : offset.map_or(0.0, |o| o.global_deg[0]),
+        offset_pitch_deg : offset.map_or(0.0, |o| o.global_deg[1]),
+    }
+}
+
+// --- DaydreamSlot ---
+
+impl DaydreamSlot {
+    /// A slot for the controller `spec` names, due to be opened on the first poll.
+    fn new(spec: &DaydreamSpec, config: DaydreamConfig) -> DaydreamSlot {
+        let (address, retry_at) = match spec {
+            DaydreamSpec::Off              => (None, None),
+            DaydreamSpec::Auto             => (None, Some(Instant::now())),
+            DaydreamSpec::Address(address) => (Some(address.clone()), Some(Instant::now())),
+        };
+
+        DaydreamSlot {
+            address  : address,
+            config   : config,
+            daydream : None,
+            pending  : None,
+            retry_at : retry_at,
+            warned   : false,
+        }
+    }
+
+    /// Collects a finished attempt, and starts one when it is due. Never blocks.
+    fn poll(&mut self) {
+        if self.daydream.is_some() {
+            return;
+        }
+
+        if let Some(rx) = &self.pending {
+            match rx.try_recv() {
+                Ok(Ok(daydream)) => {
+                    info!(
+                        address = daydream.address(),
+                        "daydream controller: pad commits, Home exits, App holds push-to-talk, volume scrolls",
+                    );
+
+                    self.daydream = Some(daydream);
+                    self.pending  = None;
+                    self.retry_at = None;
+                }
+
+                Ok(Err(e)) => {
+                    self.pending = None;
+
+                    // Not paired is a ceremony away, not a retry away.
+                    let not_paired = e.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<DaydreamError>()
+                            .is_some_and(|d| matches!(d, DaydreamError::NotPaired { .. }))
+                    });
+
+                    if not_paired {
+                        info!("no daydream controller is paired; the mouse and the latch are the controls");
+
+                        self.retry_at = None;
+                    }
+                    else {
+                        if !self.warned {
+                            warn!(error = %format_args!("{e:#}"), retry_s = DAYDREAM_RETRY.as_secs(), "daydream controller not opened, retrying");
+                        }
+                        else {
+                            debug!(error = %format_args!("{e:#}"), "daydream controller still not opened");
+                        }
+
+                        self.warned   = true;
+                        self.retry_at = Some(Instant::now() + DAYDREAM_RETRY);
+                    }
+                }
+
+                Err(TryRecvError::Empty)        => {}
+                Err(TryRecvError::Disconnected) => {
+                    // The opener panicked; treat it as a failure worth retrying.
+                    self.pending  = None;
+                    self.retry_at = Some(Instant::now() + DAYDREAM_RETRY);
+                }
+            }
+
+            return;
+        }
+
+        if self.retry_at.is_some_and(|at| Instant::now() >= at) {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let address  = self.address.clone();
+            let config   = self.config;
+
+            let spawned = std::thread::Builder::new()
+                .name("gaze-daydream-open".to_string())
+                .spawn(move || {
+                    let _ = tx.send(Daydream::open(address.as_deref(), config));
+                });
+
+            match spawned {
+                Ok(_)  => self.pending = Some(rx),
+                Err(e) => {
+                    warn!(error = %e, "could not spawn the daydream opener");
+
+                    self.retry_at = Some(Instant::now() + DAYDREAM_RETRY);
+                }
+            }
+        }
+    }
+
+    /// Replaces the mapping's tunables, for the open controller and any opened later.
+    fn set_config(&mut self, config: DaydreamConfig) {
+        self.config = config;
+
+        if let Some(daydream) = self.daydream.as_mut() {
+            daydream.set_config(config);
+        }
+    }
+
+    /// Stops the open controller. An attempt in flight finishes on its own thread and
+    /// its result is dropped with the slot.
+    fn stop(&mut self) {
+        if let Some(daydream) = self.daydream.as_mut() {
+            daydream.stop();
+        }
+    }
+}
+
 // --- Helpers ---
 
 /// Builds the overlay caption. The overlay's built in font is 5x7 printable ASCII, so this
@@ -1655,9 +1677,9 @@ fn log_candidates(engine: &SnapEngine, elements: &[Element], gaze: Option<Global
 /// asked for, because most text on a screen is being read, not aimed at, and marking it
 /// is exactly the distraction the pointer look exists to avoid. The snap engine still
 /// targets whatever it targets; this only decides what is drawn.
-fn worth_marking(element: &Element, args: &Args) -> bool {
+fn worth_marking(element: &Element, tuning: &Tuning) -> bool {
     match element.kind {
-        ElementKind::Text    => args.highlight_text,
+        ElementKind::Text    => tuning.highlight_text,
         ElementKind::Unknown => false,
         _                    => true,
     }
@@ -1736,8 +1758,8 @@ mod tests {
         }
     }
 
-    /// Focus-follows-gaze compares output names, so a disabled output must not be one:
-    /// warping onto a panel the session is not watching would strand the pointer there.
+    /// Output names decide which output a redetect is asked for, so a disabled output
+    /// must not be one: nothing is watching it.
     #[test]
     fn output_at_finds_enabled_outputs_only() {
         let geometry = desk();

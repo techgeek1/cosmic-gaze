@@ -1,10 +1,10 @@
-//! Live phase 0 loop: a grabbed mouse becomes synthetic gaze, the gaze snaps to detected
-//! UI boxes, the overlay shows where it landed, and the mouse's own buttons commit, exit,
-//! and force a redetect. See `PLAN.md`'s gaze-proto contract.
+//! The dev harness: the session loop from flags, with every provider and the debug look.
+//! The daemon runs the same loop from the stored config; see `gazed`.
 
 use anyhow::Result;
 use clap::Parser;
 use gaze_proto::cli::Args;
+use gaze_proto::live::Live;
 use gaze_proto::session;
 use tracing_subscriber::EnvFilter;
 
@@ -15,5 +15,7 @@ fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
-    session::run(&Args::parse())
+    let args = Args::parse();
+
+    session::run(&args.session()?, &Live::new(args.tuning()?))
 }

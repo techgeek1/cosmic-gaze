@@ -17,6 +17,7 @@ gaze-provider-et5       = { workspace = true }
 gaze-clicks             = { workspace = true }
 gaze-a11y               = { workspace = true }
 gaze-daydream           = { workspace = true }
+gaze-config             = { workspace = true }
 
 anyhow             = { workspace = true }
 clap               = { workspace = true }

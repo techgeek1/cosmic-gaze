@@ -50,5 +50,5 @@ pub use flywheel::{ClickRecord, ClickVia, FlywheelLog};
 pub use gaze::Et5Frame;
 pub use model::{Features, ResidualModel};
 pub use offset::{ClickFeedback, OffsetParams, OnlineOffset};
-pub use provider::Et5Provider;
+pub use provider::{Et5Provider, OffsetSummary};
 pub use ttp::{DisplayArea, DisplayRect};

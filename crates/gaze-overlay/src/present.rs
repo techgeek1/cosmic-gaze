@@ -177,6 +177,12 @@ impl Presenter {
         self.theme = theme;
     }
 
+    /// Replaces the tunables. The spring's next step uses the new settle time; a linger
+    /// already running is measured against the new one.
+    pub fn set_style(&mut self, style: PointerStyle) {
+        self.style = style;
+    }
+
     /// The theme in use.
     pub fn theme(&self) -> &Theme {
         &self.theme

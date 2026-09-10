@@ -6,17 +6,16 @@
 //!
 //! * `synthetic` grabs the Lenovo mouse, so its buttons and wheel are already the
 //!   provider's own events and nothing else can see them.
-//! * `webcam` and `replay` have no input device of their own, so the controls come from a
-//!   [`ButtonSource`] on that same mouse, which grabs it as well unless `--no-grab` says
-//!   otherwise.
+//! * `webcam`, `et5` and `replay` have no input device of their own, so the controls come
+//!   from a [`ButtonSource`] on that same mouse when one is asked for, which grabs it as
+//!   well unless told not to. The daemon asks for none: the controller commits.
 //!
-//! [`GazeSource`] is an enum rather than a trait object because the three shapes differ in
-//! more than behaviour: only the synthetic one has a ground-truth point to score against,
-//! only the webcam one has a socket whose health is worth reporting, and whether the wheel
-//! is owned exclusively (which decides whether the scroll tier re-injects it or only warps
-//! ahead of it) varies per run rather than per variant.
+//! [`GazeSource`] is an enum rather than a trait object because the shapes differ in more
+//! than behaviour: only the synthetic one has a ground-truth point to score against, only
+//! the webcam one has a socket whose health is worth reporting, and only the ET5 one
+//! learns from clicks and has a link that can drop.
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Instant;
 use anyhow::{Context, Result};
 use gaze_core::{DesktopGeometry, GazeSample, GlobalPx, NoiseModel};
@@ -27,21 +26,12 @@ use gaze_provider_synthetic::{
     ReplayProvider,
     SyntheticProvider,
 };
-use gaze_provider_et5::{ClickFeedback, ClickVia, Et5Calibration, Et5Provider, OffsetParams, ResidualModel};
-use gaze_provider_webcam::{CameraPose, DEFAULT_SIGMA_DEG, SampleMeta, WebcamProvider};
+use gaze_provider_et5::{ClickFeedback, ClickVia, Et5Calibration, Et5Provider, OffsetParams, OffsetSummary, ResidualModel};
+use gaze_provider_webcam::{CameraPose, SampleMeta, WebcamProvider};
 use tracing::{info, warn};
 
 use crate::buttons::ButtonSource;
-use crate::cli::{Args, Provider};
-
-/// Conventional calibration file, used when `--calibration` is not given.
-const DEFAULT_CALIBRATION_PATH : &str = "config/calibration.toml";
-
-/// Conventional ET5 calibration file, used when `--calibration` is not given.
-const DEFAULT_ET5_CALIBRATION_PATH : &str = "config/calibration-et5.toml";
-
-/// Conventional ET5 residual model, used when `--model` is not given.
-const DEFAULT_ET5_MODEL_PATH : &str = "config/model-et5.json";
+use crate::config::SourceSpec;
 
 /// A discrete control the session acts on, whatever produced it.
 ///
@@ -162,27 +152,25 @@ pub enum GazeSource {
     /// buttons and wheel, and knows the noise-free point behind every sample.
     Synthetic(SyntheticProvider),
 
-    /// Real gaze from the sidecar. Controls come from the Lenovo, which is the only commit
-    /// channel a webcam run has.
+    /// Real gaze from the sidecar. Controls come from the mouse when one is read.
     Webcam {
         /// Where the samples come from.
         provider : WebcamProvider,
-        /// The Lenovo's buttons and wheel. Required: gaze cannot commit itself and there
-        /// is no keyboard grab, so nothing else here can.
-        buttons  : ButtonSource,
+        /// The mouse's buttons and wheel, when asked for.
+        buttons  : Option<ButtonSource>,
         /// Accumulated sidecar health, updated once per sample by
         /// [`poll_health`](GazeSource::poll_health).
         health   : WebcamHealth,
     },
 
-    /// Real gaze from the ET5 over native USB. Controls come from the Lenovo, as in
-    /// `webcam`: gaze cannot commit itself.
+    /// Real gaze from the ET5 over native USB. Controls come from the mouse when one is
+    /// read; the daemon reads none and the controller commits.
     Et5 {
         /// Where the samples come from. Boxed: the provider embeds the USB session
         /// and converter state, and would otherwise dominate the enum's size.
         provider : Box<Et5Provider>,
-        /// The Lenovo's buttons and wheel. Required, as in `webcam`.
-        buttons  : ButtonSource,
+        /// The mouse's buttons and wheel, when asked for.
+        buttons  : Option<ButtonSource>,
     },
 
     /// A recorded session. Controls come from the same reader as `webcam` when the device
@@ -199,15 +187,49 @@ pub enum GazeSource {
 // --- GazeSource ---
 
 impl GazeSource {
-    /// Opens whichever source `args.provider` selected, logging what will commit.
-    pub fn open(args: &Args, geometry: &DesktopGeometry, model: NoiseModel)
+    /// Opens the source `spec` describes, logging what will commit. `buttons` names the
+    /// mouse read for commits on the sources that have no controls of their own, and
+    /// `grab` whether to grab it; the synthetic source grabs its own device regardless.
+    pub fn open(
+        spec     : &SourceSpec,
+        buttons  : Option<&str>,
+        grab     : bool,
+        geometry : &DesktopGeometry,
+    )
         -> Result<GazeSource>
     {
-        match args.provider {
-            Provider::Synthetic => open_synthetic(args, geometry, model),
-            Provider::Webcam    => open_webcam(args, geometry),
-            Provider::Et5       => open_et5(args, geometry),
-            Provider::Replay    => open_replay(args),
+        match spec {
+            SourceSpec::Synthetic { device, gain, seed, model } => {
+                open_synthetic(device, *gain, *seed, *model, geometry)
+            }
+
+            SourceSpec::Webcam { socket, camera, calibration, sigma_deg, desk_text } => {
+                open_webcam(
+                    socket,
+                    camera.as_deref(),
+                    calibration.as_deref(),
+                    *sigma_deg,
+                    desk_text,
+                    geometry,
+                    buttons,
+                    grab,
+                )
+            }
+
+            SourceSpec::Et5 { calibration, model, device_blob, offset, flywheel } => {
+                open_et5(
+                    calibration.as_deref(),
+                    model.as_deref(),
+                    device_blob,
+                    offset.as_deref(),
+                    flywheel.as_deref(),
+                    geometry,
+                    buttons,
+                    grab,
+                )
+            }
+
+            SourceSpec::Replay { path } => open_replay(path, buttons, grab),
         }
     }
 
@@ -224,11 +246,11 @@ impl GazeSource {
     /// Drains the controls queued since the last call, without blocking.
     pub fn controls(&mut self) -> Vec<Control> {
         match self {
-            GazeSource::Synthetic(provider)     => provider.events().map(control_of).collect(),
-            GazeSource::Webcam { buttons, .. }  => buttons.events().collect(),
-            GazeSource::Et5 { buttons, .. }     => buttons.events().collect(),
+            GazeSource::Synthetic(provider) => provider.events().map(control_of).collect(),
 
-            GazeSource::Replay { buttons, .. } => {
+            GazeSource::Webcam { buttons, .. }
+            | GazeSource::Et5 { buttons, .. }
+            | GazeSource::Replay { buttons, .. } => {
                 match buttons {
                     Some(buttons) => buttons.events().collect(),
                     None          => Vec::new(),
@@ -248,7 +270,7 @@ impl GazeSource {
 
     /// The clock real clicks must be stamped on to be attributed, when this source can
     /// learn from them: the ET5 provider with a residual model loaded. `None` for every
-    /// other source, which is also the signal not to open the real mouse at all.
+    /// other source, which is also the signal not to read the real mouse for labels.
     pub fn click_clock(&self) -> Option<Instant> {
         match self {
             GazeSource::Et5 { provider, .. } if provider.has_model() => Some(provider.started_at()),
@@ -265,23 +287,57 @@ impl GazeSource {
         }
     }
 
-    /// Whether this source has the control device to itself.
-    ///
-    /// It decides what the scroll tier does with a wheel event: on a grabbed device the
-    /// compositor never sees the wheel, so the session has to re-inject it; on an
-    /// un-grabbed one the compositor is already delivering it and injecting again would
-    /// scroll twice, so the session only warps the pointer ahead of it.
-    ///
-    /// The synthetic provider always grabs. The other two grab their button device unless
-    /// `--no-grab`, so this is a property of the run, not of the variant.
+    /// Forgets the ET5's online offset. Every other source has none.
+    pub fn reset_offset(&mut self) {
+        if let GazeSource::Et5 { provider, .. } = self {
+            provider.reset_offset();
+        }
+    }
+
+    /// Whether the samples are flowing: the ET5's link is up, or the source is one
+    /// that cannot lose a link.
+    pub fn connected(&self) -> bool {
+        match self {
+            GazeSource::Et5 { provider, .. } => provider.connected(),
+            _                                => true,
+        }
+    }
+
+    /// Whether a calibration was loaded. Only the ET5 reports one.
+    pub fn calibrated(&self) -> bool {
+        match self {
+            GazeSource::Et5 { provider, .. } => provider.calibrated(),
+            _                                => false,
+        }
+    }
+
+    /// Whether a residual model is running.
+    pub fn has_model(&self) -> bool {
+        match self {
+            GazeSource::Et5 { provider, .. } => provider.has_model(),
+            _                                => false,
+        }
+    }
+
+    /// The ET5's online offset in brief, when it has one.
+    pub fn offset_summary(&self) -> Option<OffsetSummary> {
+        match self {
+            GazeSource::Et5 { provider, .. } => provider.offset_summary(),
+            _                                => None,
+        }
+    }
+
+    /// Whether this source has the control device to itself, so its wheel never reaches
+    /// the compositor. The synthetic provider always grabs; the others grab their
+    /// button device when asked to, so this is a property of the run, not of the variant.
     pub fn grabbed(&self) -> bool {
         match self {
-            GazeSource::Synthetic(_)           => true,
-            GazeSource::Webcam { buttons, .. } => buttons.grabbed(),
-            GazeSource::Et5 { buttons, .. }    => buttons.grabbed(),
+            GazeSource::Synthetic(_) => true,
 
             // No device means no wheel to own in the first place.
-            GazeSource::Replay { buttons, .. } => {
+            GazeSource::Webcam { buttons, .. }
+            | GazeSource::Et5 { buttons, .. }
+            | GazeSource::Replay { buttons, .. } => {
                 buttons.as_ref().is_some_and(ButtonSource::grabbed)
             }
         }
@@ -339,12 +395,18 @@ impl GazeSource {
 
             GazeSource::Webcam { provider, buttons, .. } => {
                 provider.stop();
-                buttons.stop();
+
+                if let Some(buttons) = buttons {
+                    buttons.stop();
+                }
             }
 
             GazeSource::Et5 { provider, buttons } => {
                 provider.stop();
-                buttons.stop();
+
+                if let Some(buttons) = buttons {
+                    buttons.stop();
+                }
             }
 
             GazeSource::Replay { provider, buttons } => {
@@ -360,22 +422,28 @@ impl GazeSource {
 
 // --- Opening ---
 
-/// Grabs the Lenovo and drives it through the desk's noise model. Buttons and wheel come
+/// Grabs the mouse and drives it through the desk's noise model. Buttons and wheel come
 /// back as provider events, and nothing reaches the compositor.
-fn open_synthetic(args: &Args, geometry: &DesktopGeometry, model: NoiseModel)
+fn open_synthetic(
+    device   : &str,
+    gain     : f64,
+    seed     : u64,
+    model    : NoiseModel,
+    geometry : &DesktopGeometry,
+)
     -> Result<GazeSource>
 {
     let provider = SyntheticProvider::create()
         .geometry(geometry.clone())
         .model(model)
-        .device_name(args.device.clone())
-        .gain_px_per_count(args.gain)
-        .seed(args.seed)
+        .device_name(device.to_string())
+        .gain_px_per_count(gain)
+        .seed(seed)
         .start()
-        .with_context(|| format!("grabbing a gaze device matching {:?}", args.device))?;
+        .with_context(|| format!("grabbing a gaze device matching {device:?}"))?;
 
     info!(
-        device  = args.device,
+        device  = device,
         commits = "left button on the grabbed device (right exits, middle redetects)",
         wheel   = "the grabbed device's wheel; the compositor never sees it",
         "provider: synthetic"
@@ -384,66 +452,56 @@ fn open_synthetic(args: &Args, geometry: &DesktopGeometry, model: NoiseModel)
     Ok(GazeSource::Synthetic(provider))
 }
 
-/// Real gaze from the webcam sidecar, with controls from the un-grabbed Lenovo.
+/// Real gaze from the webcam sidecar, with controls from the mouse when one is read.
 ///
-/// The camera pose comes out of the same `desk.toml` the session already parsed, because it
-/// describes the desk rather than the run; only the device node is worth overriding per
-/// run, and even that is only read by the sidecar. A missing socket is not an error: the
-/// provider reconnects with backoff, so starting this before the sidecar is up is fine and
-/// the samples begin when it appears.
-///
-/// The button source is required here, unlike in replay: gaze cannot commit itself and
-/// there is no keyboard grab, so those three buttons are the only commit channel a webcam
-/// run has. It is grabbed by default, which keeps a commit press from also clicking
-/// whatever the pointer is over.
-fn open_webcam(args: &Args, geometry: &DesktopGeometry) -> Result<GazeSource> {
-    let text = std::fs::read_to_string(&args.config)
-        .with_context(|| format!("reading {}", args.config.display()))?;
+/// The camera pose comes out of the same desk file the session already parsed, because
+/// it describes the desk rather than the run; only the device node is worth overriding
+/// per run, and even that is only read by the sidecar. A missing socket is not an error:
+/// the provider reconnects with backoff, so starting this before the sidecar is up is
+/// fine and the samples begin when it appears.
+#[allow(clippy::too_many_arguments)]
+fn open_webcam(
+    socket      : &Path,
+    camera      : Option<&Path>,
+    calibration : Option<&Path>,
+    sigma_deg   : f64,
+    desk_text   : &str,
+    geometry    : &DesktopGeometry,
+    buttons     : Option<&str>,
+    grab        : bool,
+)
+    -> Result<GazeSource>
+{
+    let mut pose = CameraPose::from_desk_toml(desk_text)
+        .context("parsing the [camera] block of the desk file")?;
 
-    let mut camera = CameraPose::from_desk_toml(&text)
-        .with_context(|| format!("parsing the [camera] block of {}", args.config.display()))?;
-
-    if let Some(device) = &args.camera {
-        camera.device = device.display().to_string();
+    if let Some(device) = camera {
+        pose.device = device.display().to_string();
     }
 
-    // `--sigma` is the desk-wide override, and the webcam profile is flat anyway, so the
-    // same flag serves both providers.
-    let sigma_deg = args.sigma.unwrap_or(DEFAULT_SIGMA_DEG);
-
-    // An explicit --calibration wins; otherwise the conventional file is used when it
-    // exists, so a freshly swept calibration is never silently ignored.
-    let default_cal = PathBuf::from(DEFAULT_CALIBRATION_PATH);
-    let calibration = args.calibration.clone().or_else(|| default_cal.exists().then_some(default_cal));
-
     let provider = WebcamProvider::create()
-        .socket(&args.webcam_socket)
+        .socket(socket)
         .geometry(geometry.clone())
-        .camera(camera)
-        .calibration(calibration.clone())
+        .camera(pose)
+        .calibration(calibration.map(Path::to_path_buf))
         .sigma_deg(sigma_deg)
         .start()
-        .with_context(|| format!("starting the webcam provider on {}", args.webcam_socket.display()))?;
+        .with_context(|| format!("starting the webcam provider on {}", socket.display()))?;
 
-    let buttons = ButtonSource::open(None, &args.device, !args.no_grab).with_context(|| {
-        format!(
-            "opening {:?} for commits: a webcam run has no other commit channel",
-            args.device,
-        )
-    })?;
+    let buttons = open_buttons(buttons, grab, "a webcam run")?;
 
     info!(
-        socket      = %args.webcam_socket.display(),
-        camera      = %args.camera.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "from config".to_string()),
-        calibration = ?args.calibration.as_ref().map(|p| p.display().to_string()),
+        socket      = %socket.display(),
+        camera      = %camera.map(|p| p.display().to_string()).unwrap_or_else(|| "from config".to_string()),
+        calibration = ?calibration.map(|p| p.display().to_string()),
         sigma_deg   = sigma_deg,
-        device      = %buttons.path().display(),
-        grabbed     = buttons.grabbed(),
-        commits     = commit_note(buttons.grabbed()),
+        device      = ?buttons.as_ref().map(|b| b.path().display().to_string()),
+        grabbed     = ?buttons.as_ref().map(ButtonSource::grabbed),
+        commits     = commit_note(buttons.as_ref()),
         "provider: webcam"
     );
 
-    match &calibration {
+    match calibration {
         Some(path) => info!(calibration = %path.display(), "webcam calibration loaded"),
         None       => warn!("running uncalibrated: expect several degrees of bias (gaze-webcam-cli calibrate fixes it)"),
     }
@@ -455,88 +513,80 @@ fn open_webcam(args: &Args, geometry: &DesktopGeometry) -> Result<GazeSource> {
     })
 }
 
-/// Real gaze from the ET5 over native USB, with controls from the Lenovo.
+/// Real gaze from the ET5 over native USB, with controls from the mouse when one is
+/// read.
 ///
 /// The provider claims the tracker's USB interface exclusively, so a sweep or a
-/// `gaze-et5-cli view` cannot run at the same time. The calibration matters more
-/// here than for the webcam: without one the tracker runs under an oversized
-/// virtual plane and the firmware's trained end-to-end mapping never applies, so
-/// the conventional file is picked up when present and its absence is loud.
-fn open_et5(args: &Args, geometry: &DesktopGeometry) -> Result<GazeSource> {
-    let default_cal = PathBuf::from(DEFAULT_ET5_CALIBRATION_PATH);
-    let path        = args.calibration.clone()
-        .or_else(|| default_cal.exists().then_some(default_cal));
-
-    let calibration = {
-        match &path {
+/// `gaze-et5-cli view` cannot run at the same time. The calibration matters more here
+/// than for the webcam: without one the tracker runs under an oversized virtual plane
+/// and the firmware's trained end-to-end mapping never applies, so its absence is loud.
+#[allow(clippy::too_many_arguments)]
+fn open_et5(
+    calibration : Option<&Path>,
+    model       : Option<&Path>,
+    device_blob : &Path,
+    offset      : Option<&Path>,
+    flywheel    : Option<&Path>,
+    geometry    : &DesktopGeometry,
+    buttons     : Option<&str>,
+    grab        : bool,
+)
+    -> Result<GazeSource>
+{
+    let loaded_calibration = {
+        match calibration {
             Some(path) => Some(Et5Calibration::load(path)
                 .with_context(|| format!("loading {}", path.display()))?),
             None       => None,
         }
     };
 
-    if calibration.is_none() {
+    if loaded_calibration.is_none() {
         warn!("running uncalibrated: the trained on-device mapping will not apply \
                (gaze-et5-cli calibrate fixes it)");
     }
 
-    let default_model = PathBuf::from(DEFAULT_ET5_MODEL_PATH);
-    let model_path    = args.model.clone()
-        .or_else(|| default_model.exists().then_some(default_model));
-
-    let model = {
-        match &model_path {
+    let loaded_model = {
+        match model {
             Some(path) => Some(ResidualModel::load(path)
                 .with_context(|| format!("loading {}", path.display()))?),
             None       => None,
         }
     };
 
-    if model.is_none() {
+    if loaded_model.is_none() {
         info!("no residual model: the firmware's ray is used as is (gaze-et5-cli fit fits one)");
     }
 
     // A frozen offset is a gain of zero with nowhere to write: clicks are still
     // attributed and logged, so a run can watch the leftovers without moving anything.
-    let (offset_path, offset_params) = {
-        if args.freeze_offset {
-            (None, OffsetParams { alpha: 0.0, ..OffsetParams::default() })
-        }
-        else {
-            (Some(args.offset.clone()), OffsetParams::default())
-        }
+    let offset_params = match offset {
+        Some(_) => OffsetParams::default(),
+        None    => OffsetParams { alpha: 0.0, ..OffsetParams::default() },
     };
-
-    // The flywheel writes every attributed click down, frozen offset or not: a run
-    // that only watches the leftovers is exactly the run whose clicks are worth keeping.
-    let flywheel_dir = (!args.no_flywheel).then(|| args.flywheel.clone());
 
     let provider = Et5Provider::create()
         .geometry(geometry.clone())
-        .calibration(calibration)
-        .model(model)
-        .offset_path(offset_path)
+        .calibration(loaded_calibration)
+        .model(loaded_model)
+        .offset_path(offset.map(Path::to_path_buf))
         .offset_params(offset_params)
-        .flywheel_dir(flywheel_dir.clone())
+        .flywheel_dir(flywheel.map(Path::to_path_buf))
+        .device_blob(device_blob)
         .start()
         .context("starting the ET5 provider (tracker on the bus, nothing else holding it?)")?;
 
-    let buttons = ButtonSource::open(None, &args.device, !args.no_grab).with_context(|| {
-        format!(
-            "opening {:?} for commits: an ET5 run has no other commit channel",
-            args.device,
-        )
-    })?;
+    let buttons = open_buttons(buttons, grab, "an ET5 run")?;
 
     info!(
-        calibration = ?path.as_ref().map(|p| p.display().to_string()),
-        model       = ?model_path.as_ref().map(|p| p.display().to_string()),
-        offset      = %args.offset.display(),
-        frozen      = args.freeze_offset,
-        flywheel    = ?flywheel_dir.as_ref().map(|p| p.display().to_string()),
-        device      = %buttons.path().display(),
-        grabbed     = buttons.grabbed(),
-        commits     = commit_note(buttons.grabbed()),
+        calibration = ?calibration.map(|p| p.display().to_string()),
+        model       = ?model.map(|p| p.display().to_string()),
+        offset      = ?offset.map(|p| p.display().to_string()),
+        frozen      = offset.is_none(),
+        flywheel    = ?flywheel.map(|p| p.display().to_string()),
+        device      = ?buttons.as_ref().map(|b| b.path().display().to_string()),
+        grabbed     = ?buttons.as_ref().map(ButtonSource::grabbed),
+        commits     = commit_note(buttons.as_ref()),
         "provider: et5"
     );
 
@@ -546,21 +596,20 @@ fn open_et5(args: &Args, geometry: &DesktopGeometry) -> Result<GazeSource> {
     })
 }
 
-/// Replays a recorded JSONL session, with controls from the un-grabbed Lenovo when it is
+/// Replays a recorded JSONL session, with controls from the mouse when one is read and
 /// present.
 ///
 /// A missing device is only a warning here: a replay is the one mode that can run with no
-/// hardware at all, driven by the recording and `--seconds`.
-fn open_replay(args: &Args) -> Result<GazeSource> {
-    let path = args.replay.as_ref().context("--provider replay needs --replay <FILE>")?;
-
+/// hardware at all, driven by the recording and a deadline.
+fn open_replay(path: &Path, buttons: Option<&str>, grab: bool) -> Result<GazeSource> {
     let provider = ReplayProvider::from_jsonl(path)
         .with_context(|| format!("reading the replay log {}", path.display()))?;
 
-    let buttons = match ButtonSource::open(None, &args.device, !args.no_grab) {
-        Ok(buttons) => Some(buttons),
+    let buttons = match buttons.map(|name| ButtonSource::open(None, name, grab)) {
+        Some(Ok(buttons)) => Some(buttons),
+        None              => None,
 
-        Err(e) => {
+        Some(Err(e)) => {
             warn!(
                 error = %e,
                 "no button device: the replay will run to its end or --seconds, with no commits"
@@ -574,7 +623,7 @@ fn open_replay(args: &Args) -> Result<GazeSource> {
         replay  = %path.display(),
         device  = ?buttons.as_ref().map(|b| b.path().display().to_string()),
         grabbed = ?buttons.as_ref().map(ButtonSource::grabbed),
-        commits = commit_note(buttons.as_ref().is_some_and(ButtonSource::grabbed)),
+        commits = commit_note(buttons.as_ref()),
         "provider: replay"
     );
 
@@ -584,16 +633,28 @@ fn open_replay(args: &Args) -> Result<GazeSource> {
     })
 }
 
+/// Opens the commit mouse when one is named. Failing to open a named one is an error:
+/// the run asked for it, and without it a run with no controller cannot commit.
+fn open_buttons(name: Option<&str>, grab: bool, what: &str) -> Result<Option<ButtonSource>> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+
+    let buttons = ButtonSource::open(None, name, grab)
+        .with_context(|| format!("opening {name:?} for commits in {what}"))?;
+
+    Ok(Some(buttons))
+}
+
 // --- Helpers ---
 
 /// One line for the startup log saying what the commit button does, which differs enough
-/// between a grabbed and an un-grabbed device to be worth spelling out at every start.
-fn commit_note(grabbed: bool) -> &'static str {
-    if grabbed {
-        "left button on the grabbed device (right exits, middle redetects)"
-    }
-    else {
-        "left button on the un-grabbed device; the compositor sees the press as a click too"
+/// between a grabbed, an un-grabbed and no device to be worth spelling out at every start.
+fn commit_note(buttons: Option<&ButtonSource>) -> &'static str {
+    match buttons {
+        Some(b) if b.grabbed() => "left button on the grabbed device (right exits, middle redetects)",
+        Some(_)                => "left button on the un-grabbed device; the compositor sees the press as a click too",
+        None                   => "the controller's pad; no mouse is read for commits",
     }
 }
 

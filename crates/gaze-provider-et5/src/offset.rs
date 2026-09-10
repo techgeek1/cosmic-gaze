@@ -533,11 +533,22 @@ impl OnlineOffset {
         }
     }
 
-    /// Forgets every posture. For an explicit user reset; nothing in the provider calls it.
+    /// Forgets every posture. For an explicit user reset; nothing in the provider calls
+    /// it on its own. The jump count stays: it is a diagnostic of the day, not a bias.
     pub fn reset(&mut self) {
         self.state.anchors.clear();
         self.state.updates = 0;
         self.rejects.clear();
+    }
+
+    /// Writes the state out where it persists, if anywhere. A reset wants this so the
+    /// next run does not restore the anchors that were just forgotten.
+    pub fn save(&self) {
+        if let Some(path) = &self.path
+            && let Err(e) = self.state.save(path)
+        {
+            warn!(path = %path.display(), "online offset not saved ({e})");
+        }
     }
 
     /// Rejects currently held for the consensus check.

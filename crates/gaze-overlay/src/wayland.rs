@@ -71,7 +71,7 @@ pub struct Overlay {
     /// Owns the wayland event source and the state channel source.
     event_loop : EventLoop<'static, App>,
     /// Kept so state can be pushed in from other threads after the loop is running.
-    sender     : Sender<OverlayState>,
+    sender     : Sender<Message>,
     /// Used to flush pending requests after each dispatch.
     conn       : Connection,
     /// Set by any [`OverlayHandle::stop`]. Checked alongside the flag `run_until` is
@@ -83,7 +83,7 @@ pub struct Overlay {
 #[derive(Clone)]
 pub struct OverlayHandle {
     /// Wakes the overlay's event loop and delivers the new state.
-    sender : Sender<OverlayState>,
+    sender : Sender<Message>,
     /// Set to ask the overlay thread to finish.
     stop   : Arc<AtomicBool>,
 }
@@ -142,13 +142,15 @@ impl Overlay {
         event_queue.roundtrip(&mut app)?;
 
         let event_loop      = EventLoop::try_new()?;
-        let (sender, source) = channel::channel::<OverlayState>();
+        let (sender, source) = channel::channel::<Message>();
 
         event_loop
             .handle()
             .insert_source(source, |event, _, app: &mut App| {
-                if let channel::Event::Msg(state) = event {
-                    app.set(state);
+                match event {
+                    channel::Event::Msg(Message::State(state)) => app.set(state),
+                    channel::Event::Msg(Message::Style(style)) => app.presenter.set_style(style),
+                    channel::Event::Closed                     => {}
                 }
             })
             .map_err(|e| OverlayError::EventLoop(e.to_string()))?;
@@ -280,7 +282,15 @@ impl OverlayHandle {
     /// is usually happy to ignore during shutdown.
     pub fn set(&self, state: OverlayState) -> Result<(), OverlayError> {
         self.sender
-            .send(state)
+            .send(Message::State(state))
+            .map_err(|_| OverlayError::EventLoop("overlay thread is gone".into()))
+    }
+
+    /// Replaces the pointer look's tunables. Takes effect on the next frame; what is
+    /// mid-fade keeps fading.
+    pub fn set_style(&self, style: PointerStyle) -> Result<(), OverlayError> {
+        self.sender
+            .send(Message::Style(style))
             .map_err(|_| OverlayError::EventLoop("overlay thread is gone".into()))
     }
 
@@ -289,6 +299,17 @@ impl OverlayHandle {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
+}
+
+/// What crosses the channel into the overlay thread. The state is by far the larger
+/// variant and by far the commoner message; boxing it to please the size lint would
+/// cost an allocation per frame for nothing.
+#[allow(clippy::large_enum_variant)]
+enum Message {
+    /// A new intent to show.
+    State(OverlayState),
+    /// New tunables for the pointer look.
+    Style(PointerStyle),
 }
 
 // --- App ---

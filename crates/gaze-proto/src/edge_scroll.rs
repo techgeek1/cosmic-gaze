@@ -256,6 +256,12 @@ impl EdgeScroller {
         self.params
     }
 
+    /// Replaces the parameters in place. A running scroll or dwell carries on under
+    /// the new ones from the next sample.
+    pub fn set_params(&mut self, params: EdgeParams) {
+        self.params = params;
+    }
+
     /// One sample. `eyes` is where the filtered gaze is and `surface` the scroll surface
     /// under it, as the tree last reported it; a surface that vanishes mid-scroll is a
     /// stop, and so is running out of room.

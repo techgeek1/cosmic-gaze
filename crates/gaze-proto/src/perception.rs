@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, mpsc};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -76,7 +76,17 @@ pub struct Perception {
     stop     : Arc<AtomicBool>,
     /// While set the thread neither captures nor detects; the last element list stands.
     paused   : Arc<AtomicBool>,
+    /// The redetect policy in force, replaceable while the thread runs.
+    redetect_policy : Arc<Mutex<RedetectPolicy>>,
     join     : Option<JoinHandle<()>>,
+}
+
+/// When an output is detected again without being forced: on a change of this
+/// fraction of its frame, or after this long regardless.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RedetectPolicy {
+    pub threshold : f32,
+    pub interval  : Duration,
 }
 
 /// Per-output state carried between passes.
@@ -146,12 +156,17 @@ impl Perception {
 
         let stop   = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
+        let policy = Arc::new(Mutex::new(RedetectPolicy {
+            threshold : config.redetect_threshold,
+            interval  : config.redetect_interval,
+        }));
 
         let join = thread::Builder::new()
             .name("gaze-perception".to_string())
             .spawn({
                 let stop   = Arc::clone(&stop);
                 let paused = Arc::clone(&paused);
+                let policy = Arc::clone(&policy);
 
                 move || {
                     let started = connect(&config);
@@ -170,7 +185,7 @@ impl Perception {
                         }
                     };
 
-                    run(config, capture, detector, store, redetect_rx, stop, paused);
+                    run(config, capture, detector, store, redetect_rx, stop, paused, policy);
                 }
             })
             .context("spawning the perception thread")?;
@@ -180,11 +195,20 @@ impl Perception {
             .map_err(|_| anyhow!("perception thread died during startup"))??;
 
         Ok(Perception {
-            redetect : redetect_tx,
-            stop     : stop,
-            paused   : paused,
-            join     : Some(join),
+            redetect        : redetect_tx,
+            stop            : stop,
+            paused          : paused,
+            redetect_policy : policy,
+            join            : Some(join),
         })
+    }
+
+    /// Replaces the redetect policy from the next pass. Lives behind a mutex rather than
+    /// two atomics because the two are one decision; the thread reads it once per pass.
+    pub fn set_redetect(&self, threshold: f32, interval: Duration) {
+        let mut policy = self.redetect_policy.lock().unwrap_or_else(|e| e.into_inner());
+
+        *policy = RedetectPolicy { threshold: threshold, interval: interval };
     }
 
     /// Stops capturing and detecting until unpaused, from the next pass. The element
@@ -242,6 +266,7 @@ fn connect(config: &PerceptionConfig) -> Result<(Capture, Detector)> {
 }
 
 /// The capture and detect loop. Runs until the stop flag is set.
+#[allow(clippy::too_many_arguments)]
 fn run(
     config   : PerceptionConfig,
     capture  : Capture,
@@ -250,6 +275,7 @@ fn run(
     redetect : Receiver<Redetect>,
     stop     : Arc<AtomicBool>,
     paused   : Arc<AtomicBool>,
+    policy   : Arc<Mutex<RedetectPolicy>>,
 )
 {
     let mut capture = capture;
@@ -265,6 +291,10 @@ fn run(
 
             continue;
         }
+
+        // The policy is read once per pass, so a change lands between passes, never
+        // between two outputs of one.
+        let policy = *policy.lock().unwrap_or_else(|e| e.into_inner());
 
         // Drain the whole channel: several requests between passes still mean one pass.
         let mut forced_all = false;
@@ -324,7 +354,7 @@ fn run(
 
             let force = forced_all || forced.contains(name);
 
-            let Some(trigger) = trigger_for(state, &frame, &config, force) else {
+            let Some(trigger) = trigger_for(state, &frame, policy, force) else {
                 continue;
             };
 
@@ -400,7 +430,7 @@ fn run(
 fn trigger_for(
     state  : &OutputState,
     frame  : &Frame,
-    config : &PerceptionConfig,
+    policy : RedetectPolicy,
     forced : bool,
 )
     -> Option<Trigger>
@@ -413,7 +443,7 @@ fn trigger_for(
         return Some(Trigger::Forced);
     }
 
-    if state.detected_at.is_none_or(|at| at.elapsed() >= config.redetect_interval) {
+    if state.detected_at.is_none_or(|at| at.elapsed() >= policy.interval) {
         return Some(Trigger::Interval);
     }
 
@@ -421,7 +451,7 @@ fn trigger_for(
     // runs on every captured frame and only the detector is gated.
     let fraction = changed_fraction(previous, frame);
 
-    if fraction > config.redetect_threshold {
+    if fraction > policy.threshold {
         return Some(Trigger::Changed { fraction: fraction });
     }
 

@@ -99,6 +99,8 @@ pub struct Controller {
     join      : Option<JoinHandle<()>>,
     /// The controller's Bluetooth address, for logging.
     address   : String,
+    /// Whether the link is up, as the reader last saw it.
+    connected : Arc<AtomicBool>,
 }
 
 // --- Controller ---
@@ -148,33 +150,41 @@ impl Controller {
 
         info!(address = %address, device = %device, "daydream controller reporting");
 
-        let stop = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let stop      = Arc::new(AtomicBool::new(false));
+        let connected = Arc::new(AtomicBool::new(true));
+        let (tx, rx)  = crossbeam_channel::unbounded();
 
         let join = thread::spawn({
             let stop   = Arc::clone(&stop);
             let reader = Reader {
-                device : device_proxy.to_owned(),
-                report : report_proxy.to_owned(),
-                paths  : Paths { device: device, report: report.clone() },
+                device    : device_proxy.to_owned(),
+                report    : report_proxy.to_owned(),
+                paths     : Paths { device: device, report: report.clone() },
+                connected : Arc::clone(&connected),
             };
 
             move || reader.run(signals, &tx, &stop)
         });
 
         Ok(Controller {
-            reports : rx,
-            stop    : stop,
-            conn    : conn,
-            report  : report,
-            join    : Some(join),
-            address : address,
+            reports   : rx,
+            stop      : stop,
+            conn      : conn,
+            report    : report,
+            join      : Some(join),
+            address   : address,
+            connected : connected,
         })
     }
 
     /// The controller's Bluetooth address.
     pub fn address(&self) -> &str {
         &self.address
+    }
+
+    /// Whether the link is up: false from a disconnect until the reader has it back.
+    pub fn connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
     }
 
     /// Drains the reports queued since the last call, without blocking.
@@ -217,9 +227,11 @@ struct Paths {
 
 /// The reader thread's state.
 struct Reader {
-    device : Proxy<'static>,
-    report : Proxy<'static>,
-    paths  : Paths,
+    device    : Proxy<'static>,
+    report    : Proxy<'static>,
+    paths     : Paths,
+    /// Shared with the [`Controller`], so a caller can ask without a report.
+    connected : Arc<AtomicBool>,
 }
 
 /// The body of `PropertiesChanged`.
@@ -268,9 +280,13 @@ impl Reader {
             {
                 warn!("daydream controller disconnected; waiting for it to come back");
 
+                self.connected.store(false, Ordering::Relaxed);
+
                 if !self.reconnect(stop) {
                     return;
                 }
+
+                self.connected.store(true, Ordering::Relaxed);
             }
         }
     }

@@ -11,7 +11,7 @@
 //!   per press and repeating while held;
 //! * the thumb resting on the pad is the **clutch**: landing on it arms the pointer look
 //!   ([`Control::Arm`]), so the eyes' target shows while the thumb rests; once the thumb
-//!   (touch) or the wrist (gyro) has travelled [`REFINE_START_PX`] the refine begins and
+//!   has travelled [`REFINE_START_PAD`] of the pad the refine begins and
 //!   from then on moves the commit point until the thumb lifts. Pressing the pad to click
 //!   implies touching it, so a refine always ends in a commit if one is wanted.
 //!
@@ -21,10 +21,11 @@
 //! nothing on the gaze side moves the pointer except a scroll that borrows it and gives
 //! it back.
 //!
-//! The touchpad is the default; the gyro was the bet (no pad-edge problem) but on the desk
-//! it was jittery and its yaw barely registered, so it stays as an option behind
-//! `--refine gyro`. Drift is irrelevant either way because every gesture starts from
-//! wherever gaze put the point.
+//! The touchpad refines. The gyro was the first bet (no pad-edge problem) but on the desk
+//! it was jittery and its yaw barely registered; it was kept as an option for a while and
+//! cut on 2026-09-10 when the tuning moved into the daemon. Every gesture starts from
+//! wherever gaze put the point, so the pad's absolute position never matters, only its
+//! travel.
 
 use std::time::{Duration, Instant};
 
@@ -33,22 +34,6 @@ use gaze_daydream::{Button, Buttons, Controller, Report};
 use tracing::warn;
 
 use crate::source::{Control, Refine};
-
-/// Which sensor moves the commit point while the thumb is on the pad.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
-pub enum RefineMode {
-    /// Thumb motion across the pad.
-    #[default]
-    Touch,
-    /// Angular rate of the controller: turn the wrist, the point moves.
-    Gyro,
-    /// No refinement; the pad only commits.
-    Off,
-}
-
-/// Default gyro gain: logical pixels per radian of wrist turn. At 1500 a one degree turn
-/// is 26 px, so the ±1° of residual gaze error is a few degrees of wrist.
-pub const DEFAULT_GYRO_GAIN_PX_PER_RAD: f64 = 1500.0;
 
 /// Default touch gain: logical pixels per full pad width. 250 makes one count of the pad's
 /// 8-bit resolution about one pixel, and puts the whole refine box
@@ -60,12 +45,6 @@ pub const DEFAULT_TOUCH_GAIN_PX: f64 = 250.0;
 /// to cover that, and a bounded box keeps a stray sweep from flinging the pointer away.
 pub const DEFAULT_RANGE_PX: f64 = 100.0;
 
-/// Default axis mapping: pointer x from minus gyro y, pointer y from minus gyro x. The
-/// controller's y axis is the pad normal (gravity reads +g on it lying flat), so yaw is
-/// about y; turning left is positive there and must move the pointer left. Pitch is about
-/// x with nose-up positive, which must move the pointer up, so both are negated.
-pub const DEFAULT_AXES: &str = "-y,-x";
-
 /// A thumb down and up within this long, without travel or a click, is a tap.
 pub const TAP_MAX: Duration = Duration::from_millis(250);
 
@@ -76,21 +55,12 @@ pub const TAP_MAX_PAD: f32 = 0.04;
 /// How far the thumb must have moved from where it landed, as a fraction of the pad,
 /// before a touch becomes a refine. A thumb settling onto the pad shifts its centroid a
 /// good deal as the pad of the finger flattens, so this is well past the tap tolerance;
-/// with the default touch gain it is 30 logical pixels. The gyro mode accumulates its
-/// own motion against the same figure in pixels.
+/// with the default touch gain it is 30 logical pixels.
 pub const REFINE_START_PAD: f32 = 0.12;
 
 /// Shortest time after the thumb lands before travel counts, so the settling of the
 /// first few reports never starts a refine.
 const REFINE_START_DELAY: Duration = Duration::from_millis(120);
-
-/// Angular rate below which the gyro is noise, rad/s. At rest on the desk the peak over a
-/// second was 0.01 to 0.03.
-const GYRO_DEADZONE_RAD_S: f32 = 0.03;
-
-/// Longest gap between two reports that still integrates as motion. Longer means the
-/// controller went away, and the motion in between is not known.
-const MAX_DT: Duration = Duration::from_millis(50);
 
 /// A held volume key starts repeating after this long ...
 const REPEAT_DELAY: Duration = Duration::from_millis(350);
@@ -106,60 +76,11 @@ const REPEAT_INTERVAL: Duration = Duration::from_millis(120);
 /// the next report reads as a fresh press, which is right.
 const SILENCE_MAX: Duration = Duration::from_millis(500);
 
-/// One signed gyro axis.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Axis {
-    /// 0, 1 or 2 for x, y, z.
-    index : usize,
-    /// Multiply by minus one.
-    negate : bool,
-}
-
-impl Axis {
-    /// Reads this axis out of a gyro sample.
-    fn of(self, v: glam::Vec3) -> f32 {
-        let value = v[self.index];
-
-        if self.negate { -value } else { value }
-    }
-}
-
-/// Parses `--refine-axes`: two comma-separated axes, each `x`, `y` or `z` with an optional
-/// leading minus, pointer x first.
-pub fn parse_axes(s: &str) -> Result<(Axis, Axis)> {
-    let parse_one = |t: &str| -> Result<Axis> {
-        let (negate, name) = match t.strip_prefix('-') {
-            Some(rest) => (true, rest),
-            None       => (false, t.strip_prefix('+').unwrap_or(t)),
-        };
-
-        let index = match name {
-            "x" => 0,
-            "y" => 1,
-            "z" => 2,
-            _   => anyhow::bail!("axis {t:?} is not one of x, y, z with an optional sign"),
-        };
-
-        Ok(Axis { index: index, negate: negate })
-    };
-
-    let (a, b) = s.split_once(',')
-        .with_context(|| format!("axes {s:?} must be two comma-separated axes, like {DEFAULT_AXES:?}"))?;
-
-    Ok((parse_one(a.trim())?, parse_one(b.trim())?))
-}
-
 /// How the controller's reports become controls.
 #[derive(Clone, Copy, Debug)]
 pub struct DaydreamConfig {
-    /// Which sensor refines.
-    pub mode              : RefineMode,
-    /// Pixels per radian, gyro mode.
-    pub gyro_gain_px_rad  : f64,
-    /// Pixels per pad width, touch mode.
-    pub touch_gain_px     : f64,
-    /// Which gyro axes drive pointer x and y.
-    pub axes              : (Axis, Axis),
+    /// Pixels per pad width.
+    pub touch_gain_px : f64,
 }
 
 /// The controller plus the mapping from its reports to controls.
@@ -182,11 +103,10 @@ struct Mapper {
     touch_since   : Option<(Instant, glam::Vec2)>,
     /// Whether the pad was clicked during the current touch, which makes it not a tap.
     touch_clicked : bool,
-    /// Gyro travel since the thumb landed, before the refine began, logical pixels;
-    /// `None` once it has begun (or between touches). Touch mode measures the thumb's
-    /// displacement from where it landed instead and only uses this as the flag.
-    pending_move  : Option<(f64, f64)>,
-    /// When the last report arrived, for the gyro's `dt`.
+    /// Set while the thumb is down and the refine has not begun; `None` once it has
+    /// (or between touches). The thumb's displacement from where it landed decides when.
+    pending_move  : bool,
+    /// When the last report arrived, for the silence failsafe.
     last_at       : Option<Instant>,
     /// Held volume keys and when each next repeats.
     repeats       : Vec<(Button, Instant)>,
@@ -209,6 +129,16 @@ impl Daydream {
     /// The controller's address, for the startup log.
     pub fn address(&self) -> &str {
         self.controller.address()
+    }
+
+    /// Whether the link is up right now.
+    pub fn connected(&self) -> bool {
+        self.controller.connected()
+    }
+
+    /// Replaces the mapping's tunables from the next report.
+    pub fn set_config(&mut self, config: DaydreamConfig) {
+        self.mapper.config = config;
     }
 
     /// Drains the reports queued since the last call into controls, in order.
@@ -252,7 +182,7 @@ impl Mapper {
             touch         : None,
             touch_since   : None,
             touch_clicked : false,
-            pending_move  : None,
+            pending_move  : false,
             last_at       : None,
             repeats       : Vec::new(),
         }
@@ -260,8 +190,7 @@ impl Mapper {
 
     /// One report's worth of edges and motion.
     fn step(&mut self, report: Report, out: &mut Vec<Control>) {
-        let p  = report.packet;
-        let dt = self.last_at.map(|t| report.at.saturating_duration_since(t)).unwrap_or(MAX_DT);
+        let p = report.packet;
 
         // A tap: the thumb lifting soon after it landed, having gone nowhere and clicked
         // nothing. Emitted before the refine ends so the commit still has the anchor.
@@ -295,10 +224,10 @@ impl Mapper {
         match (self.touch, p.touch) {
             (None, Some(_)) => {
                 out.push(Control::Arm { down: true });
-                self.pending_move = Some((0.0, 0.0));
+                self.pending_move = true;
             }
             (Some(_), None) => {
-                if self.pending_move.take().is_none() && self.config.mode != RefineMode::Off {
+                if !std::mem::take(&mut self.pending_move) {
                     out.push(Control::Refine(Refine::End));
                 }
 
@@ -307,68 +236,38 @@ impl Mapper {
             _ => {}
         }
 
-        if self.config.mode != RefineMode::Off
-            && let Some(now) = p.touch
-        {
-            let (dx, dy) = match self.config.mode {
-                RefineMode::Gyro => {
-                    let dt = dt.min(MAX_DT).as_secs_f64();
-                    let (ax, ay) = self.config.axes;
-                    let (rx, ry) = (ax.of(p.gyro), ay.of(p.gyro));
+        if let Some(now) = p.touch {
+            let (dx, dy) = match self.touch {
+                Some(prev) => {
+                    let d = now - prev;
 
-                    let rx = if rx.abs() < GYRO_DEADZONE_RAD_S { 0.0 } else { rx };
-                    let ry = if ry.abs() < GYRO_DEADZONE_RAD_S { 0.0 } else { ry };
-
-                    (f64::from(rx) * dt * self.config.gyro_gain_px_rad,
-                     f64::from(ry) * dt * self.config.gyro_gain_px_rad)
+                    (f64::from(d.x) * self.config.touch_gain_px,
+                     f64::from(d.y) * self.config.touch_gain_px)
                 }
 
-                RefineMode::Touch => match self.touch {
-                    Some(prev) => {
-                        let d = now - prev;
-
-                        (f64::from(d.x) * self.config.touch_gain_px,
-                         f64::from(d.y) * self.config.touch_gain_px)
-                    }
-
-                    None => (0.0, 0.0),
-                },
-
-                RefineMode::Off => (0.0, 0.0),
+                None => (0.0, 0.0),
             };
 
             // Motion counts for nothing until it amounts to a nudge: the thumb a pad
-            // fraction from where it landed, or the wrist the same distance in pixels,
-            // and not within the settling time either way. Then the refine begins from
-            // where the point is, the way a joystick's dead zone begins from its rim,
-            // and every later move passes straight on.
-            match self.pending_move.as_mut() {
-                Some((px, py)) => {
-                    *px += dx;
-                    *py += dy;
+            // fraction from where it landed, and not within the settling time. Then the
+            // refine begins from where the point is, the way a joystick's dead zone
+            // begins from its rim, and every later move passes straight on.
+            if self.pending_move {
+                let settled = self
+                    .touch_since
+                    .is_some_and(|(since, _)| report.at.saturating_duration_since(since) >= REFINE_START_DELAY);
 
-                    let settled = self
-                        .touch_since
-                        .is_some_and(|(since, _)| report.at.saturating_duration_since(since) >= REFINE_START_DELAY);
+                let travelled = self
+                    .touch_since
+                    .is_some_and(|(_, from)| (now - from).length() >= REFINE_START_PAD);
 
-                    let travelled = match self.config.mode {
-                        RefineMode::Touch => self
-                            .touch_since
-                            .is_some_and(|(_, from)| (now - from).length() >= REFINE_START_PAD),
-                        _ => px.hypot(*py) >= f64::from(REFINE_START_PAD) * self.config.touch_gain_px,
-                    };
-
-                    if settled && travelled {
-                        self.pending_move = None;
-                        out.push(Control::Refine(Refine::Begin));
-                    }
+                if settled && travelled {
+                    self.pending_move = false;
+                    out.push(Control::Refine(Refine::Begin));
                 }
-
-                None if dx != 0.0 || dy != 0.0 => {
-                    out.push(Control::Refine(Refine::Move { dx_px: dx, dy_px: dy }));
-                }
-
-                None => {}
+            }
+            else if dx != 0.0 || dy != 0.0 {
+                out.push(Control::Refine(Refine::Move { dx_px: dx, dy_px: dy }));
             }
         }
 
@@ -459,30 +358,6 @@ mod tests {
     use super::*;
     use gaze_daydream::Packet;
 
-    #[test]
-    fn axes_parse_with_signs_and_default_is_valid() {
-        let (x, y) = parse_axes(DEFAULT_AXES).unwrap();
-
-        assert_eq!(x, Axis { index: 1, negate: true });
-        assert_eq!(y, Axis { index: 0, negate: true });
-
-        let (x, y) = parse_axes(" z , +x").unwrap();
-
-        assert_eq!(x, Axis { index: 2, negate: false });
-        assert_eq!(y, Axis { index: 0, negate: false });
-
-        assert!(parse_axes("w,x").is_err());
-        assert!(parse_axes("x").is_err());
-    }
-
-    #[test]
-    fn a_negated_axis_reads_the_negative() {
-        let v = glam::Vec3::new(1.0, 2.0, 3.0);
-
-        assert_eq!(Axis { index: 1, negate: true }.of(v), -2.0);
-        assert_eq!(Axis { index: 2, negate: false }.of(v), 3.0);
-    }
-
     /// A report with the thumb at `touch`, nothing else happening.
     fn touch_report(at: Instant, touch: Option<(f32, f32)>) -> Report {
         Report {
@@ -501,12 +376,7 @@ mod tests {
 
     #[test]
     fn a_thumb_drag_moves_both_axes_by_the_pad_gain() {
-        let config = DaydreamConfig {
-            mode              : RefineMode::Touch,
-            gyro_gain_px_rad  : DEFAULT_GYRO_GAIN_PX_PER_RAD,
-            touch_gain_px     : 1000.0,
-            axes              : parse_axes(DEFAULT_AXES).unwrap(),
-        };
+        let config = DaydreamConfig { touch_gain_px: 1000.0 };
 
         let mut mapper = Mapper::new(config);
         let mut out    = Vec::new();
@@ -556,12 +426,7 @@ mod tests {
     /// gaze keeps driving, and lifting only disarms.
     #[test]
     fn a_resting_thumb_arms_without_refining() {
-        let config = DaydreamConfig {
-            mode              : RefineMode::Touch,
-            gyro_gain_px_rad  : DEFAULT_GYRO_GAIN_PX_PER_RAD,
-            touch_gain_px     : DEFAULT_TOUCH_GAIN_PX,
-            axes              : parse_axes(DEFAULT_AXES).unwrap(),
-        };
+        let config = DaydreamConfig { touch_gain_px: DEFAULT_TOUCH_GAIN_PX };
 
         let mut mapper = Mapper::new(config);
         let mut out    = Vec::new();
@@ -583,12 +448,7 @@ mod tests {
 
     #[test]
     fn a_quick_still_touch_is_a_context_commit_and_a_drag_is_not() {
-        let config = DaydreamConfig {
-            mode              : RefineMode::Touch,
-            gyro_gain_px_rad  : DEFAULT_GYRO_GAIN_PX_PER_RAD,
-            touch_gain_px     : 250.0,
-            axes              : parse_axes(DEFAULT_AXES).unwrap(),
-        };
+        let config = DaydreamConfig { touch_gain_px: 250.0 };
 
         let mut mapper = Mapper::new(config);
         let mut out    = Vec::new();
@@ -615,12 +475,7 @@ mod tests {
 
     /// The touch mapping at its defaults.
     fn default_config() -> DaydreamConfig {
-        DaydreamConfig {
-            mode              : RefineMode::Touch,
-            gyro_gain_px_rad  : DEFAULT_GYRO_GAIN_PX_PER_RAD,
-            touch_gain_px     : DEFAULT_TOUCH_GAIN_PX,
-            axes              : parse_axes(DEFAULT_AXES).unwrap(),
-        }
+        DaydreamConfig { touch_gain_px: DEFAULT_TOUCH_GAIN_PX }
     }
 
     /// A report with `buttons` down, nothing else happening.

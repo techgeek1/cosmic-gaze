@@ -1,19 +1,37 @@
-//! Command line surface of the live prototype.
+//! Command line surface of the dev harness.
+//!
+//! The daemon runs the same session loop with no flags at all: the files come from
+//! [`gaze_config::Paths`], the numbers from the stored [`Tuning`], and clicking, edge
+//! scrolling and the controller are always on. What is left here is what an experiment
+//! needs and a desktop does not: which provider, whether anything is injected, a
+//! recording, a deadline, the debug look, and `--tune KEY=VALUE` to move any knob for
+//! one run without touching the stored tuning.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use gaze_core::{NoiseModel, SigmaProfile};
-use gaze_provider_webcam::DEFAULT_SOCKET;
+use gaze_config::{Paths, Tuning};
+use gaze_core::{DesktopGeometry, NoiseModel, SigmaProfile};
+use gaze_provider_webcam::{DEFAULT_SIGMA_DEG, DEFAULT_SOCKET};
 
-use crate::daydream::RefineMode;
+use crate::config::{DaydreamSpec, OverlayMode, SessionConfig, SourceSpec};
 
 /// Off-axis angle the `--sigma` override declares its flat region reaches to. Far beyond
 /// anything a desk spans, so `SigmaProfile::sigma_at` never leaves that region and every
 /// sample gets exactly the sigma that was asked for, on every output.
 const FLAT_OVERRIDE_DEG: f64 = 1.0e6;
+
+/// The webcam's filter preset: it jitters ~1.5 deg per sample at 30 Hz, which reads as
+/// 60 deg/s and would classify every sample as a saccade under the tracker's defaults,
+/// so the velocity is measured over a longer window with a higher threshold and the
+/// smoother is heavier. Applied unless the same keys are given with `--tune`.
+const WEBCAM_FILTER: [(&str, f64); 4] = [
+    ("filter_velocity_deg_s" , 80.0),
+    ("filter_window_s"       , 0.10),
+    ("filter_min_cutoff_hz"  , 0.6 ),
+    ("filter_beta"           , 0.02),
+];
 
 /// Which source the gaze samples come from.
 ///
@@ -22,8 +40,8 @@ const FLAT_OVERRIDE_DEG: f64 = 1.0e6;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum Provider {
     /// The phase 0 path: grab the Lenovo mouse, integrate its motion as gaze, and take
-    /// commit/exit/redetect (and, with `--scroll`, the wheel) from its own buttons. The
-    /// device is `EVIOCGRAB`ed, so none of it reaches the compositor.
+    /// commit/exit/redetect from its own buttons. The device is `EVIOCGRAB`ed, so none of
+    /// it reaches the compositor.
     #[default]
     Synthetic,
 
@@ -33,8 +51,8 @@ pub enum Provider {
     Webcam,
 
     /// Real gaze from the Tobii ET5 over native USB (`gaze-provider-et5`). Controls
-    /// come from the Lenovo's buttons like `webcam`; calibrate first with
-    /// `gaze-et5-cli calibrate`.
+    /// come from the controller, and from the Lenovo's buttons like `webcam` unless
+    /// `--no-buttons`; calibrate first with `gaze-et5-cli calibrate`.
     Et5,
 
     /// Replay a recorded JSONL session (`--record` from an earlier run). Controls come
@@ -43,23 +61,27 @@ pub enum Provider {
     Replay,
 }
 
-/// Live gaze prototype: grabbed mouse to synthetic gaze to snap to click.
+/// Live gaze prototype: a gaze source to snap to click, with every knob on the command
+/// line.
 ///
 /// Clicking is off by default. Nothing reaches the real pointer until `--click` is passed.
 #[derive(Debug, Parser)]
 #[command(name = "gaze-proto", version)]
 pub struct Args {
-    /// Desk geometry and noise config.
-    #[arg(long, default_value = "config/desk.toml")]
-    pub config: PathBuf,
+    /// A checkout to read the desk's files from: `DIR/config` holds the desk file, the
+    /// calibration, the residual model, the offset and the flywheel, `DIR/models` the
+    /// ONNX models. The daemon reads the XDG locations instead.
+    #[arg(long, default_value = ".")]
+    pub home: PathBuf,
 
-    /// Name substring matching the mouse to grab under /dev/input/event*.
+    /// Name substring matching the mouse read for commits under /dev/input/event*.
     #[arg(long, default_value = "Lenovo")]
     pub device: String,
 
-    /// Directory holding the ONNX models.
-    #[arg(long, default_value = "models")]
-    pub models: PathBuf,
+    /// Read no mouse for commits: the controller is the only commit channel, as in the
+    /// daemon. Not for `--provider synthetic`, whose mouse is the gaze.
+    #[arg(long, conflicts_with = "device")]
+    pub no_buttons: bool,
 
     /// Where gaze samples come from. See `Provider` for what commits in each mode.
     #[arg(long, value_enum, default_value_t = Provider::Synthetic)]
@@ -69,13 +91,12 @@ pub struct Args {
     #[arg(long)]
     pub replay: Option<PathBuf>,
 
-    /// Leave the button device readable by the compositor in `webcam` and `replay` mode.
+    /// Do not grab the commit mouse.
     ///
     /// The default grabs it, because the Lenovo is a dedicated spare: without the grab a
     /// commit press also clicks whatever the pointer is over and the exit press also
     /// right-clicks the desktop. Pass this when reading a mouse that is still in use as a
-    /// mouse, and accept that the scroll tier can then only warp, not re-inject. Has no
-    /// effect under `--provider synthetic`, which always grabs.
+    /// mouse. Has no effect under `--provider synthetic`, which always grabs.
     #[arg(long)]
     pub no_grab: bool,
 
@@ -90,126 +111,20 @@ pub struct Args {
     #[arg(long)]
     pub camera: Option<PathBuf>,
 
-    /// Calibration file for the webcam or ET5 provider. Omitted, the provider's
-    /// conventional file (`config/calibration.toml` / `config/calibration-et5.toml`)
-    /// is used when it exists; truly uncalibrated runs are worth several degrees of
-    /// error (`gaze-webcam-cli calibrate` / `gaze-et5-cli calibrate` fit one).
-    #[arg(long)]
-    pub calibration: Option<PathBuf>,
-
-    /// Residual model for the ET5 provider (`gaze-et5-cli fit`). Omitted, the
-    /// conventional file (`config/model-et5.json`) is used when it exists.
-    #[arg(long)]
-    pub model: Option<PathBuf>,
-
-    /// Where the ET5 online offset (the day's bias, learnt from real clicks) persists
-    /// across runs. Only meaningful with a residual model.
-    #[arg(long, default_value = "config/offset-et5.json")]
-    pub offset: PathBuf,
-
     /// Keep the ET5 online offset frozen: real clicks are attributed and logged but
-    /// do not move it, and nothing is written to `--offset`.
+    /// do not move it, and nothing is written to the offset file.
     #[arg(long)]
     pub freeze_offset: bool,
-
-    /// Where the ET5 flywheel writes every attributed click with its features, one
-    /// JSONL file per UTC day (`gaze-et5-cli flywheel` reads them). Only meaningful
-    /// with a residual model.
-    #[arg(long, default_value = "config/flywheel")]
-    pub flywheel: PathBuf,
 
     /// Write no flywheel records this run.
     #[arg(long)]
     pub no_flywheel: bool,
 
-    /// I-VT saccade velocity threshold, deg/s. Default 30 (tracker) or 80 (webcam).
-    #[arg(long)]
-    pub filter_velocity_deg_s: Option<f64>,
-
-    /// Velocity estimation window, seconds. Default 0.02 (tracker) or 0.10 (webcam).
-    #[arg(long)]
-    pub filter_window_s: Option<f64>,
-
-    /// One-euro minimum cutoff, Hz. Lower is smoother and laggier during fixations.
-    /// Default 1.0 (tracker) or 0.6 (webcam).
-    #[arg(long)]
-    pub filter_min_cutoff_hz: Option<f64>,
-
-    /// One-euro speed coefficient. Default 0.3 (tracker) or 0.02 (webcam).
-    #[arg(long)]
-    pub filter_beta: Option<f64>,
-
-    /// Route the real mouse wheel to the window under the gaze point instead of the one
-    /// under the pointer. The scroll tier: no precision needed, highest volume (DESIGN.md
-    /// section 3, principle 4).
-    #[arg(long)]
-    pub scroll: bool,
-
-    /// How far the gaze point must be from the pointer, in degrees of visual angle, before
-    /// a wheel event warps the pointer to it. Below this the pointer is already close
-    /// enough that warping would only steal the user's own scroll position.
-    #[arg(long, default_value_t = 3.0)]
-    pub scroll_warp_deg: f64,
-
-    /// Warp the pointer to a fixation that dwells on a different output than the pointer
-    /// is on. No click, just the warp, so keyboard-follows-mouse desktops follow gaze.
-    #[arg(long)]
-    pub focus_follows_gaze: bool,
-
-    /// Seconds a fixation must last before `--focus-follows-gaze` warps to it.
-    #[arg(long, default_value_t = 0.4)]
-    pub focus_dwell_s: f64,
-
-    /// Scroll the surface under the gaze continuously while the eyes dwell in its lower
-    /// or upper band, at a speed that grows with how deep in the band they are. The
-    /// surface is the real scrolling region from the accessibility tree, never the
-    /// window; where the tree has no answer nothing scrolls. Only while the eyes are
-    /// not pointing: a thumb on the Daydream pad or the F14 latch silences it, and with
-    /// the thumb up the overlay shows the band the eyes are near as a faint zone. See
-    /// `edge_scroll`.
-    #[arg(long)]
-    pub edge_scroll: bool,
-
-    /// Share of the surface's height forming the lower (read-on) band.
-    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_BAND_FRACTION)]
-    pub edge_band: f64,
-
-    /// Share of the surface's height forming the upper (go-back) band.
-    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_TOP_BAND_FRACTION)]
-    pub edge_top_band: f64,
-
-    /// Seconds the gaze must stay in the lower band before scrolling starts.
-    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_DWELL_S)]
-    pub edge_dwell_s: f64,
-
-    /// Seconds the gaze must stay in the upper band before scrolling starts.
-    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_TOP_DWELL_S)]
-    pub edge_top_dwell_s: f64,
-
-    /// Scroll speed at the surface's edge, wheel lines per second.
-    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_MAX_LINES_S)]
-    pub edge_max_lines_s: f64,
-
-    /// Seconds for the speed to ramp up from zero when a scroll starts.
-    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_RAMP_S)]
-    pub edge_ramp_s: f64,
-
-    /// Exponent on band depth: 1 is linear, 2 slow near the inner edge and fast at the outer.
-    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_EXPONENT)]
-    pub edge_exponent: f64,
-
-    /// Seconds the eyes must hold the outer part of the band before the speed grows.
-    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_HOLD_S)]
-    pub edge_hold_s: f64,
-
-    /// Speed multiplier gained per second of hold past `--edge-hold-s` (2 doubles it
-    /// every second), capped at 40 lines per second overall.
-    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_HOLD_GAIN)]
-    pub edge_hold_gain: f64,
-
-    /// Speed multiplier while the tracked eyes are past the edge of the screen itself.
-    #[arg(long, default_value_t = crate::edge_scroll::DEFAULT_TURBO)]
-    pub edge_turbo: f64,
+    /// Override one tuning knob for this run, `KEY=VALUE`; repeatable. The keys are
+    /// the fields of `gaze_config::Tuning`, e.g. `--tune edge_dwell_s=0.4`. The stored
+    /// tuning is never read or written by the prototype.
+    #[arg(long = "tune", value_name = "KEY=VALUE")]
+    pub tune: Vec<String>,
 
     /// Override the desk noise profile with a flat sigma, in degrees, on every output.
     /// Also sets the webcam provider's flat sigma, which otherwise defaults to the 2.5
@@ -222,11 +137,12 @@ pub struct Args {
     #[arg(long)]
     pub sigma_profile: bool,
 
-    /// Log what would be clicked instead of clicking it. The default.
+    /// Log what would be clicked, scrolled and warped instead of doing it. The default.
     #[arg(long, conflicts_with = "click")]
     pub dry_run: bool,
 
-    /// Really inject clicks through /dev/uinput. Moves the real pointer.
+    /// Really inject through /dev/uinput: clicks, edge scrolls and the pointer warps
+    /// that carry them. Moves the real pointer.
     #[arg(long)]
     pub click: bool,
 
@@ -237,20 +153,8 @@ pub struct Args {
     /// Draw the debug overlay (gaze ring, raw candidate box, state caption) instead of
     /// the pointer look. The pointer look shows a dot only near something clickable and
     /// a themed highlight on the favoured control; the debug look shows everything.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "overlay_always")]
     pub overlay_debug: bool,
-
-    /// How close the gaze must be to an element, degrees from its nearest edge, for the
-    /// pointer look to show the dot and highlight it. The snap engine still targets out
-    /// to `--snap-deg`, so a commit past this distance lands on an unmarked element.
-    #[arg(long, default_value_t = 0.8)]
-    pub near_deg: f64,
-
-    /// Snap radius: how far the gaze may be from an element's nearest edge, degrees, for
-    /// the engine to target it at all. Wider forgives more tracker error and pulls to
-    /// more wrong elements.
-    #[arg(long, default_value_t = 2.0)]
-    pub snap_deg: f64,
 
     /// Show the pointer look for the whole run. The default shows it only while a thumb
     /// rests on the Daydream pad or F14 has latched it on, so reading is never marked
@@ -258,78 +162,18 @@ pub struct Args {
     #[arg(long)]
     pub overlay_always: bool,
 
-    /// How long the pointer dot takes to settle on a new gaze point, seconds. The dot
-    /// follows the gaze on a critically damped spring stepped at the display's frame
-    /// rate; shorter is more responsive and passes more of the tracker's jitter.
-    #[arg(long, default_value_t = 0.2)]
-    pub pointer_settle_s: f64,
-
-    /// How long the pointer dot stays up after nothing clickable is near, seconds.
-    #[arg(long, default_value_t = 0.3)]
-    pub pointer_linger_s: f64,
-
-    /// Do not ask the accessibility tree what the eyes are on. Asked, the tree's answer
-    /// outranks the recogniser's kind for the pointer look: a control it names is marked
-    /// with its own box, text it names is never marked. Applications off the bus
-    /// (Chromium and Electron without accessibility forced on, see gaze-a11y's README)
-    /// fall back to the recogniser either way.
-    #[arg(long)]
-    pub no_a11y: bool,
-
-    /// Let the pointer look mark text elements (OCR words, labels) as well as controls.
-    /// Off, a target that is text gets no highlight and no dot, so a page of prose stays
-    /// unmarked while it is read; a commit on an OCR word still lands, unmarked.
-    #[arg(long)]
-    pub highlight_text: bool,
-
-    /// Read the Daydream controller (`gaze-daydream`) alongside the mouse: its pad
-    /// commits, Home exits, App holds the voice stack's push-to-talk (forwarded as F13),
-    /// the volume keys are a wheel, a thumb resting on the pad shows the pointer look,
-    /// and a thumb that travels refines the commit point (see `--refine`). Pair it once with
-    /// `bluetoothctl` and wake it with Home before starting.
-    #[arg(long)]
-    pub daydream: bool,
+    /// Read no Daydream controller even if one is paired. The default reads the first
+    /// paired one (`gaze-daydream`): its pad commits, Home exits, App holds the voice
+    /// stack's push-to-talk (forwarded as F13), the volume keys are a wheel, a thumb
+    /// resting on the pad shows the pointer look, and a thumb that travels refines the
+    /// commit point. Pair it once with `bluetoothctl`; a sleeping controller is retried
+    /// until Home wakes it.
+    #[arg(long, conflicts_with = "daydream_address")]
+    pub no_daydream: bool,
 
     /// The controller's Bluetooth address, when more than one is paired.
-    #[arg(long, requires = "daydream")]
+    #[arg(long)]
     pub daydream_address: Option<String>,
-
-    /// What moves the commit point while the thumb rests on the controller's pad.
-    #[arg(long, value_enum, default_value_t = RefineMode::Touch, requires = "daydream")]
-    pub refine: RefineMode,
-
-    /// Gyro refine gain, logical pixels per radian of wrist turn.
-    #[arg(long, default_value_t = crate::daydream::DEFAULT_GYRO_GAIN_PX_PER_RAD)]
-    pub refine_gyro_gain: f64,
-
-    /// Touch refine gain, logical pixels per full pad width.
-    #[arg(long, default_value_t = crate::daydream::DEFAULT_TOUCH_GAIN_PX)]
-    pub refine_touch_gain: f64,
-
-    /// Side of the box, centred on where the refine began, that the refined point stays
-    /// inside, in logical pixels.
-    #[arg(long, default_value_t = crate::daydream::DEFAULT_RANGE_PX)]
-    pub refine_range: f64,
-
-    /// Which gyro axes drive pointer x and y, each `x`, `y` or `z` with an optional
-    /// minus, pointer x first. Change it if the wrist and the pointer disagree.
-    #[arg(long, default_value = crate::daydream::DEFAULT_AXES)]
-    pub refine_axes: String,
-
-    /// Commit channel latency, in seconds. A commit is attributed to the target that was
-    /// fixated this long ago, not to whatever is under the gaze now.
-    #[arg(long, default_value_t = 0.15)]
-    pub commit_latency: f64,
-
-    /// Fraction of an output's frame that must change before detection re-runs on it.
-    #[arg(long, default_value_t = 0.02)]
-    pub redetect_threshold: f32,
-
-    /// Seconds after which an output is re-detected regardless of how little changed. The
-    /// frame-diff trigger catches real changes within ~200 ms, so this is only a backstop;
-    /// at 2 s it kept the detector pinned (~8 cores) on a static desktop.
-    #[arg(long, default_value_t = 15.0)]
-    pub redetect_interval: f64,
 
     /// Append every provider sample to this file as one JSON object per line, for replay.
     #[arg(long)]
@@ -351,7 +195,103 @@ pub struct Args {
 // --- Args ---
 
 impl Args {
-    /// Resolves the noise model to run the provider with.
+    /// The files this run reads.
+    pub fn paths(&self) -> Paths {
+        Paths::home(&self.home)
+    }
+
+    /// Everything the session needs before it starts, read from the desk file and the
+    /// flags. Fails when the desk file is missing or malformed, or a required flag is.
+    pub fn session(&self) -> Result<SessionConfig> {
+        let paths = self.paths();
+        let desk  = paths.desk();
+
+        let text = std::fs::read_to_string(&desk)
+            .with_context(|| format!("reading {}", desk.display()))?;
+
+        let geometry = DesktopGeometry::from_toml(&text)
+            .with_context(|| format!("parsing {}", desk.display()))?;
+
+        // Files the provider only reads when they exist, so a freshly fitted model is
+        // never silently ignored and a missing one is loud where it is opened.
+        let existing = |path: PathBuf| path.exists().then_some(path);
+
+        let source = match self.provider {
+            Provider::Synthetic => SourceSpec::Synthetic {
+                device : self.device.clone(),
+                gain   : self.gain,
+                seed   : self.seed,
+                model  : self.noise_model(geometry.noise)?,
+            },
+
+            Provider::Webcam => SourceSpec::Webcam {
+                socket      : self.webcam_socket.clone(),
+                camera      : self.camera.clone(),
+                calibration : existing(paths.config_dir.join("calibration.toml")),
+                sigma_deg   : self.sigma.unwrap_or(DEFAULT_SIGMA_DEG),
+                desk_text   : text,
+            },
+
+            Provider::Et5 => SourceSpec::Et5 {
+                calibration : existing(paths.calibration()),
+                model       : existing(paths.model()),
+                device_blob : paths.device_blob(),
+                offset      : (!self.freeze_offset).then(|| paths.offset()),
+                flywheel    : (!self.no_flywheel).then(|| paths.flywheel()),
+            },
+
+            Provider::Replay => SourceSpec::Replay {
+                path : self.replay.clone().context("--provider replay needs --replay <FILE>")?,
+            },
+        };
+
+        let daydream = match (&self.daydream_address, self.no_daydream) {
+            (Some(address), _) => DaydreamSpec::Address(address.clone()),
+            (None, true)       => DaydreamSpec::Off,
+            (None, false)      => DaydreamSpec::Auto,
+        };
+
+        let overlay = match (self.overlay_debug, self.overlay_always) {
+            (true, _)      => OverlayMode::Debug,
+            (false, true)  => OverlayMode::Always,
+            (false, false) => OverlayMode::Pointer,
+        };
+
+        Ok(SessionConfig {
+            geometry   : geometry,
+            models_dir : paths.models_dir,
+            source     : source,
+            buttons    : (!self.no_buttons).then(|| self.device.clone()),
+            grab       : !self.no_grab,
+            daydream   : daydream,
+            click      : !self.dry_run && self.click,
+            overlay    : overlay,
+            show_truth : self.show_truth,
+            record     : self.record.clone(),
+            seconds    : self.seconds,
+        })
+    }
+
+    /// The tuning this run starts under: the defaults, the webcam preset when the
+    /// provider is the webcam, then every `--tune` in order. Fails on a bad key or
+    /// value.
+    pub fn tuning(&self) -> Result<Tuning> {
+        let mut tuning = Tuning::default();
+
+        if self.provider == Provider::Webcam {
+            for (key, value) in WEBCAM_FILTER {
+                tuning.set(key, value);
+            }
+        }
+
+        for assignment in &self.tune {
+            tuning.apply(assignment).map_err(|e| anyhow::anyhow!("--tune: {e}"))?;
+        }
+
+        Ok(tuning)
+    }
+
+    /// Resolves the noise model to run the synthetic provider with.
     ///
     /// `desk` is whatever the config's `[noise]` section held. Rate, drift and latency
     /// always come from there, because they describe the tracker being simulated rather
@@ -359,7 +299,7 @@ impl Args {
     /// `--sigma`.
     pub fn noise_model(&self, desk: Option<NoiseModel>) -> Result<NoiseModel> {
         let mut model = desk.with_context(|| {
-            format!("{} has no [noise] section", self.config.display())
+            format!("{} has no [noise] section", self.paths().desk().display())
         })?;
 
         if let Some(sigma_deg) = self.sigma {
@@ -379,37 +319,14 @@ impl Args {
         Ok(model)
     }
 
-    /// How long an output may go without a fresh detection.
-    pub fn redetect_interval(&self) -> Duration {
-        Duration::from_secs_f64(self.redetect_interval.max(0.0))
-    }
-
     /// Whether anything at all may reach the real pointer this run.
     ///
-    /// `--dry-run` is the master off switch: it gates warps and scrolls (wheel and edge)
-    /// as well as clicks,
-    /// so a dry run is safe to leave running while the desk is being used for something
-    /// else. Note that the default (neither flag) is *not* a dry run for the scroll tier:
-    /// `--scroll` alone scrolls for real, because a scroll is not a click and routing it
-    /// to the window under gaze is the whole point of the flag.
+    /// `--dry-run` is the master off switch, and so is the default: without `--click`
+    /// there is no injector, so no warp, scroll or click can happen even by accident.
+    /// With it, all three are live, because the warps and the edge scrolls are what
+    /// carry the clicks to where they land.
     pub fn injects(&self) -> bool {
-        !self.dry_run && (self.click || self.scroll || self.focus_follows_gaze || self.edge_scroll)
-    }
-
-    /// The edge scroller's tunables from the flags.
-    pub fn edge_params(&self) -> crate::edge_scroll::EdgeParams {
-        crate::edge_scroll::EdgeParams {
-            band_fraction     : self.edge_band,
-            top_band_fraction : self.edge_top_band,
-            dwell_s           : self.edge_dwell_s,
-            top_dwell_s       : self.edge_top_dwell_s,
-            max_lines_s       : self.edge_max_lines_s,
-            ramp_s            : self.edge_ramp_s,
-            exponent          : self.edge_exponent,
-            hold_s            : self.edge_hold_s,
-            hold_gain         : self.edge_hold_gain,
-            turbo             : self.edge_turbo,
-        }
+        !self.dry_run && self.click
     }
 }
 
@@ -444,5 +361,32 @@ mod tests {
 
         // Rate still comes from the desk config: the override only touches the profile.
         assert_eq!(model.rate_hz, 120.0);
+    }
+
+    /// The webcam preset applies under its provider and only there, and an explicit
+    /// `--tune` beats it; a bad assignment is an error, not a silent default.
+    #[test]
+    fn tuning_layers_defaults_preset_and_overrides() {
+        let tracker = Args::parse_from(["gaze-proto", "--provider", "et5"]).tuning().unwrap();
+
+        assert_eq!(tracker, Tuning::default());
+
+        let webcam = Args::parse_from(["gaze-proto", "--provider", "webcam"]).tuning().unwrap();
+
+        assert_eq!(webcam.filter_velocity_deg_s, 80.0);
+        assert_eq!(webcam.filter_beta, 0.02);
+        assert_eq!(webcam.snap_deg, Tuning::default().snap_deg);
+
+        let tuned = Args::parse_from([
+            "gaze-proto", "--provider", "webcam", "--tune", "filter_beta=0.5", "--tune", "snap_deg=3",
+        ])
+        .tuning()
+        .unwrap();
+
+        assert_eq!(tuned.filter_beta, 0.5);
+        assert_eq!(tuned.filter_velocity_deg_s, 80.0);
+        assert_eq!(tuned.snap_deg, 3.0);
+
+        assert!(Args::parse_from(["gaze-proto", "--tune", "snap=3"]).tuning().is_err());
     }
 }

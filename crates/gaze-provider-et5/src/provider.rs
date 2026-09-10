@@ -163,6 +163,17 @@ pub struct Et5Provider {
     stopped      : bool,
 }
 
+/// The online offset's state, as a status line wants it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OffsetSummary {
+    /// Accepted clicks folded in over the life of the state.
+    pub updates    : u64,
+    /// Bias jumps adopted from a consensus of rejects.
+    pub jumps      : u64,
+    /// The global mean bias, yaw and pitch degrees.
+    pub global_deg : [f64; 2],
+}
+
 /// Builder for `Et5Provider`.
 pub struct Et5ProviderBuilder {
     /// The residual model run on every direct-mode frame, when one is fitted.
@@ -251,6 +262,41 @@ impl Et5Provider {
     /// Whether a residual model is running, and with it the online offset.
     pub fn has_model(&self) -> bool {
         self.convert.model.is_some()
+    }
+
+    /// Whether the link is up right now. False between a transport error and the
+    /// reconnect that follows it.
+    pub fn connected(&self) -> bool {
+        self.device.is_some()
+    }
+
+    /// Whether a calibration was loaded for this provider.
+    pub fn calibrated(&self) -> bool {
+        self.convert.calibration.is_some()
+    }
+
+    /// The online offset's state in brief, `None` without a residual model.
+    pub fn offset_summary(&self) -> Option<OffsetSummary> {
+        self.convert.model.as_ref().map(|m| {
+            let state = m.offset.state();
+
+            OffsetSummary {
+                updates    : state.updates,
+                jumps      : state.jumps,
+                global_deg : m.offset.global_deg(),
+            }
+        })
+    }
+
+    /// Forgets the day's offset, every anchor, and writes the empty state out where
+    /// the offset persists. Nothing happens without a residual model.
+    pub fn reset_offset(&mut self) {
+        if let Some(m) = self.convert.model.as_mut() {
+            m.offset.reset();
+            m.offset.save();
+
+            info!("online offset reset");
+        }
     }
 
     /// The instant the provider's clock started: every sample's `t_s` is seconds since
