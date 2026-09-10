@@ -157,19 +157,21 @@ uses), name and path `dev.techgeek1.CosmicGaze` / `/dev/techgeek1/CosmicGaze`:
 properties `Tracker`, `Calibrated`, `Model`, `Controller`, `Paused` (booleans), `Mode`
 (`no-tracker`, `paused`, `reading`, `pointing`, `scrolling`), `OffsetUpdates`,
 `OffsetJumps`, `OffsetYawDeg`, `OffsetPitchDeg`; methods `Pause`, `Resume`,
-`ResetOffset`. Recalibrate arrives with U4. `gaze_config::Status` is the Rust side of
+`ResetOffset`, `Quit`. Recalibrate arrives with U4. `gaze_config::Status` is the Rust side of
 those properties, filled by the session loop through `gaze_proto::Live`, which also
 carries the pause and reset flags and the tuning in.
 
 The daemon retries the tracker every few seconds when it is not on the bus, and runs
-the session again if it ends. The overlay stays in-process for latency. Autostart via
-the XDG autostart entry in `data/`.
+the session again if it ends. The overlay stays in-process for latency. Not started with
+the session: the applet's Start button runs it and its Stop button calls `Quit`
+(2026-09-10), so the tracker only runs while it is wanted.
 
 ## U3. Applet — built 2026-09-10
 
 `gaze-applet` (`cosmic-ext-applet-gaze`), a libcosmic panel applet on the same pin as
 the trainer. Status icon; a popup with the live state (tracker, calibration, model,
-controller, mode, offset), a pause toggle, and an "Advanced" section that draws every
+controller, mode, offset), a Start/Stop button that runs the installed `gazed` and
+calls `Quit`, a pause toggle, and an "Advanced" section that draws every
 `KNOBS` entry as a slider writing straight to cosmic-config, so the feel can be tuned
 on the running system without a rebuild or a restart. It polls the daemon's properties
 over D-Bus (one `GetAll` a second, faster while open), which survives the daemon

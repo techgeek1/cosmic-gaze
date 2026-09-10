@@ -1990,6 +1990,7 @@ dependencies = [
 name = "gaze-applet"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "gaze-config",
  "libcosmic",
  "serde",

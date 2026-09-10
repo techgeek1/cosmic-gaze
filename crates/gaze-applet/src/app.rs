@@ -1,11 +1,11 @@
-//! The applet: a status icon, and a popup with the daemon's state, a pause toggle, and
-//! the tuning knobs behind an "Advanced" fold.
+//! The applet: a status icon, and a popup with the daemon's state, a Start/Stop button,
+//! a pause toggle, and the tuning knobs behind an "Advanced" fold.
 //!
 //! Status comes from polling the daemon (`daemon.rs`) on a timer; tuning is read from
 //! cosmic-config on start and watched for changes from elsewhere, and every slider
 //! writes its key straight back, which is what the daemon watches.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cosmic::cosmic_config::{self, ConfigSet};
 use cosmic::iced::platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup};
@@ -34,6 +34,11 @@ const POLL_OPEN: Duration = Duration::from_millis(500);
 /// The popup's width, logical pixels.
 const POPUP_WIDTH: f32 = 340.0;
 
+/// How long after Start the button reads "Starting" while the daemon is not yet on the
+/// bus. The daemon claims its name within a second; past this it did not come up, and
+/// the button offers Start again (the log says why).
+const STARTING_GRACE: Duration = Duration::from_secs(10);
+
 /// The state dot's colours: running, paused, and no daemon or no tracker.
 const DOT_RUNNING: Color = Color::from_rgb(0.2, 0.8, 0.2);
 const DOT_PAUSED : Color = Color::from_rgb(0.9, 0.7, 0.1);
@@ -47,6 +52,8 @@ pub struct App {
     status   : Option<Status>,
     /// Whether the last poll has come back, so a slow bus does not queue polls.
     polling  : bool,
+    /// When Start was pressed, until the daemon answers or [`STARTING_GRACE`] passes.
+    starting : Option<Instant>,
     /// Whether the knobs are shown.
     advanced : bool,
     tuning   : Tuning,
@@ -62,6 +69,12 @@ pub enum Message {
     PopupClosed(window::Id),
     Poll,
     Status(Option<Status>),
+    /// Run the daemon.
+    Start,
+    /// The daemon was run, or could not be.
+    Started(Result<(), String>),
+    /// Ask the daemon to exit.
+    Stop,
     SetPaused(bool),
     ResetOffset,
     /// A fire-and-forget daemon call finished; poll again so the popup catches up.
@@ -110,7 +123,7 @@ impl App {
     /// The status rows of the popup.
     fn status_rows(&self, spacing: &Spacing) -> Vec<Element<'_, Message>> {
         let Some(status) = &self.status else {
-            return vec![padded_control(text::body("Daemon not running")).into()];
+            return vec![padded_control(text::body("Not running")).into()];
         };
 
         let flags = [
@@ -216,6 +229,7 @@ impl cosmic::Application for App {
             popup    : None,
             status   : None,
             polling  : false,
+            starting : None,
             advanced : false,
             tuning   : tuning,
             store    : store,
@@ -263,6 +277,38 @@ impl cosmic::Application for App {
             Message::Status(status) => {
                 self.polling = false;
                 self.status  = status;
+
+                // Up, or given up on.
+                if self.status.is_some()
+                    || self.starting.is_some_and(|since| since.elapsed() > STARTING_GRACE)
+                {
+                    self.starting = None;
+                }
+            }
+
+            Message::Start => {
+                self.starting = Some(Instant::now());
+
+                return cosmic::task::future(async {
+                    Message::Started(daemon::start().map_err(|e| format!("{e:#}")))
+                });
+            }
+
+            Message::Started(result) => {
+                if let Err(e) = result {
+                    warn!("starting the daemon failed: {e}");
+                    self.starting = None;
+                }
+
+                return self.poll();
+            }
+
+            Message::Stop => {
+                return cosmic::task::future(async {
+                    daemon::quit().await;
+
+                    Message::Called
+                });
             }
 
             Message::SetPaused(paused) => {
@@ -363,21 +409,33 @@ impl cosmic::Application for App {
 
         // --- controls ---
 
-        let paused = self.status.as_ref().is_some_and(|s| s.paused);
+        let running = self.status.is_some();
 
-        content = content.push(padded_control(
-            row![
-                text::body("Paused"),
-                widget::Space::new().width(Length::Fill),
-                toggler(paused).on_toggle(Message::SetPaused),
-            ]
-            .spacing(space_xs)
-            .align_y(Alignment::Center),
-        ));
+        let run_button = match (running, self.starting) {
+            (true,  _)       => widget::button::standard("Stop").on_press(Message::Stop),
+            (false, Some(_)) => widget::button::standard("Starting"),
+            (false, None)    => widget::button::suggested("Start").on_press(Message::Start),
+        };
 
-        content = content.push(padded_control(
-            widget::button::standard("Reset offset").on_press(Message::ResetOffset),
-        ));
+        content = content.push(padded_control(run_button));
+
+        if running {
+            let paused = self.status.as_ref().is_some_and(|s| s.paused);
+
+            content = content.push(padded_control(
+                row![
+                    text::body("Paused"),
+                    widget::Space::new().width(Length::Fill),
+                    toggler(paused).on_toggle(Message::SetPaused),
+                ]
+                .spacing(space_xs)
+                .align_y(Alignment::Center),
+            ));
+
+            content = content.push(padded_control(
+                widget::button::standard("Reset offset").on_press(Message::ResetOffset),
+            ));
+        }
 
         content = content.push(
             padded_control(widget::divider::horizontal::default()).padding([space_xxs, space_s]),

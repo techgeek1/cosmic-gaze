@@ -26,11 +26,12 @@ cosmic-config under `~/.config/cosmic/dev.techgeek1.CosmicGaze/v1/` (one file pe
 written with the defaults on first run) and applied at the next sample when edited,
 whether by the applet's Advanced section or by hand.
 
-`just install` from the workspace root puts `gazed` and the applet under `~/.local/bin`
-and installs the autostart entry (`data/dev.techgeek1.CosmicGaze.desktop`) that
-cosmic-session honours; `just install-desk` copies the desk's files from the checkout
-to the XDG locations above. After both, `gazed` from a terminal is the installed daemon
-on the installed files, and the next login starts it by itself.
+`just install` from the workspace root puts `gazed` and the applet under `~/.local/bin`;
+`just install-desk` copies the desk's files from the checkout to the XDG locations
+above. The daemon does not start with the session: the applet's Start button runs the
+installed `gazed` (its log goes to `~/.local/state/cosmic-gaze/gazed.log`) and its Stop
+button calls `Quit`, so the tracker only runs while it is wanted. `gazed` from a
+terminal is the same daemon on the same files, with the log on stderr.
 
 ## Control interface
 
@@ -43,7 +44,7 @@ busctl --user get-property dev.techgeek1.CosmicGaze /dev/techgeek1/CosmicGaze de
 Properties: `Tracker`, `Calibrated`, `Model`, `Controller`, `Paused`, `Mode`
 (`no-tracker`, `paused`, `reading`, `pointing`, `scrolling`), `OffsetUpdates`,
 `OffsetJumps`, `OffsetYawDeg`, `OffsetPitchDeg`. Methods: `Pause`, `Resume`,
-`ResetOffset`. The Rust side of this is `gaze_config::bus`.
+`ResetOffset`, `Quit`. The Rust side of this is `gaze_config::bus`.
 
 ## What it needs
 

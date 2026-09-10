@@ -55,6 +55,12 @@ impl Service {
         self.live.request_reset_offset();
     }
 
+    /// Ends the session and exits, as a signal would.
+    fn quit(&self) {
+        info!("quit requested");
+        self.live.stop();
+    }
+
     #[zbus(property)]
     fn tracker(&self) -> bool {
         self.live.status().tracker

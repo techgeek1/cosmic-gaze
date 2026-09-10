@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Gaze
-Comment=Gaze pointing, scrolling and clicking for COSMIC
-Exec=gazed
-Icon=preferences-desktop-accessibility-symbolic
-NoDisplay=true
-Terminal=false
-Categories=COSMIC;Accessibility;

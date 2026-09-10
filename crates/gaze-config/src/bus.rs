@@ -79,6 +79,10 @@ pub trait Gaze {
     /// Forgets the day's offset: every anchor, back to the model alone.
     fn reset_offset(&self) -> zbus::Result<()>;
 
+    /// Ends the session and exits the daemon, as SIGTERM would: the pointer is returned
+    /// and the offset saved. The applet's Stop button.
+    fn quit(&self) -> zbus::Result<()>;
+
     #[zbus(property)]
     fn tracker(&self) -> zbus::Result<bool>;
 

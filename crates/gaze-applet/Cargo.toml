@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 gaze-config = { workspace = true }
+anyhow      = { workspace = true }
 serde       = { workspace = true }
 
 tracing            = { workspace = true }
