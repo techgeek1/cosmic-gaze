@@ -22,7 +22,7 @@ use tiny_skia::Pixmap;
 
 use crate::draw::{self, Item, PixelBox};
 use crate::mapping::OutputMapping;
-use crate::state::{OverlayState, Pointer, Target, Zone};
+use crate::state::{Mark, OverlayState, Pointer, Target, Zone};
 use crate::theme::Theme;
 
 /// Radius of the dot, logical pixels. Eight across, about four times a period in the
@@ -63,6 +63,19 @@ pub const ZONE_FILL_ALPHA: f32 = 0.05;
 
 /// Alpha of the zone's interior while it is scrolling, so the scroll is visibly on.
 pub const ZONE_ACTIVE_FILL_ALPHA: f32 = 0.1;
+
+/// Radius of a ceremony mark's ring, logical pixels. Half the 40 px square the
+/// ceremonies drew before, so the target the eyes are asked to hold, and the gates
+/// tuned against it, are unchanged.
+pub const MARK_RADIUS_PX: f64 = 20.0;
+
+/// Alpha of the mark's interior at the start of a hold.
+pub const MARK_FILL_ALPHA: f32 = 0.08;
+
+/// Alpha of the mark's interior once the hold is complete. The fill is the only
+/// progress the user sees now that the caption is gone, so its end has to be plainly
+/// different from its start, and it stops well short of hiding the centre dot.
+pub const MARK_FULL_FILL_ALPHA: f32 = 0.35;
 
 /// Time constant of a fade in, seconds. About three of these to look fully there.
 pub const FADE_IN_S: f64 = 0.06;
@@ -119,6 +132,8 @@ pub struct Presenter {
     boxes  : Vec<Highlight>,
     /// Every scroll zone still visible, likewise.
     zones  : Vec<Band>,
+    /// The ceremony target, shown exactly as given: no fade, no spring.
+    mark   : Option<Mark>,
     /// The clock as of the last step, seconds on the caller's timeline.
     now_s  : f64,
 }
@@ -168,6 +183,7 @@ impl Presenter {
             away_s : None,
             boxes  : Vec::new(),
             zones  : Vec::new(),
+            mark   : None,
             now_s  : 0.0,
         }
     }
@@ -186,6 +202,12 @@ impl Presenter {
     /// The theme in use.
     pub fn theme(&self) -> &Theme {
         &self.theme
+    }
+
+    /// Replaces the ceremony target. Drawn on the next frame where it is; `None`
+    /// removes it on the next frame. Nothing animates: the target is where to look.
+    pub fn set_mark(&mut self, mark: Option<Mark>) {
+        self.mark = mark;
     }
 
     /// Takes a new intent. Sets where every fade is heading; nothing moves until
@@ -314,9 +336,10 @@ impl Presenter {
             || (self.away_s.is_some() && self.dot.goal > 0.0)
     }
 
-    /// True when nothing is drawn and nothing is about to be.
+    /// True when nothing is drawn and nothing is about to be. A mark counts as drawn.
     pub fn is_idle(&self) -> bool {
         self.dot.alpha <= 0.0 && self.boxes.is_empty() && self.zones.is_empty()
+            && self.mark.is_none()
     }
 
     /// The draw items for one output as of the last step. Like [`draw::scene`], items
@@ -372,6 +395,36 @@ impl Presenter {
                 color  : self.theme.accent_at(alpha * HIGHLIGHT_STROKE_ALPHA),
                 fill   : self.theme.accent_at(alpha * HIGHLIGHT_FILL_ALPHA),
                 halo_color : self.theme.halo_at(alpha),
+            });
+        }
+
+        // The mark under the dot: a ring the size of the old target square, its
+        // interior filling with the hold, and the pointer look's own dot at its centre.
+        if let Some(m) = self.mark {
+            let r        = map.buffer_len(MARK_RADIUS_PX);
+            let (cx, cy) = map.buffer(m.at);
+            let fill     = MARK_FILL_ALPHA
+                + (MARK_FULL_FILL_ALPHA - MARK_FILL_ALPHA) * m.progress.clamp(0.0, 1.0);
+
+            items.push(Item::RoundBox {
+                x          : cx - r,
+                y          : cy - r,
+                w          : 2.0 * r,
+                h          : 2.0 * r,
+                radius     : r,
+                stroke     : map.buffer_len(HIGHLIGHT_STROKE_PX),
+                halo       : map.buffer_len(HALO_PX),
+                color      : self.theme.accent_at(HIGHLIGHT_STROKE_ALPHA),
+                fill       : self.theme.accent_at(fill),
+                halo_color : self.theme.halo_at(1.0),
+            });
+            items.push(Item::Marker {
+                cx         : cx,
+                cy         : cy,
+                radius     : map.buffer_len(DOT_RADIUS_PX),
+                halo       : map.buffer_len(HALO_PX),
+                color      : self.theme.accent_at(1.0),
+                halo_color : self.theme.halo_at(1.0),
             });
         }
 
@@ -770,5 +823,51 @@ mod tests {
 
         assert_eq!(alpha, 1.0);
         assert_eq!(target.rect.x, 90.0);
+    }
+
+    /// A ceremony mark is a circle the size of the old target with the dot at its
+    /// centre, drawn where it is put with no fade, and its fill deepens with progress.
+    #[test]
+    fn a_mark_is_a_filled_ring_with_a_dot_that_never_fades() {
+        let mut p = presenter();
+        let at    = GlobalPx { x: 400.0, y: 300.0 };
+
+        p.set_mark(Some(Mark { at: at, progress: 0.0 }));
+
+        let items = p.scene(&map());
+
+        assert_eq!(items.len(), 2);
+
+        let (r, w, h, fill_start) = match items[0] {
+            Item::RoundBox { radius, w, h, fill, .. } => (radius, w, h, fill[3]),
+            _                                         => panic!("ring first"),
+        };
+
+        assert_eq!(w, h);
+        assert_eq!(w, 2.0 * r);
+        assert_eq!(r, map().buffer_len(MARK_RADIUS_PX));
+
+        match items[1] {
+            Item::Marker { cx, cy, .. } => assert_eq!(map().buffer(at), (cx, cy)),
+            _                           => panic!("dot second"),
+        }
+
+        // Time passes: the mark is still there, unfaded, and asks for no frames.
+        assert!(!p.step(p.now_s + 1.0));
+        assert_eq!(p.scene(&map()).len(), 2);
+        assert!(!p.is_idle());
+
+        p.set_mark(Some(Mark { at: at, progress: 1.0 }));
+
+        let fill_end = match p.scene(&map())[0] {
+            Item::RoundBox { fill, .. } => fill[3],
+            _                           => panic!("ring first"),
+        };
+
+        assert!(fill_end > fill_start, "{fill_end} > {fill_start}");
+
+        p.set_mark(None);
+
+        assert!(p.is_idle());
     }
 }

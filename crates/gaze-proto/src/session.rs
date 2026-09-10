@@ -923,6 +923,7 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
                         }),
                         background : None,
                         pointer    : None,
+                        mark       : None,
                     }
                 }
                 else {
@@ -933,6 +934,7 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
                         label      : None,
                         background : None,
                         pointer    : pointer,
+                        mark       : None,
                     }
                 }
             };

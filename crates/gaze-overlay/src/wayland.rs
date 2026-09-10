@@ -395,6 +395,7 @@ impl App {
         }
 
         self.presenter.observe(state.pointer.as_ref());
+        self.presenter.set_mark(state.mark);
         self.state = state;
 
         for surface in &mut self.surfaces {

@@ -1137,11 +1137,10 @@ fn run_round(
         let anchor = plan.points.get(4)
             .or_else(|| round.points.first().and_then(|i| plan.points.get(*i)))
             .ok_or(SweepError::NoDisplays)?;
-        let label  = format!("adapting to {} — eyes on the dot",
-                             round.background.name());
+        info!("adapting to {}: eyes on the dot", round.background.name());
 
-        show_target(overlay, anchor.px, &label)?;
-        wait(ADAPT_S, frames_rx, keys)?;
+        show_target(overlay, anchor.px, 0.0)?;
+        wait(overlay, anchor.px, ADAPT_S, frames_rx, keys)?;
     }
 
     let targets: Vec<[f64; 2]> = round.points.iter()
@@ -1161,14 +1160,15 @@ fn run_round(
 
     for (position, index) in round.points.iter().copied().enumerate() {
         let point = plan.points[index];
-        let label = format!("round {number}/{total} {} ({}) — {} {}/{}: eyes on the dot",
-                            round.name, round.background.name(), point.label,
-                            position + 1, round.points.len());
 
-        show_target(overlay, point.px, &label)?;
+        info!("round {number}/{total} {} ({}): {} {}/{}, eyes on the dot",
+              round.name, round.background.name(), point.label,
+              position + 1, round.points.len());
+
+        show_target(overlay, point.px, 0.0)?;
 
         let result = run_point(overlay, keys, config, gate, frames_rx, &targets,
-                               position, index, point.px, point.label, &label)?;
+                               position, index, point.px, point.label)?;
 
         match result.outcome {
             PointOutcome::Gate    => summary.gate    += 1,
@@ -1238,7 +1238,8 @@ fn run_round(
 /// frames adds it. Once armed the dwell stays armed, since a device that lost its
 /// answer for five seconds has not proved anything by finding it again.
 ///
-/// `name` is the target's short name for the nag line; `label` is the overlay caption.
+/// `name` is the target's short name for the nag line. The mark on screen shows the
+/// gate's progress and nothing else; the numbers go to the log.
 #[allow(clippy::too_many_arguments)]
 fn run_point(
     overlay   : &OverlayHandle,
@@ -1251,7 +1252,6 @@ fn run_point(
     index     : usize,
     px        : GlobalPx,
     name      : &str,
-    label     : &str,
 )
     -> Result<PointResult, SweepError>
 {
@@ -1379,19 +1379,25 @@ fn run_point(
             }
         }
 
-        // Keep the caption alive with the gate's own progress: a user who cannot tell
-        // whether the tracker sees them has no way to fix their posture.
-        let live = {
+        // Keep the mark alive with the gate's own progress: a user who cannot tell
+        // whether the tracker sees them has no way to fix their posture. Under manual
+        // acceptance it is how much of the window names this target; on the dwell
+        // fallback, how much of the dwell has run; otherwise the vote against its gate.
+        let progress = {
             match (config.manual, dwell_armed) {
-                (true, _)      => format!("{label} [click when settled; {}/{} on it]",
-                                          verdict.hits, samples.len()),
-                (false, true)  => format!("{label} [no gaze — hold still, {}/{} eyes]",
-                                          tally.eyes, tally.frames),
-                (false, false) => format!("{label} [{}/{}]", verdict.hits, gate.min_hits),
+                (true, _)      => match samples.len() {
+                    0 => 0.0,
+                    n => verdict.hits as f64 / n as f64,
+                },
+                (false, true)  => match dwell_since {
+                    Some(since) => (now - since) / DWELL_S,
+                    None        => 0.0,
+                },
+                (false, false) => verdict.hits as f64 / gate.min_hits.max(1) as f64,
             }
         };
 
-        show_target(overlay, px, &live)?;
+        show_target(overlay, px, progress.clamp(0.0, 1.0) as f32)?;
 
         std::thread::sleep(TICK);
     }
@@ -1505,9 +1511,10 @@ pub fn run_health(
 
             let px    = out.uv_to_px(u, v);
             let index = row * steps + col + 1;
-            let label = format!("health check {index}/{} — eyes on the dot", steps * steps);
 
-            show_target(overlay, px, &label)?;
+            info!("health check {index}/{}: eyes on the dot", steps * steps);
+
+            show_target(overlay, px, 0.0)?;
 
             while next_frame(&frames_rx)?.is_some() {}
 
@@ -1524,6 +1531,8 @@ pub fn run_health(
                 }
 
                 let t = start.elapsed().as_secs_f64();
+
+                show_target(overlay, px, (t / HEALTH_DWELL_S) as f32)?;
 
                 while let Some(frame) = next_frame(&frames_rx)? {
                     if let Some(uv) = valid_uv(&frame)
@@ -1748,12 +1757,22 @@ fn valid_uv(frame: &Et5Frame) -> Option<[f64; 2]> {
 
 /// Sleeps for `duration_s` in ticks, honouring the abort key and keeping the gaze
 /// queue drained (a full queue would otherwise hand the next target stale frames).
-fn wait(duration_s: f64, frames_rx: &Receiver<Et5Frame>, keys: Option<&Receiver<SweepKey>>)
+fn wait(
+    overlay    : &OverlayHandle,
+    px         : GlobalPx,
+    duration_s : f64,
+    frames_rx  : &Receiver<Et5Frame>,
+    keys       : Option<&Receiver<SweepKey>>,
+)
     -> Result<(), SweepError>
 {
     let start = Instant::now();
 
     while start.elapsed().as_secs_f64() < duration_s {
+        let progress = (start.elapsed().as_secs_f64() / duration_s.max(f64::EPSILON)) as f32;
+
+        show_target(overlay, px, progress)?;
+
         while next_frame(frames_rx)?.is_some() {}
 
         if let Some(keys) = keys {

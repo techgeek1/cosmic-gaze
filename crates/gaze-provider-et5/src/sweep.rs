@@ -39,8 +39,8 @@ use crossbeam_channel::{Receiver, Sender};
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
-use gaze_core::{DesktopGeometry, GlobalPx, OutputGeometry, Ray, Rect};
-use gaze_overlay::{OverlayHandle, OverlayState};
+use gaze_core::{DesktopGeometry, GlobalPx, OutputGeometry, Ray};
+use gaze_overlay::{Mark, OverlayHandle, OverlayState};
 
 use crate::calibration::{
     CALIBRATION_FORMAT, Et5Calibration, HeadGain, OutputCalibration, OutputPose,
@@ -52,9 +52,6 @@ use crate::gaze::{Et5Frame, EyeCombiner, filtered_ray};
 use crate::pose::{PointObservation, PoseObservation, solve_pose, solve_pose_points};
 use crate::triangulate::intersect_rays;
 use crate::ttp::DisplayArea;
-
-/// Side of the target square drawn at each position, logical pixels.
-pub(crate) const TARGET_PX: f64 = 40.0;
 
 /// Animation tick. Short enough that the target motion looks continuous and the gaze
 /// channel never backs up.
@@ -544,6 +541,7 @@ pub fn run_sweep(
         label      : None,
         background : None,
         pointer    : None,
+        mark       : None,
     });
 
     if entries.is_empty() {
@@ -721,24 +719,26 @@ fn run_pass(
             }
         };
 
+        info!("{label}: eyes on the dot");
+
         // Glide to the stop at constant angular speed.
-        glide(geometry, overlay, &label, current, px, t0, frames_rx, &mut pass)?;
+        glide(geometry, overlay, current, px, t0, frames_rx, &mut pass)?;
         current = px;
 
-        // Settle: the saccade and the moment it takes to lock onto the square.
-        show_target(overlay, px, &label)?;
+        // Settle: the saccade and the moment it takes to lock onto the ring.
+        show_target(overlay, px, 0.0)?;
         let mut skip = false;
 
         // Give the posture change a beat before samples count.
         if lean && index == RING_POINTS + 1 {
-            wait_draining(1.5, t0, frames_rx, &mut pass, px, false, keys, &mut skip)?;
+            wait_draining(overlay, 1.5, t0, frames_rx, &mut pass, px, false, keys, &mut skip)?;
 
             if skip {
                 continue;
             }
         }
 
-        wait_draining(config.settle_s, t0, frames_rx, &mut pass, px, false,
+        wait_draining(overlay, config.settle_s, t0, frames_rx, &mut pass, px, false,
                       keys, &mut skip)?;
 
         if skip {
@@ -753,7 +753,7 @@ fn run_pass(
         else {
             let t_start = t0.elapsed().as_secs_f64();
 
-            wait_draining(config.collect_s, t0, frames_rx, &mut pass, px, false,
+            wait_draining(overlay, config.collect_s, t0, frames_rx, &mut pass, px, false,
                           keys, &mut skip)?;
 
             if !skip {
@@ -782,17 +782,18 @@ fn run_pass(
         // regression, and the chunked observations back the ray-solve fallback.
         for (u, v) in TRI_DOTS {
             let target = out.uv_to_px(u, v);
-            let label  = format!("{} hold: eyes on the dot — lean well in and back, side to side, up/down, small turns",
-                                 out.name);
 
-            glide(geometry, overlay, &label, current, target, t0, frames_rx, &mut pass)?;
+            info!("{} hold: eyes on the dot, lean well in and back, side to side, up/down, \
+                   small turns", out.name);
+
+            glide(geometry, overlay, current, target, t0, frames_rx, &mut pass)?;
             current = target;
-            show_target(overlay, target, &label)?;
+            show_target(overlay, target, 0.0)?;
 
             let mut skip = false;
             let t_start  = t0.elapsed().as_secs_f64();
 
-            wait_draining(PARALLAX_HOLD_S, t0, frames_rx, &mut pass, target, false,
+            wait_draining(overlay, PARALLAX_HOLD_S, t0, frames_rx, &mut pass, target, false,
                           keys, &mut skip)?;
 
             if !skip {
@@ -865,12 +866,11 @@ fn ring_stops(out: &OutputGeometry, lean: bool) -> Vec<(f64, f64, GlobalPx)> {
 }
 
 /// Animates the target from `from` to `to` at the configured angular speed, recording
-/// trajectory and draining frames throughout.
-#[allow(clippy::too_many_arguments)]
+/// trajectory and draining frames throughout. The mark shows no progress while it
+/// moves: the hold has not started.
 pub(crate) fn glide(
     geometry  : &DesktopGeometry,
     overlay   : &OverlayHandle,
-    label     : &str,
     from      : GlobalPx,
     to        : GlobalPx,
     t0        : Instant,
@@ -900,7 +900,7 @@ pub(crate) fn glide(
         let a = (start.elapsed().as_secs_f64() / dur_s).min(1.0);
         let p = GlobalPx { x: from.x + dx * a, y: from.y + dy * a };
 
-        show_target(overlay, p, label)?;
+        show_target(overlay, p, 0.0)?;
         drain(frames_rx, t0, &mut pass.frames);
         pass.traj.push(TrajPoint {
             t_s    : t0.elapsed().as_secs_f64(),
@@ -917,9 +917,11 @@ pub(crate) fn glide(
 }
 
 /// Sleeps for `duration_s` in ticks, draining frames and recording the stationary
-/// target. `Advance` ends the wait early, `Skip` sets the flag, `Quit` aborts.
+/// target, and repainting the mark with the hold's progress so the user can see the
+/// wait running out. `Advance` ends the wait early, `Skip` sets the flag, `Quit` aborts.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn wait_draining(
+    overlay    : &OverlayHandle,
     duration_s : f64,
     t0         : Instant,
     frames_rx  : &Receiver<Et5Frame>,
@@ -934,6 +936,9 @@ pub(crate) fn wait_draining(
     let start = Instant::now();
 
     while start.elapsed().as_secs_f64() < duration_s {
+        let progress = (start.elapsed().as_secs_f64() / duration_s.max(f64::EPSILON)) as f32;
+
+        show_target(overlay, target, progress)?;
         drain(frames_rx, t0, &mut pass.frames);
         pass.traj.push(TrajPoint {
             t_s    : t0.elapsed().as_secs_f64(),
@@ -999,22 +1004,16 @@ fn overlay_background() -> Option<[u8; 4]> {
     (packed != 0).then(|| packed.to_be_bytes())
 }
 
-/// Draws the target square with a centre cross and caption.
-pub(crate) fn show_target(overlay: &OverlayHandle, px: GlobalPx, label: &str)
+/// Draws the target: the pointer look's mark, a ring the size of the old square with
+/// the dot at its centre, its interior filling with `progress` (0 to 1) as the hold at
+/// it runs. No caption: what the user needs to know goes to the terminal.
+pub(crate) fn show_target(overlay: &OverlayHandle, px: GlobalPx, progress: f32)
     -> Result<(), SweepError>
 {
     overlay.set(OverlayState {
-        gaze       : None,
-        highlight  : Some(Rect {
-            x : px.x - TARGET_PX * 0.5,
-            y : px.y - TARGET_PX * 0.5,
-            w : TARGET_PX,
-            h : TARGET_PX,
-        }),
-        truth      : Some(px),
-        label      : Some(label.to_string()),
         background : overlay_background(),
-        pointer    : None,
+        mark       : Some(Mark { at: px, progress: progress.clamp(0.0, 1.0) }),
+        ..OverlayState::default()
     }).map_err(|e| SweepError::Overlay(e.to_string()))
 }
 
@@ -2097,18 +2096,18 @@ pub fn run_collect(
 
             let target = out.uv_to_px(u, v);
             let left_s = deadline - t0.elapsed().as_secs_f64();
-            let label  = format!("{} collect ({:.0}s left) — eyes on the dot: {}",
-                                 out.name, left_s.max(0.0),
-                                 COLLECT_PROMPTS[k % COLLECT_PROMPTS.len()]);
 
-            glide(geometry, overlay, &label, current, target, t0, &frames_rx, &mut pass)?;
+            info!("{} collect ({:.0}s left), eyes on the dot: {}",
+                  out.name, left_s.max(0.0), COLLECT_PROMPTS[k % COLLECT_PROMPTS.len()]);
+
+            glide(geometry, overlay, current, target, t0, &frames_rx, &mut pass)?;
             current = target;
-            show_target(overlay, target, &label)?;
+            show_target(overlay, target, 0.0)?;
 
             let mut skip = false;
             let t_start  = t0.elapsed().as_secs_f64();
 
-            wait_draining(COLLECT_HOLD_S, t0, &frames_rx, &mut pass, target, false,
+            wait_draining(overlay, COLLECT_HOLD_S, t0, &frames_rx, &mut pass, target, false,
                           keys, &mut skip)?;
 
             if !skip {
@@ -2140,6 +2139,7 @@ pub fn run_collect(
         label      : None,
         background : None,
         pointer    : None,
+        mark       : None,
     });
 
     save_pass(&raw_out.to_path_buf(), out_name, &pass)

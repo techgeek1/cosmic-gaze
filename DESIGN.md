@@ -1285,7 +1285,10 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   residual model was refused at start as fitted under a different device blob (the
   2026-09-09 recalibration orphaned it), so `Model` reads false until `gaze-et5-cli fit`
   is run again; not a daemon problem. Not yet driven: the applet under a real panel,
-  and the daemon with clicks live.
+  and the daemon with clicks live. Same day, the calibration ceremony stopped drawing
+  the debug look: its target is now the pointer look's ring and dot in the theme's
+  accent, filling as the hold progresses, with the captions moved to the log
+  (PLAN-UX.md U1).
 
 ## 11. Open questions
 

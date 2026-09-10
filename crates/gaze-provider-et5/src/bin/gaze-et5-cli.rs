@@ -2553,6 +2553,7 @@ fn view(config: &std::path::Path, calibration: Option<&std::path::Path>, direct:
             label      : None,
             background : None,
             pointer    : None,
+            mark       : None,
         };
 
         let _ = overlay.set(state);

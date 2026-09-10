@@ -21,7 +21,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use gaze_core::{GlobalPx, Rect};
-use gaze_overlay::{Overlay, OverlayState, Pointer, PointerStyle, Presenter, Target, Theme, render};
+use gaze_overlay::{Mark, Overlay, OverlayState, Pointer, PointerStyle, Presenter, Target, Theme, render};
 
 /// How often the animation pushes a new state. The overlay paces its own drawing off
 /// frame callbacks, so pushing faster than the display refreshes only coalesces.
@@ -84,6 +84,55 @@ struct Args {
     /// Which point of the animation `--render` captures, in seconds.
     #[arg(long, default_value_t = 1.0)]
     at: f64,
+
+    /// Add a ceremony mark to the `--render` frame: `X,Y` in global logical pixels
+    /// with an optional `,PROGRESS` in 0..1 (default 0). What `gaze-et5-cli calibrate`
+    /// draws, offline.
+    #[arg(long, value_name = "X,Y[,PROGRESS]", value_parser = parse_mark)]
+    mark: Option<Mark>,
+
+    /// Paint the `--render` frame on a solid background, as the record ceremony does.
+    #[arg(long, value_enum, default_value_t = Background::None)]
+    background: Background,
+}
+
+/// The solid background `--render` paints under the overlay, if any.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+enum Background {
+    /// Transparent: the desktop would show through.
+    #[default]
+    None,
+    Black,
+    White,
+}
+
+impl Background {
+    /// The colour as the overlay state wants it.
+    fn color(self) -> Option<[u8; 4]> {
+        match self {
+            Background::None  => None,
+            Background::Black => Some([0, 0, 0, 255]),
+            Background::White => Some([255, 255, 255, 255]),
+        }
+    }
+}
+
+/// Parses `X,Y[,PROGRESS]` into a mark.
+fn parse_mark(s: &str) -> Result<Mark, String> {
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+
+    if parts.len() != 2 && parts.len() != 3 {
+        return Err(format!("expected X,Y or X,Y,PROGRESS, got {s:?}"));
+    }
+
+    let number = |i: usize| -> Result<f64, String> {
+        parts[i].parse().map_err(|_| format!("{:?} is not a number", parts[i]))
+    };
+
+    Ok(Mark {
+        at       : GlobalPx { x: number(0)?, y: number(1)? },
+        progress : if parts.len() == 3 { number(2)? as f32 } else { 0.0 },
+    })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -100,7 +149,7 @@ fn main() -> anyhow::Result<()> {
     let look = if args.pointer { Look::Pointer } else { Look::Debug };
 
     if let Some(dir) = args.render {
-        return render_frames(&dir, args.at, look);
+        return render_frames(&dir, args.at, look, args.mark, args.background.color());
     }
 
     if args.threaded {
@@ -144,7 +193,15 @@ fn list_outputs() -> anyhow::Result<()> {
 /// Renders the frame the animation would show at `at` seconds, one PNG per output, and
 /// puts nothing on screen. The alpha channel is what the compositor would composite, so a
 /// mostly transparent image with a ring and a box in it is the expected result.
-fn render_frames(dir: &Path, at: f64, look: Look) -> anyhow::Result<()> {
+fn render_frames(
+    dir        : &Path,
+    at         : f64,
+    look       : Look,
+    mark       : Option<Mark>,
+    background : Option<[u8; 4]>,
+)
+    -> anyhow::Result<()>
+{
     let overlay = Overlay::connect()?;
     let desk    = Desk::of(&overlay)?;
 
@@ -152,7 +209,8 @@ fn render_frames(dir: &Path, at: f64, look: Look) -> anyhow::Result<()> {
 
     // The pointer look has state: fades that depend on the frames before `at`. Replaying the animation into a presenter up to that point gives the frame the
     // screen would have shown.
-    let (state, presenter) = match look {
+    // A mark is drawn by the presenter, so one is built for it under either look.
+    let (mut state, mut presenter) = match look {
         Look::Debug   => (frame_at(&desk, at), None),
         Look::Pointer => {
             let mut presenter = Presenter::new(Theme::cosmic(), PointerStyle::default());
@@ -168,6 +226,17 @@ fn render_frames(dir: &Path, at: f64, look: Look) -> anyhow::Result<()> {
             (OverlayState::default(), Some(presenter))
         }
     };
+
+    state.mark       = mark;
+    state.background = background;
+
+    if mark.is_some() && presenter.is_none() {
+        presenter = Some(Presenter::new(Theme::cosmic(), PointerStyle::default()));
+    }
+
+    if let Some(p) = presenter.as_mut() {
+        p.set_mark(mark);
+    }
 
     for map in overlay.outputs() {
         let pixmap = match &presenter {
@@ -345,6 +414,7 @@ fn frame_at(desk: &Desk, t: f64) -> OverlayState {
         label      : Some(format!("GAZE {:.0} {:.0}", gaze.x, gaze.y)),
         background : None,
         pointer    : None,
+        mark       : None,
     }
 }
 

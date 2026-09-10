@@ -12,7 +12,8 @@ use gaze_core::{GlobalPx, Rect};
 /// look: drawn exactly as given, on the frame they arrive, in fixed colours. `pointer`
 /// is the daily-driver look: an intent the overlay presents on its own clock, fading
 /// the dot and the highlight in and out and colouring both from the desktop theme
-/// ([`crate::Presenter`]). A producer normally sets one or the other.
+/// ([`crate::Presenter`]). A producer normally sets one or the other. `mark` is the
+/// ceremonies' target, drawn in the pointer look's colours with neither fade nor spring.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OverlayState {
     /// Where the filtered gaze point is. Drawn as a ring with a centre dot.
@@ -33,6 +34,21 @@ pub struct OverlayState {
     pub background : Option<[u8; 4]>,
     /// The pointer look. `None` takes it down (the dot and any highlight fade out).
     pub pointer    : Option<Pointer>,
+    /// A calibration target: where to look, and how far along the hold there is.
+    pub mark       : Option<Mark>,
+}
+
+/// A target the eyes are asked to hold: what the calibration, sweep and record
+/// ceremonies show. Drawn in the theme's accent with a halo, like the pointer look,
+/// and moved on the frame it arrives: a target that lagged its producer during a glide
+/// would be a target in the wrong place.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mark {
+    /// Where to look, global logical pixels.
+    pub at       : GlobalPx,
+    /// How far along the hold at this target is, 0 to 1. Shown as the ring's interior
+    /// filling in; it is the only progress the user sees now that there is no caption.
+    pub progress : f32,
 }
 
 /// The pointer look as the producer wants it: what is where. How that is shown, the

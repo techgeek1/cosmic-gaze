@@ -81,6 +81,15 @@ thread presents it on its own clock (`present.rs`). Rules:
   mouse and gaze are fully decoupled. The controller's
   held/idle arbitration against the mouse (gyro thresholds, a six-second window) is
   gone: the thumb is the intent, and nothing gaze-side moves the pointer otherwise.
+- **The calibration mark (2026-09-10).** The ceremonies (`calibrate`, the sweeps, the
+  recording sessions) drew the debug look: an amber square, a magenta cross and a
+  caption in the 5x7 font. They now draw a mark in the pointer look's language: a
+  20 px accent ring with the halo, the dot at its centre, and an interior that fills
+  from 8% to 35% accent as the hold at that target progresses (the gate's hits, the
+  dwell, the settle time), which is the only progress signal now that there is no
+  text on screen. What the caption said (which round, which point, lean in) is one
+  log line per segment instead. `gaze-overlay-cli --render DIR --mark X,Y[,P]
+  --background black|white` shows it offline.
 - **The tree outranks the recogniser.** Once per place the eyes settle, the session asks
   the accessibility tree what is there (`verify.rs`, on `gaze-clicks`'s tree thread,
   polled, never blocking). A control it names (`link`, `push button`, `entry`, ...) is

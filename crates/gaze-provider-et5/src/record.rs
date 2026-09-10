@@ -793,29 +793,28 @@ fn run_grid(
         return Err(SweepError::NoDisplays);
     };
 
-    let adapt = format!("{} — adapting to {}, eyes on the dot",
-                        phase.as_str(), phase.background_name());
+    info!("{}: adapting to {}, eyes on the dot", phase.as_str(), phase.background_name());
 
     // The pupil is still moving for seconds after the background flips; nothing collected
     // during that would describe the illumination it is labelled with.
-    show_target(overlay, first, &adapt)?;
+    show_target(overlay, first, 0.0)?;
 
     let mut skip = false;
-    wait_draining(ADAPT_S, t0, frames_rx, pass, first, false, keys, &mut skip)?;
+    wait_draining(overlay, ADAPT_S, t0, frames_rx, pass, first, false, keys, &mut skip)?;
 
     let mut current = first;
 
     for (index, (u, v, px)) in plan.stops.iter().cloned().enumerate() {
-        let label = format!("{} {}/{} ({} background)",
-                            out.name, index + 1, total, phase.background_name());
+        info!("{} {}/{} ({} background): eyes on the dot",
+              out.name, index + 1, total, phase.background_name());
 
-        glide(geometry, overlay, &label, current, px, t0, frames_rx, pass)?;
+        glide(geometry, overlay, current, px, t0, frames_rx, pass)?;
         current = px;
 
-        show_target(overlay, px, &label)?;
+        show_target(overlay, px, 0.0)?;
 
         let mut skip = false;
-        wait_draining(config.settle_s, t0, frames_rx, pass, px, false, keys, &mut skip)?;
+        wait_draining(overlay, config.settle_s, t0, frames_rx, pass, px, false, keys, &mut skip)?;
 
         if skip {
             continue;
@@ -823,7 +822,7 @@ fn run_grid(
 
         let t_start = t0.elapsed().as_secs_f64();
 
-        wait_draining(config.collect_s, t0, frames_rx, pass, px, false, keys, &mut skip)?;
+        wait_draining(overlay, config.collect_s, t0, frames_rx, pass, px, false, keys, &mut skip)?;
 
         if skip {
             continue;
@@ -864,10 +863,11 @@ fn run_wander(
     let start   = Instant::now();
     let mut cur = out.uv_to_px(0.5, 0.5);
 
-    show_target(overlay, cur, "wander — adapting to white, eyes on the dot")?;
+    info!("wander: adapting to white, eyes on the dot");
+    show_target(overlay, cur, 0.0)?;
 
     let mut skip = false;
-    wait_draining(ADAPT_S, t0, frames_rx, pass, cur, false, keys, &mut skip)?;
+    wait_draining(overlay, ADAPT_S, t0, frames_rx, pass, cur, false, keys, &mut skip)?;
 
     let mut k = 0usize;
 
@@ -881,18 +881,18 @@ fn run_wander(
 
         let target = out.uv_to_px(u, v);
         let left_s = duration_s - start.elapsed().as_secs_f64();
-        let label  = format!("{} wander ({:.0}s left) — eyes on the dot: {}",
-                             out.name, left_s.max(0.0),
-                             COLLECT_PROMPTS[k % COLLECT_PROMPTS.len()]);
 
-        glide(geometry, overlay, &label, cur, target, t0, frames_rx, pass)?;
+        info!("{} wander ({:.0}s left), eyes on the dot: {}",
+              out.name, left_s.max(0.0), COLLECT_PROMPTS[k % COLLECT_PROMPTS.len()]);
+
+        glide(geometry, overlay, cur, target, t0, frames_rx, pass)?;
         cur = target;
-        show_target(overlay, target, &label)?;
+        show_target(overlay, target, 0.0)?;
 
         let mut skip = false;
         let t_start  = t0.elapsed().as_secs_f64();
 
-        wait_draining(COLLECT_HOLD_S, t0, frames_rx, pass, target, false, keys,
+        wait_draining(overlay, COLLECT_HOLD_S, t0, frames_rx, pass, target, false, keys,
                       &mut skip)?;
 
         if !skip {
