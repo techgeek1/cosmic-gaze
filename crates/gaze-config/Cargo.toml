@@ -1,0 +1,33 @@
+[package]
+name              = "gaze-config"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde   = { workspace = true }
+tracing = { workspace = true }
+dirs    = "6"
+
+# The watcher type `cosmic-config` hands back, so it can be kept alive by name. Same
+# major as cosmic-config's.
+notify = "8"
+
+# The daemon's control interface: the proxy the applet (and `busctl`-shaped tools) talk
+# to. `blocking-api` gives the daemon a synchronous proxy for its own smoke test;
+# `async-io` is the reactor every zbus user in this workspace runs on, so the features
+# never skew.
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+
+# Tuning is stored the way every COSMIC app stores settings: one RON file per key under
+# `~/.config/cosmic/<id>/v1/`. Same pin as the overlay and the trainer. `macro` is the
+# `CosmicConfigEntry` derive; no `subscription`, which would pull iced in.
+[dependencies.cosmic-config]
+git              = "https://github.com/pop-os/libcosmic.git"
+rev              = "c1897c01aa8a25776ceadeddcb161bb59ccffd79"
+default-features = false
+features         = ["macro"]
+
+[lints.clippy]
+# The workspace style mandates explicit `Foo { x: x }` field syntax everywhere.
+redundant_field_names = "allow"
