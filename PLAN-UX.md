@@ -1,6 +1,6 @@
 # UX build plan: a quiet overlay, a daemon, an applet
 
-**Status 2026-09-09: U1 built.** Everything before this was a prototype driven from a
+**Status 2026-09-10: U1, U2 and U3 built; U4 next.** Everything before this was a prototype driven from a
 terminal with a debug overlay that drew the raw gaze point, a box on whatever the snap
 engine favoured and a caption. It worked and it was exhausting to look at: a ring on the
 fovea over whatever was being read, boxes flickering across prose, text hard to read for
@@ -112,26 +112,59 @@ three points on a Reddit tab on 2026-09-09 and everything on GitHub, a PR page a
 Reddit thread an hour later, probed the same way; not reproduced since, and the session
 now logs the first few such answers so the next one says which page.
 
-## U2. Daemon (`gazed`)
+## U2. Daemon (`gazed`) — built 2026-09-10
 
-The session loop in `gaze-proto` becomes a library run by a daemon that owns the device,
-the overlay and the injector. Two channels, the COSMIC-native split:
+The session loop in `gaze-proto` becomes a library (`gaze_proto::session::run`) run by a
+daemon that owns the tracker, the overlay and the injector. What the prototype exposed as
+forty flags sorts into three piles, decided 2026-09-10 after the modes session:
 
-- **Settings** through cosmic-config: the applet writes, the daemon watches. Provider,
-  the tier toggles (click, scroll, edge scroll, focus follows gaze, daydream), the
-  overlay knobs above, model and offset paths.
-- **Live state and commands** over the session D-Bus (`zbus`, as `gaze-a11y` already
-  uses): properties for tracker present, calibrated, offset clicks and jumps, current
-  owner; methods for pause, resume, reset offset, recalibrate.
+- **Dies with the prototype.** Provider selection and everything it drags in (synthetic,
+  replay, webcam, the grabbed mouse, noise overrides, seed, gain), record, seconds,
+  show-truth, the debug look, dry run versus click, freeze-offset, no-flywheel. These stay
+  in `gaze-proto`'s `Args` as the dev harness. Two were features and are cut outright:
+  wheel routing to the window under gaze (`--scroll`) and focus-follows-gaze, both of
+  which moved the pointer on their own initiative, which the borrow-and-return model
+  abolished. The tier toggles go too: clicking, edge scrolling and the tree verdicts are
+  always on, and the Daydream controller is used when one is paired (the first paired
+  one), retried in the background while it is asleep. The gyro refine mode and its axes
+  go; touch won.
+- **Becomes a fixed location.** `gaze_config::Paths`: the desk file, calibration,
+  device blob and residual model under `$XDG_CONFIG_HOME/cosmic-gaze/`, models under
+  `$XDG_DATA_HOME/cosmic-gaze/models/`, the offset and the flywheel under
+  `$XDG_STATE_HOME/cosmic-gaze/`. `gazed --home DIR` (and `gaze-proto --home DIR`) maps
+  all three onto a checkout's `config/` and `models/` so a live run needs no copying.
+- **Becomes tuning.** Every number still being moved: the filter quartet, snap and near
+  radii, commit latency, pointer settle and linger, the ten edge-scroll knobs, the refine
+  gain and range, the redetect pair, and whether text is highlighted. One
+  `gaze_config::Tuning` struct, one key per field under cosmic-config
+  `dev.techgeek1.CosmicGaze` v1, a `KNOBS` table (key, label, unit, range, step) so the
+  applet can draw them without knowing any of them. The daemon watches the config and
+  applies a change at the next sample without restarting anything: the filter stack and
+  snap engine are rebuilt, the overlay is restyled, the scroller, the controller mapper
+  and the perception thread take new parameters in place.
 
-The overlay stays in-process for latency. `gaze-proto` becomes a thin front-end for
-one-off runs with flags. Autostart via the XDG autostart entry COSMIC honours.
+**Live state and commands** over the session D-Bus (`zbus`, as `gaze-a11y` already
+uses), name and path `dev.techgeek1.CosmicGaze` / `/dev/techgeek1/CosmicGaze`:
+properties `Tracker`, `Calibrated`, `Model`, `Controller`, `Paused` (booleans), `Mode`
+(`no-tracker`, `paused`, `reading`, `pointing`, `scrolling`), `OffsetUpdates`,
+`OffsetJumps`, `OffsetYawDeg`, `OffsetPitchDeg`; methods `Pause`, `Resume`,
+`ResetOffset`. Recalibrate arrives with U4. `gaze_config::Status` is the Rust side of
+those properties, filled by the session loop through `gaze_proto::Live`, which also
+carries the pause and reset flags and the tuning in.
 
-## U3. Applet
+The daemon retries the tracker every few seconds when it is not on the bus, and runs
+the session again if it ends. The overlay stays in-process for latency. Autostart via
+the XDG autostart entry in `data/`.
 
-A libcosmic panel applet (the trainer already builds against the same pin): status icon
-with a popup of the toggles and the live numbers, and the recalibrate button. Nothing
-gaze-specific in it beyond the D-Bus proxy and the config struct.
+## U3. Applet — built 2026-09-10
+
+`gaze-applet` (`cosmic-ext-applet-gaze`), a libcosmic panel applet on the same pin as
+the trainer. Status icon; a popup with the live state (tracker, calibration, model,
+controller, mode, offset), a pause toggle, and an "Advanced" section that draws every
+`KNOBS` entry as a slider writing straight to cosmic-config, so the feel can be tuned
+on the running system without a rebuild or a restart. It polls the daemon's properties
+over D-Bus (one `GetAll` a second, faster while open), which survives the daemon
+restarting. Nothing gaze-specific in it beyond `gaze-config`.
 
 ## U4. Calibrate moves into the daemon
 

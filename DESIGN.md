@@ -1260,6 +1260,33 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   px of that point, a gaze further away is asked about again within 100 ms and gets
   nothing until the reply lands.
 
+- 2026-09-10, **The prototype becomes a daemon and an applet (PLAN-UX.md U2, U3).**
+  Decided first what not to carry: no tier toggles (clicking, edge scrolling and the
+  tree verdicts are always on; the paired Daydream controller is used when it is awake
+  and retried while it sleeps), no wheel routing to the window under gaze and no
+  focus-follows-gaze (both moved the pointer on their own initiative, which the
+  borrow-and-return model of 2026-09-09 is the answer to), no gyro refine. Forty flags
+  became: a dev harness (`gaze-proto` keeps provider selection, dry run, record, the
+  debug look, plus `--tune KEY=VALUE`), three XDG directories (`gaze_config::Paths`,
+  `--home DIR` for a checkout), and twenty-four tuning knobs in cosmic-config
+  (`gaze_config::Tuning`, one key each under `dev.techgeek1.CosmicGaze/v1`). The
+  session loop is now a library the daemon runs on a thread and steers through
+  `gaze_proto::Live`: a tuning change is applied at the next sample without a restart
+  (filter stack and snap engine rebuilt, overlay restyled, scroller, controller mapper
+  and detector handed their new parameters), pause and reset-offset are flags, status
+  goes back the other way. `gazed` serves `dev.techgeek1.CosmicGaze` on the session bus
+  (ten properties, `Pause`, `Resume`, `ResetOffset`), reruns the session whenever it
+  ends, and stops cleanly on SIGTERM. The applet (`cosmic-ext-applet-gaze`) polls those
+  properties once a second, has the pause toggle and the reset button, and draws every
+  knob as a slider under an "Advanced" fold, writing straight to cosmic-config. Smoke
+  test on the desk: `gazed --home . --dry-run` came up with tracker and calibration
+  true, took Pause and Resume from `busctl`, reloaded twice for two edits of
+  `edge_dwell_s` while running, and ended on SIGTERM with the session summary. The
+  residual model was refused at start as fitted under a different device blob (the
+  2026-09-09 recalibration orphaned it), so `Model` reads false until `gaze-et5-cli fit`
+  is run again; not a daemon problem. Not yet driven: the applet under a real panel,
+  and the daemon with clicks live.
+
 ## 11. Open questions
 
 - nottobii code quality/completeness as a base vs. writing a fresh ET5 driver against its protocol notes.
