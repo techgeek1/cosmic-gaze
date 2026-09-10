@@ -63,20 +63,6 @@ pub enum SourceSpec {
         model  : NoiseModel,
     },
 
-    /// The webcam sidecar over its socket.
-    Webcam {
-        /// The sidecar's socket.
-        socket      : PathBuf,
-        /// Overrides the desk file's camera node.
-        camera      : Option<PathBuf>,
-        /// Calibration file, when one exists.
-        calibration : Option<PathBuf>,
-        /// The flat sigma to run under.
-        sigma_deg   : f64,
-        /// The desk file's text, which holds the camera pose.
-        desk_text   : String,
-    },
-
     /// The ET5 over native USB.
     Et5 {
         /// Calibration file, when one exists.

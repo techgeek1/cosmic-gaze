@@ -13,7 +13,6 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use gaze_config::{Paths, Tuning};
 use gaze_core::{DesktopGeometry, NoiseModel, SigmaProfile};
-use gaze_provider_webcam::{DEFAULT_SIGMA_DEG, DEFAULT_SOCKET};
 
 use crate::config::{DaydreamSpec, OverlayMode, SessionConfig, SourceSpec};
 
@@ -21,17 +20,6 @@ use crate::config::{DaydreamSpec, OverlayMode, SessionConfig, SourceSpec};
 /// anything a desk spans, so `SigmaProfile::sigma_at` never leaves that region and every
 /// sample gets exactly the sigma that was asked for, on every output.
 const FLAT_OVERRIDE_DEG: f64 = 1.0e6;
-
-/// The webcam's filter preset: it jitters ~1.5 deg per sample at 30 Hz, which reads as
-/// 60 deg/s and would classify every sample as a saccade under the tracker's defaults,
-/// so the velocity is measured over a longer window with a higher threshold and the
-/// smoother is heavier. Applied unless the same keys are given with `--tune`.
-const WEBCAM_FILTER: [(&str, f64); 4] = [
-    ("filter_velocity_deg_s" , 80.0),
-    ("filter_window_s"       , 0.10),
-    ("filter_min_cutoff_hz"  , 0.6 ),
-    ("filter_beta"           , 0.02),
-];
 
 /// Which source the gaze samples come from.
 ///
@@ -45,18 +33,14 @@ pub enum Provider {
     #[default]
     Synthetic,
 
-    /// Real gaze from `gaze-provider-webcam`. The controls come from the Lenovo's buttons
-    /// read by a separate reader, which grabs the device too (see `--no-grab`) and
-    /// discards its motion.
-    Webcam,
-
     /// Real gaze from the Tobii ET5 over native USB (`gaze-provider-et5`). Controls
-    /// come from the controller, and from the Lenovo's buttons like `webcam` unless
+    /// come from the controller, and from the Lenovo's buttons (read by a separate
+    /// reader that grabs the device, see `--no-grab`, and discards its motion) unless
     /// `--no-buttons`; calibrate first with `gaze-et5-cli calibrate`.
     Et5,
 
     /// Replay a recorded JSONL session (`--record` from an earlier run). Controls come
-    /// from the same button source as `webcam` when the device is available, and the run
+    /// from the same button source as `et5` when the device is available, and the run
     /// is otherwise driven entirely by the recording.
     Replay,
 }
@@ -100,17 +84,6 @@ pub struct Args {
     #[arg(long)]
     pub no_grab: bool,
 
-    /// Unix socket the webcam gaze sidecar publishes on. Defaults to the sidecar's own
-    /// path, so `--provider webcam` needs no flags when the sidecar is running.
-    #[arg(long, default_value = DEFAULT_SOCKET)]
-    pub webcam_socket: PathBuf,
-
-    /// Overrides the camera node from the desk config's `[camera] device`. The rest of the
-    /// camera pose always comes from that config, since it describes the desk rather than
-    /// the run.
-    #[arg(long)]
-    pub camera: Option<PathBuf>,
-
     /// Keep the ET5 online offset frozen: real clicks are attributed and logged but
     /// do not move it, and nothing is written to the offset file.
     #[arg(long)]
@@ -127,8 +100,6 @@ pub struct Args {
     pub tune: Vec<String>,
 
     /// Override the desk noise profile with a flat sigma, in degrees, on every output.
-    /// Also sets the webcam provider's flat sigma, which otherwise defaults to the 2.5
-    /// degrees `gaze-provider-webcam` calls the optimistic end of webcam-only gaze.
     #[arg(long, conflicts_with = "sigma_profile")]
     pub sigma: Option<f64>,
 
@@ -224,14 +195,6 @@ impl Args {
                 model  : self.noise_model(geometry.noise)?,
             },
 
-            Provider::Webcam => SourceSpec::Webcam {
-                socket      : self.webcam_socket.clone(),
-                camera      : self.camera.clone(),
-                calibration : existing(paths.config_dir.join("calibration.toml")),
-                sigma_deg   : self.sigma.unwrap_or(DEFAULT_SIGMA_DEG),
-                desk_text   : text,
-            },
-
             Provider::Et5 => SourceSpec::Et5 {
                 calibration : existing(paths.calibration()),
                 model       : existing(paths.model()),
@@ -272,17 +235,10 @@ impl Args {
         })
     }
 
-    /// The tuning this run starts under: the defaults, the webcam preset when the
-    /// provider is the webcam, then every `--tune` in order. Fails on a bad key or
-    /// value.
+    /// The tuning this run starts under: the defaults, then every `--tune` in order.
+    /// Fails on a bad key or value.
     pub fn tuning(&self) -> Result<Tuning> {
         let mut tuning = Tuning::default();
-
-        if self.provider == Provider::Webcam {
-            for (key, value) in WEBCAM_FILTER {
-                tuning.set(key, value);
-            }
-        }
 
         for assignment in &self.tune {
             tuning.apply(assignment).map_err(|e| anyhow::anyhow!("--tune: {e}"))?;
@@ -363,28 +319,22 @@ mod tests {
         assert_eq!(model.rate_hz, 120.0);
     }
 
-    /// The webcam preset applies under its provider and only there, and an explicit
-    /// `--tune` beats it; a bad assignment is an error, not a silent default.
+    /// A run starts on the defaults; an explicit `--tune` moves one key and leaves the
+    /// rest; a bad assignment is an error, not a silent default.
     #[test]
-    fn tuning_layers_defaults_preset_and_overrides() {
+    fn tuning_layers_defaults_and_overrides() {
         let tracker = Args::parse_from(["gaze-proto", "--provider", "et5"]).tuning().unwrap();
 
         assert_eq!(tracker, Tuning::default());
 
-        let webcam = Args::parse_from(["gaze-proto", "--provider", "webcam"]).tuning().unwrap();
-
-        assert_eq!(webcam.filter_velocity_deg_s, 80.0);
-        assert_eq!(webcam.filter_beta, 0.02);
-        assert_eq!(webcam.snap_deg, Tuning::default().snap_deg);
-
         let tuned = Args::parse_from([
-            "gaze-proto", "--provider", "webcam", "--tune", "filter_beta=0.5", "--tune", "snap_deg=3",
+            "gaze-proto", "--provider", "et5", "--tune", "filter_beta=0.5", "--tune", "snap_deg=3",
         ])
         .tuning()
         .unwrap();
 
         assert_eq!(tuned.filter_beta, 0.5);
-        assert_eq!(tuned.filter_velocity_deg_s, 80.0);
+        assert_eq!(tuned.filter_velocity_deg_s, Tuning::default().filter_velocity_deg_s);
         assert_eq!(tuned.snap_deg, 3.0);
 
         assert!(Args::parse_from(["gaze-proto", "--tune", "snap=3"]).tuning().is_err());

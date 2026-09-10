@@ -50,5 +50,5 @@ pub use feedback::ClickFeed;
 pub use live::Live;
 pub use perception::{ElementStore, Perception, PerceptionConfig};
 pub use score::{Outcome, Scoreboard, classify};
-pub use source::{Control, GazeSource, WebcamHealth};
+pub use source::{Control, GazeSource};
 pub use warp::{WarpReason, Warper};

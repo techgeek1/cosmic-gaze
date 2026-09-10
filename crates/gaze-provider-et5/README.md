@@ -234,7 +234,7 @@ nottobii keeps one session across its whole init; nothing observed here needs th
 `gaze-proto --provider et5` runs the full snap/click prototype on this provider;
 it picks up `config/calibration-et5.toml` and `config/model-et5.json` automatically
 (`--calibration`, `--model` override) and takes commits from the grabbed Lenovo's
-buttons like the webcam mode. With a model the provider corrects the firmware's ray
+buttons. With a model the provider corrects the firmware's ray
 in angle space before intersecting the configured desk (`model.rs`), widens sigma by
 the model's own variance, and fades the correction out where the variance says the
 frame is off the training data; the old correction field and head gain are bypassed.

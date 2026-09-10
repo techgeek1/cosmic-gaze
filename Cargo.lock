@@ -2178,7 +2178,6 @@ dependencies = [
  "gaze-overlay",
  "gaze-provider-et5",
  "gaze-provider-synthetic",
- "gaze-provider-webcam",
  "gaze-snap",
  "glam 0.30.10",
  "tracing",
@@ -2228,28 +2227,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "gaze-provider-webcam"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "crossbeam-channel",
- "gaze-core",
- "gaze-overlay",
- "gaze-provider-synthetic",
- "glam 0.30.10",
- "rand 0.9.5",
- "rand_distr",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "toml 0.9.12+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
 ]

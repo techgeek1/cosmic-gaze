@@ -159,7 +159,9 @@ Outputs a markdown report. Bin: `gaze-bench --shots screenshots/ --sigmas 0.5,0.
 
 ### gaze-proto (DONE; `gaze-proto --click --show-truth`; Lenovo left = commit, right = exit, middle = redetect; ~0.45 core idle, ~8 cores while detecting)
 
-Also has `--provider synthetic|webcam|replay` and the scroll tier (2026-08-26):
+Also has `--provider synthetic|webcam|replay` and the scroll tier (2026-08-26; the webcam
+provider and its sidecar were removed 2026-09-10, the ET5 having replaced them, and the
+scroll tier went with the borrow-and-return model of 2026-09-09):
 
 - **What commits.** The same three buttons on the Lenovo in every mode, and the device is
   `EVIOCGRAB`ed in every mode: `synthetic` grabs it as its gaze device, `webcam` and

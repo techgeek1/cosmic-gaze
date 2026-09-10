@@ -6,14 +6,13 @@
 //!
 //! * `synthetic` grabs the Lenovo mouse, so its buttons and wheel are already the
 //!   provider's own events and nothing else can see them.
-//! * `webcam`, `et5` and `replay` have no input device of their own, so the controls come
+//! * `et5` and `replay` have no input device of their own, so the controls come
 //!   from a [`ButtonSource`] on that same mouse when one is asked for, which grabs it as
 //!   well unless told not to. The daemon asks for none: the controller commits.
 //!
 //! [`GazeSource`] is an enum rather than a trait object because the shapes differ in more
-//! than behaviour: only the synthetic one has a ground-truth point to score against, only
-//! the webcam one has a socket whose health is worth reporting, and only the ET5 one
-//! learns from clicks and has a link that can drop.
+//! than behaviour: only the synthetic one has a ground-truth point to score against, and
+//! only the ET5 one learns from clicks and has a link that can drop.
 
 use std::path::Path;
 use std::time::Instant;
@@ -27,7 +26,6 @@ use gaze_provider_synthetic::{
     SyntheticProvider,
 };
 use gaze_provider_et5::{ClickFeedback, ClickVia, Et5Calibration, Et5Provider, OffsetParams, OffsetSummary, ResidualModel};
-use gaze_provider_webcam::{CameraPose, SampleMeta, WebcamProvider};
 use tracing::{info, warn};
 
 use crate::buttons::ButtonSource;
@@ -92,76 +90,11 @@ pub enum Refine {
     End,
 }
 
-/// Running health of a webcam session, for the exit summary.
-///
-/// The provider reports the sidecar's confidence and latency for the *latest* frame only,
-/// which says nothing about whether the session as a whole was tracking well. This
-/// accumulates them into means. Frames are deduplicated by `seq`, because the session polls
-/// once per gaze sample and a stalled sidecar would otherwise have its last good frame
-/// counted hundreds of times.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct WebcamHealth {
-    /// Distinct sidecar frames observed.
-    pub frames : u64,
-    /// Sum of per-frame confidence, for the mean.
-    conf_sum   : f64,
-    /// Sum of per-frame capture-to-socket latency, milliseconds, for the mean.
-    lat_ms_sum : f64,
-    /// `seq` of the last frame counted, so a repeat is not counted twice.
-    last_seq   : Option<u64>,
-}
-
-// --- WebcamHealth ---
-
-impl WebcamHealth {
-    /// Folds in the provider's latest frame metadata, ignoring a frame already counted.
-    pub fn observe(&mut self, meta: SampleMeta) {
-        if self.last_seq == Some(meta.seq) {
-            return;
-        }
-
-        self.last_seq    = Some(meta.seq);
-        self.frames     += 1;
-        self.conf_sum   += meta.conf;
-        self.lat_ms_sum += meta.lat_ms;
-    }
-
-    /// Mean model confidence over the session, or `0.0` before the first frame.
-    pub fn conf_mean(&self) -> f64 {
-        if self.frames == 0 {
-            return 0.0;
-        }
-
-        self.conf_sum / self.frames as f64
-    }
-
-    /// Mean sidecar capture-to-socket latency in milliseconds, or `0.0` before the first
-    /// frame.
-    pub fn lat_ms_mean(&self) -> f64 {
-        if self.frames == 0 {
-            return 0.0;
-        }
-
-        self.lat_ms_sum / self.frames as f64
-    }
-}
-
 /// Gaze samples plus controls for one run.
 pub enum GazeSource {
     /// The grabbed Lenovo mouse driven through the desk's noise model. Owns its own
     /// buttons and wheel, and knows the noise-free point behind every sample.
     Synthetic(SyntheticProvider),
-
-    /// Real gaze from the sidecar. Controls come from the mouse when one is read.
-    Webcam {
-        /// Where the samples come from.
-        provider : WebcamProvider,
-        /// The mouse's buttons and wheel, when asked for.
-        buttons  : Option<ButtonSource>,
-        /// Accumulated sidecar health, updated once per sample by
-        /// [`poll_health`](GazeSource::poll_health).
-        health   : WebcamHealth,
-    },
 
     /// Real gaze from the ET5 over native USB. Controls come from the mouse when one is
     /// read; the daemon reads none and the controller commits.
@@ -173,7 +106,7 @@ pub enum GazeSource {
         buttons  : Option<ButtonSource>,
     },
 
-    /// A recorded session. Controls come from the same reader as `webcam` when the device
+    /// A recorded session. Controls come from the same reader as `et5` when the device
     /// is available.
     Replay {
         /// Where the samples come from.
@@ -203,19 +136,6 @@ impl GazeSource {
                 open_synthetic(device, *gain, *seed, *model, geometry)
             }
 
-            SourceSpec::Webcam { socket, camera, calibration, sigma_deg, desk_text } => {
-                open_webcam(
-                    socket,
-                    camera.as_deref(),
-                    calibration.as_deref(),
-                    *sigma_deg,
-                    desk_text,
-                    geometry,
-                    buttons,
-                    grab,
-                )
-            }
-
             SourceSpec::Et5 { calibration, model, device_blob, offset, flywheel } => {
                 open_et5(
                     calibration.as_deref(),
@@ -237,7 +157,6 @@ impl GazeSource {
     pub fn next_sample(&mut self) -> Option<GazeSample> {
         match self {
             GazeSource::Synthetic(provider)      => provider.next(),
-            GazeSource::Webcam { provider, .. }  => provider.next(),
             GazeSource::Et5 { provider, .. }     => provider.next(),
             GazeSource::Replay { provider, .. }  => provider.next(),
         }
@@ -248,8 +167,7 @@ impl GazeSource {
         match self {
             GazeSource::Synthetic(provider) => provider.events().map(control_of).collect(),
 
-            GazeSource::Webcam { buttons, .. }
-            | GazeSource::Et5 { buttons, .. }
+            GazeSource::Et5 { buttons, .. }
             | GazeSource::Replay { buttons, .. } => {
                 match buttons {
                     Some(buttons) => buttons.events().collect(),
@@ -335,8 +253,7 @@ impl GazeSource {
             GazeSource::Synthetic(_) => true,
 
             // No device means no wheel to own in the first place.
-            GazeSource::Webcam { buttons, .. }
-            | GazeSource::Et5 { buttons, .. }
+            GazeSource::Et5 { buttons, .. }
             | GazeSource::Replay { buttons, .. } => {
                 buttons.as_ref().is_some_and(ButtonSource::grabbed)
             }
@@ -346,60 +263,16 @@ impl GazeSource {
     /// What this source is called in logs.
     pub fn label(&self) -> &'static str {
         match self {
-            GazeSource::Synthetic(_)     => "synthetic",
-            GazeSource::Webcam { .. }    => "webcam",
-            GazeSource::Et5 { .. }       => "et5",
-            GazeSource::Replay { .. }    => "replay",
+            GazeSource::Synthetic(_)  => "synthetic",
+            GazeSource::Et5 { .. }    => "et5",
+            GazeSource::Replay { .. } => "replay",
         }
-    }
-
-    /// Folds the sidecar's latest frame metadata into the running health figures.
-    ///
-    /// Called once per gaze sample, and a no-op for every provider but the webcam one.
-    /// Polling rather than reading a counter inside the provider keeps the means honest
-    /// about what this session actually saw, rather than about what arrived on the socket.
-    pub fn poll_health(&mut self) {
-        if let GazeSource::Webcam { provider, health, .. } = self
-            && let Some(meta) = provider.last_meta()
-        {
-            health.observe(meta);
-        }
-    }
-
-    /// Logs the webcam session's socket health. Does nothing for the other providers,
-    /// which have no socket to be healthy.
-    pub fn log_health(&self) {
-        let GazeSource::Webcam { provider, health, .. } = self else {
-            return;
-        };
-
-        let stats = provider.stats();
-
-        info!(
-            connected    = stats.connected,
-            lines        = stats.lines,
-            connects     = stats.connects,
-            bad_lines    = stats.bad_lines,
-            frames       = health.frames,
-            conf_mean    = health.conf_mean(),
-            lat_ms_mean  = health.lat_ms_mean(),
-            last_output  = ?provider.last_output(),
-            "sidecar health"
-        );
     }
 
     /// Releases the device and stops any reader threads. Idempotent.
     pub fn stop(&mut self) {
         match self {
             GazeSource::Synthetic(provider) => provider.stop(),
-
-            GazeSource::Webcam { provider, buttons, .. } => {
-                provider.stop();
-
-                if let Some(buttons) = buttons {
-                    buttons.stop();
-                }
-            }
 
             GazeSource::Et5 { provider, buttons } => {
                 provider.stop();
@@ -452,74 +325,13 @@ fn open_synthetic(
     Ok(GazeSource::Synthetic(provider))
 }
 
-/// Real gaze from the webcam sidecar, with controls from the mouse when one is read.
-///
-/// The camera pose comes out of the same desk file the session already parsed, because
-/// it describes the desk rather than the run; only the device node is worth overriding
-/// per run, and even that is only read by the sidecar. A missing socket is not an error:
-/// the provider reconnects with backoff, so starting this before the sidecar is up is
-/// fine and the samples begin when it appears.
-#[allow(clippy::too_many_arguments)]
-fn open_webcam(
-    socket      : &Path,
-    camera      : Option<&Path>,
-    calibration : Option<&Path>,
-    sigma_deg   : f64,
-    desk_text   : &str,
-    geometry    : &DesktopGeometry,
-    buttons     : Option<&str>,
-    grab        : bool,
-)
-    -> Result<GazeSource>
-{
-    let mut pose = CameraPose::from_desk_toml(desk_text)
-        .context("parsing the [camera] block of the desk file")?;
-
-    if let Some(device) = camera {
-        pose.device = device.display().to_string();
-    }
-
-    let provider = WebcamProvider::create()
-        .socket(socket)
-        .geometry(geometry.clone())
-        .camera(pose)
-        .calibration(calibration.map(Path::to_path_buf))
-        .sigma_deg(sigma_deg)
-        .start()
-        .with_context(|| format!("starting the webcam provider on {}", socket.display()))?;
-
-    let buttons = open_buttons(buttons, grab, "a webcam run")?;
-
-    info!(
-        socket      = %socket.display(),
-        camera      = %camera.map(|p| p.display().to_string()).unwrap_or_else(|| "from config".to_string()),
-        calibration = ?calibration.map(|p| p.display().to_string()),
-        sigma_deg   = sigma_deg,
-        device      = ?buttons.as_ref().map(|b| b.path().display().to_string()),
-        grabbed     = ?buttons.as_ref().map(ButtonSource::grabbed),
-        commits     = commit_note(buttons.as_ref()),
-        "provider: webcam"
-    );
-
-    match calibration {
-        Some(path) => info!(calibration = %path.display(), "webcam calibration loaded"),
-        None       => warn!("running uncalibrated: expect several degrees of bias (gaze-webcam-cli calibrate fixes it)"),
-    }
-
-    Ok(GazeSource::Webcam {
-        provider : provider,
-        buttons  : buttons,
-        health   : WebcamHealth::default(),
-    })
-}
-
 /// Real gaze from the ET5 over native USB, with controls from the mouse when one is
 /// read.
 ///
 /// The provider claims the tracker's USB interface exclusively, so a sweep or a
-/// `gaze-et5-cli view` cannot run at the same time. The calibration matters more here
-/// than for the webcam: without one the tracker runs under an oversized virtual plane
-/// and the firmware's trained end-to-end mapping never applies, so its absence is loud.
+/// `gaze-et5-cli view` cannot run at the same time. The calibration matters: without one
+/// the tracker runs under an oversized virtual plane and the firmware's trained
+/// end-to-end mapping never applies, so its absence is loud.
 #[allow(clippy::too_many_arguments)]
 fn open_et5(
     calibration : Option<&Path>,
@@ -684,54 +496,4 @@ mod tests {
         assert_eq!(control_of(ProviderEvent::Wheel(-2)), Control::Wheel(-2));
     }
 
-    fn meta(seq: u64, conf: f64, lat_ms: f64) -> SampleMeta {
-        SampleMeta {
-            seq         : seq,
-            sidecar_t_s : 0.0,
-            conf        : conf,
-            lat_ms      : lat_ms,
-            off_axis_deg: 0.0,
-            clamped     : false,
-        }
-    }
-
-    #[test]
-    fn health_means_are_over_distinct_frames() {
-        let mut health = WebcamHealth::default();
-
-        health.observe(meta(1, 0.9, 20.0));
-        health.observe(meta(2, 0.7, 40.0));
-
-        assert_eq!(health.frames, 2);
-        assert!((health.conf_mean() - 0.8).abs() < 1e-12);
-        assert!((health.lat_ms_mean() - 30.0).abs() < 1e-12);
-    }
-
-    /// The session polls once per gaze sample, so a sidecar that stalls would otherwise
-    /// have its last good frame counted over and over and report perfect health.
-    #[test]
-    fn health_ignores_a_frame_it_has_already_counted() {
-        let mut health = WebcamHealth::default();
-
-        health.observe(meta(1, 1.0, 10.0));
-
-        for _ in 0..100 {
-            health.observe(meta(1, 1.0, 10.0));
-        }
-
-        health.observe(meta(2, 0.0, 30.0));
-
-        assert_eq!(health.frames, 2);
-        assert!((health.conf_mean() - 0.5).abs() < 1e-12);
-        assert!((health.lat_ms_mean() - 20.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn health_means_are_zero_before_the_first_frame() {
-        let health = WebcamHealth::default();
-
-        assert_eq!(health.frames, 0);
-        assert_eq!(health.conf_mean(), 0.0);
-        assert_eq!(health.lat_ms_mean(), 0.0);
-    }
 }

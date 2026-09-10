@@ -656,10 +656,6 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
         samples    += 1;
         last_sample = Some(sample);
 
-        // Cheap (one mutex, deduplicated by frame sequence) and only meaningful for the
-        // webcam provider, which is the only one with a socket that can go quietly bad.
-        source.poll_health();
-
         if let Some(writer) = record.as_mut() {
             match to_jsonl_line(&sample) {
                 Ok(line) => writeln!(writer, "{line}").context("writing the recording")?,
@@ -979,10 +975,6 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
         (Some(before), Some(after)) => Some(100.0 * (after - before) / elapsed),
         _                           => None,
     };
-
-    // Before `stop`: the reader thread clears `connected` on its way out, so asking
-    // afterwards would report every session as having ended disconnected.
-    source.log_health();
 
     if let Some(feed) = clicks.as_mut() {
         feed.stop();

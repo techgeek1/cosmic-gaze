@@ -57,23 +57,6 @@ radius_mm     = 0.0
 position_mm   = [-40.0, -75.0, 100.0]    # MEASURE
 pitch_deg     = -15.0                    # MEASURE: top tilted away from the user
 
-# Webcam (Logitech C920), 2026-08-26 placement: on a bottle on the desk at about the seam,
-# just right of the small panel and slightly above its top edge, ~25 cm in front of it,
-# looking up at the face from ~43 cm. Camera frame is OpenCV (+X right, +Y down, +Z forward
-# out of the lens); the provider applies a fixed 180° roll so a camera facing the user maps
-# onto desk +Z, then yaw/pitch/roll below in the SAME convention as the panels (right-hand
-# rule about desk +Y / +X / +Z: positive pitch tilts the optical axis DOWN, negative yaw turns
-# it toward -X). Derived from the photo and the nominal eye; MEASURE.
-[camera]
-device       = "/dev/video0"
-position_mm  = [100.0, 80.0, 250.0]     # MEASURE: lens ~245 mm above the desk (1 L Nalgene 215 mm + C920), panel top edge ~165 mm
-yaw_deg      = -14.0                    # MEASURE: turned toward -X, at the eye
-pitch_deg    = -14.0                    # MEASURE: tilted UP at the face (eye ~100 mm above, ~410 mm away)
-roll_deg     = 0.0
-hfov_deg     = 70.4                     # Logitech C920: 70.4° H, 43.3° V (78° diagonal); used when no intrinsics file
-width        = 1920
-height       = 1080
-
 [noise]
 rate_hz         = 120.0
 jitter_deg      = 0.2    # per-sample precision; bias = sqrt(sigma^2 - jitter^2) per fixation

@@ -1288,7 +1288,9 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   and the daemon with clicks live. Same day, the calibration ceremony stopped drawing
   the debug look: its target is now the pointer look's ring and dot in the theme's
   accent, filling as the hold progresses, with the captions moved to the log
-  (PLAN-UX.md U1).
+  (PLAN-UX.md U1). And the webcam provider went: `gaze-provider-webcam`, its sidecar
+  socket, the `[camera]` block of the desk file and the `webcam` filter preset, none of
+  which had been run since the ET5 arrived.
 
 ## 11. Open questions
 
