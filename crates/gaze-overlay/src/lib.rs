@@ -7,7 +7,7 @@
 //! overlay is up.
 //!
 //! It has two looks. The debug look draws exactly what it is given, the frame it is
-//! given it: a gaze ring, a candidate box, a truth cross, a caption, in fixed colours.
+//! given it: a gaze ring, a candidate box, a caption, in fixed colours.
 //! The pointer look ([`Pointer`]) is for daily use: the producer sends an intent, where
 //! the gaze is, whether it is moving, whether anything clickable is near and which
 //! element is favoured, and the overlay presents it on its own clock ([`Presenter`]).

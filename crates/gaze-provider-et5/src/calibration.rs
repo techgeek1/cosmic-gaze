@@ -613,7 +613,6 @@ mod tests {
             eye_mm     : [0.0, 180.0, 650.0],
             tracker_mm : [0.0, 0.0, 0.0],
             outputs    : vec![panel()],
-            noise      : None,
         };
 
         cal.apply_poses(&mut geometry);

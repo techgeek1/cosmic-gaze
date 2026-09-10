@@ -14,7 +14,6 @@ gaze-detect             = { path = "crates/gaze-detect" }
 gaze-capture            = { path = "crates/gaze-capture" }
 gaze-overlay            = { path = "crates/gaze-overlay" }
 gaze-inject             = { path = "crates/gaze-inject" }
-gaze-provider-synthetic = { path = "crates/gaze-provider-synthetic" }
 gaze-provider-et5       = { path = "crates/gaze-provider-et5" }
 gaze-clicks             = { path = "crates/gaze-clicks" }
 gaze-a11y               = { path = "crates/gaze-a11y" }
@@ -32,8 +31,6 @@ tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap        = { version = "4", features = ["derive"] }
 image       = { version = "0.25", default-features = false, features = ["png"] }
-rand        = "0.9"
-rand_distr  = "0.5"
 crossbeam-channel = "0.5"
 
 [profile.dev]

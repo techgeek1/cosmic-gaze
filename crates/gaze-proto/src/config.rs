@@ -1,7 +1,7 @@
 //! What a session is built from, and how the tuning maps onto the parts that use it.
 //!
-//! [`SessionConfig`] is everything decided before the loop starts: the desk, where the
-//! samples come from, which devices are read, and what may reach the real desktop. The
+//! [`SessionConfig`] is everything decided before the loop starts: the desk, the
+//! tracker's files, whether the controller is read, and what may reach the real desktop. The
 //! daemon builds one from [`gaze_config::Paths`]; the prototype builds one from its
 //! flags. [`gaze_config::Tuning`] is everything that may change while the loop runs, and
 //! the helpers at the bottom turn it into the filter stack, the snap engine, the pointer
@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 
 use gaze_config::Tuning;
-use gaze_core::{DesktopGeometry, NoiseModel};
+use gaze_core::DesktopGeometry;
 use gaze_overlay::PointerStyle;
 use gaze_snap::{FilterStack, SnapEngine};
 
@@ -21,18 +21,12 @@ use crate::edge_scroll::EdgeParams;
 /// Everything decided before the loop starts.
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
-    /// The desk: outputs, eye, tracker, noise.
+    /// The desk: outputs, eye, tracker.
     pub geometry   : DesktopGeometry,
     /// Directory holding the ONNX models.
     pub models_dir : PathBuf,
-    /// Where the gaze samples come from.
+    /// The tracker's files.
     pub source     : SourceSpec,
-    /// Name substring of a mouse read for commit, exit and redetect on providers that
-    /// have no controls of their own. `None` reads no such device, which is the daemon:
-    /// the controller commits, and the mouse is the user's.
-    pub buttons    : Option<String>,
-    /// Grab that mouse, so its presses reach nothing else.
-    pub grab       : bool,
     /// Whether and which Daydream controller to read.
     pub daydream   : DaydreamSpec,
     /// Click for real. Off, commits are logged and nothing is injected at all: no
@@ -40,44 +34,19 @@ pub struct SessionConfig {
     pub click      : bool,
     /// Which look the overlay draws, and when.
     pub overlay    : OverlayMode,
-    /// Draw the provider's noise-free point, when it has one.
-    pub show_truth : bool,
-    /// Append every sample to this file for replay.
-    pub record     : Option<PathBuf>,
     /// Exit after this many seconds.
     pub seconds    : Option<f64>,
 }
 
-/// Where the gaze samples come from, with what each source needs to start.
+/// What the ET5 provider needs to start.
 #[derive(Clone, Debug)]
-pub enum SourceSpec {
-    /// A grabbed mouse driven through the desk's noise model.
-    Synthetic {
-        /// Name substring of the mouse to grab.
-        device : String,
-        /// Logical pixels of gaze motion per raw mouse count.
-        gain   : f64,
-        /// Seeds the noise RNG.
-        seed   : u64,
-        /// The noise to add.
-        model  : NoiseModel,
-    },
-
-    /// The ET5 over native USB.
-    Et5 {
-        /// Calibration file, when one exists.
-        calibration : Option<PathBuf>,
-        /// The on-device calibration blob re-declared on every connect.
-        device_blob : PathBuf,
-        /// Where the online offset persists; `None` freezes it in memory.
-        offset      : Option<PathBuf>,
-    },
-
-    /// A recorded session.
-    Replay {
-        /// The JSONL recording.
-        path : PathBuf,
-    },
+pub struct SourceSpec {
+    /// Calibration file, when one exists.
+    pub calibration : Option<PathBuf>,
+    /// The on-device calibration blob re-declared on every connect.
+    pub device_blob : PathBuf,
+    /// Where the online offset persists; `None` freezes it in memory.
+    pub offset      : Option<PathBuf>,
 }
 
 /// Whether and which Daydream controller to read.

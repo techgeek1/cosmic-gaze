@@ -34,8 +34,6 @@
 //! takes its new parameters in place), ask for the offset to be forgotten, and stop it;
 //! it reports a [`Status`] in return. All through [`Live`].
 
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -47,7 +45,6 @@ use gaze_daydream::DaydreamError;
 use gaze_inject::{Button as InjectButton, Injector, Key};
 use gaze_overlay::{Overlay, OverlayState, Pointer, Target, Zone};
 use gaze_provider_et5::ClickFeedback;
-use gaze_provider_synthetic::to_jsonl_line;
 use gaze_snap::{FixationState, Filtered, SnapEngine};
 use tracing::{debug, error, info, warn};
 
@@ -61,7 +58,7 @@ use crate::feedback::{self, ClickFeed, Press};
 use crate::keys::LatchKeys;
 use crate::live::Live;
 use crate::perception::{ElementStore, Perception, PerceptionConfig};
-use crate::score::{Scoreboard, classify};
+use crate::score::Scoreboard;
 use crate::source::{Control, GazeSource, Refine};
 use crate::surface::SurfaceCache;
 use crate::verify::{Verdict, Verifier};
@@ -235,7 +232,7 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
 
     // --- gaze source ---
 
-    let mut source = GazeSource::open(&config.source, config.buttons.as_deref(), config.grab, geometry)?;
+    let mut source = GazeSource::open(&config.source, geometry)?;
 
     // --- controller ---
 
@@ -286,19 +283,6 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
 
     let mut scroller = EdgeScroller::new(edge_params(&tuning));
     let mut surfaces = SurfaceCache::spawn();
-
-    // --- recording ---
-
-    let mut record = config
-        .record
-        .as_ref()
-        .map(|path| -> Result<_> {
-            let file = File::create(path)
-                .with_context(|| format!("creating {}", path.display()))?;
-
-            Ok(BufWriter::new(file))
-        })
-        .transpose()?;
 
     // --- loop ---
 
@@ -415,8 +399,7 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
         }
 
         // Controls before samples: a commit should not wait out a sample tick.
-        let mut controls = source.controls();
-        let mouse_n      = controls.len();
+        let mut controls = Vec::new();
 
         if let Some(daydream) = daydream.daydream.as_mut() {
             controls.extend(daydream.controls());
@@ -426,9 +409,7 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
             controls.extend(keys.events());
         }
 
-        for (i, control) in controls.into_iter().enumerate() {
-            let from_pad = i >= mouse_n;
-
+        for control in controls {
             match control {
                 Control::Commit | Control::Context => {
                     let button = match control {
@@ -455,8 +436,6 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
 
                     let clicked = commit(
                         &mut engine,
-                        source.truth(),
-                        &elements,
                         if paused { None } else { injector.as_mut() },
                         &mut board,
                         last_sample,
@@ -466,11 +445,8 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
                     );
 
                     // A pad commit is a gaze label like a mouse press is: the user was
-                    // looking at what they committed. A mouse commit is already seen by
-                    // the click feed as the physical press it is, so it is not fed twice.
-                    if from_pad
-                        && let (Some(px), Some(sample)) = (clicked, last_sample)
-                    {
+                    // looking at what they committed.
+                    if let (Some(px), Some(sample)) = (clicked, last_sample) {
                         let feedback = source.observe_click(px, sample.t_s);
 
                         log_click_feedback("pad", px, feedback);
@@ -634,7 +610,7 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
                 }
 
                 Control::Wheel(detents) => {
-                    wheel(injector.as_mut(), &warper, detents, source.grabbed());
+                    wheel(injector.as_mut(), &warper, detents);
                 }
             }
         }
@@ -655,13 +631,6 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
 
         samples    += 1;
         last_sample = Some(sample);
-
-        if let Some(writer) = record.as_mut() {
-            match to_jsonl_line(&sample) {
-                Ok(line) => writeln!(writer, "{line}").context("writing the recording")?,
-                Err(e)   => warn!(error = %e, "dropping a sample from the recording"),
-            }
-        }
 
         let filtered = filter.push(sample);
         let gaze     = filtered.sample.point.filter(|_| filtered.sample.valid);
@@ -909,7 +878,6 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
                     OverlayState {
                         gaze       : gaze,
                         highlight  : target.as_ref().filter(|_| !hidden).map(|t| t.element.bbox),
-                        truth      : if config.show_truth { source.truth() } else { None },
                         label      : Some(match (scrolling, hidden, retarget_block) {
                             _ if refined.is_some_and(|r| r.engaged) => "refine".to_string(),
                             (true, _, _)        => "edge scroll".to_string(),
@@ -926,7 +894,6 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
                     OverlayState {
                         gaze       : None,
                         highlight  : None,
-                        truth      : if config.show_truth { source.truth() } else { None },
                         label      : None,
                         background : None,
                         pointer    : pointer,
@@ -993,10 +960,6 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
 
     perception.stop();
 
-    if let Some(writer) = record.as_mut() {
-        writer.flush().context("flushing the recording")?;
-    }
-
     info!(
         reason          = reason,
         provider        = source.label(),
@@ -1005,11 +968,6 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
         sample_hz       = samples as f64 / elapsed,
         elements        = elements.len(),
         commits         = board.commits,
-        graded          = board.graded(),
-        hits            = board.hits,
-        slips           = board.slips,
-        misses          = board.misses,
-        hit_rate        = board.hit_rate(),
         mean_latency_ms = board.mean_latency_s() * 1000.0,
         warps           = warper.warps(),
         edge_starts     = scroller.starts,
@@ -1030,15 +988,11 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
 
 // --- Commit ---
 
-/// Resolves one left-button press to a target, clicks it, and grades it.
+/// Resolves one commit to a target, clicks it, and times it.
 ///
-/// The click is issued before any of the scoring work so the recorded latency is the real
+/// The click is issued before any of the bookkeeping so the recorded latency is the real
 /// press-to-click delay. In dry run there is no click, so the same figure measures the
 /// press-to-decision path instead and is correspondingly optimistic.
-///
-/// `truth` is the provider's noise-free point, which only the synthetic provider has. With
-/// no truth the commit is still counted and timed, just not graded: there is nothing to
-/// grade a real gaze sample against.
 ///
 /// `refined` is where the fine channel moved the point. Given, the click lands there
 /// whatever the snap engine thinks, target or no target; the engine's answer is still
@@ -1049,8 +1003,6 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn commit(
     engine    : &mut SnapEngine,
-    truth     : Option<GlobalPx>,
-    elements  : &[Element],
     injector  : Option<&mut Injector>,
     board     : &mut Scoreboard,
     sample    : Option<GazeSample>,
@@ -1091,14 +1043,7 @@ fn commit(
 
     let latency = press.elapsed();
 
-    // Truth is read at press time by the caller, not after the click, so a moving mouse
-    // cannot make a hit look like a slip.
-    let outcome = truth.map(|truth| classify(truth, target.as_ref().map(|t| &t.element), elements));
-
-    match outcome {
-        Some(outcome) => board.record(outcome, latency),
-        None          => board.record_ungraded(latency),
-    }
+    board.record(latency);
 
     let (id, kind, bbox, point) = match &target {
         Some(target) => (
@@ -1123,8 +1068,6 @@ fn commit(
         kind       = ?kind,
         bbox       = ?bbox,
         click      = ?point,
-        truth      = ?truth.map(|t| format!("{:.0},{:.0}", t.x, t.y)),
-        outcome    = ?outcome.map(|o| o.to_string()),
         refined    = ?refined.map(|p| format!("{:.0},{:.0}", p.x, p.y)),
         sigma_deg  = sample.sigma_deg,
         latency_ms = latency.as_secs_f64() * 1000.0,
@@ -1208,11 +1151,7 @@ fn log_click_feedback(via: &str, px: GlobalPx, feedback: Option<ClickFeedback>) 
 /// Injects one wheel event from the controller's volume keys at the pointer, wherever it
 /// is. No warp: with the thumb up the pointer is the user's, and a wheel where it sits
 /// is what a wheel on the mouse would do.
-///
-/// `grabbed` is whether the device the event came from is grabbed; it never is for the
-/// controller, so this is only kept honest for a grabbed mouse's wheel, which the
-/// compositor never saw and which therefore has to be re-injected here.
-fn wheel(injector: Option<&mut Injector>, warper: &Warper, detents: i32, grabbed: bool) {
+fn wheel(injector: Option<&mut Injector>, warper: &Warper, detents: i32) {
     let mut injector = injector;
 
     let Some(point) = pointer_position(injector.as_deref_mut(), warper) else {
@@ -1233,7 +1172,6 @@ fn wheel(injector: Option<&mut Injector>, warper: &Warper, detents: i32, grabbed
                 x       = %format_args!("{:.0}", point.x),
                 y       = %format_args!("{:.0}", point.y),
                 detents = detents,
-                grabbed = grabbed,
                 "dry run: would scroll here"
             );
         }
@@ -1747,7 +1685,6 @@ mod tests {
             eye_mm     : [0.0, 0.0, 650.0],
             tracker_mm : [0.0, 0.0, 0.0],
             outputs    : vec![output("DP-1", true, 0.0, 1000.0), output("DP-2", false, 1000.0, 1000.0)],
-            noise      : None,
         }
     }
 

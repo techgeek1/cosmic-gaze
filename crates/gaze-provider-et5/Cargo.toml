@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 gaze-core          = { workspace = true }
 gaze-overlay       = { workspace = true }
-gaze-provider-synthetic = { workspace = true }
 gaze-snap          = { workspace = true }
 # Used only by `gaze-et5-cli` (`--daydream` on calibrate and record).
 gaze-daydream      = { workspace = true }

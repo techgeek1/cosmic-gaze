@@ -39,8 +39,8 @@ pub struct Ray {
 }
 
 /// One gaze observation from any provider. A provider that only knows a screen point
-/// (a webcam model, a replay file) sets `point` and leaves `ray` as `None`; the geometry
-/// layer can reconstruct the ray from the nominal eye position. `sigma_deg` is the
+/// sets `point` and leaves `ray` as `None`; the geometry layer can reconstruct the ray
+/// from the nominal eye position. `sigma_deg` is the
 /// provider's own estimate of its 1-sigma angular error for this sample and is what the
 /// snap engine uses to size its search radius and to bail out to the coarse tier.
 #[derive(Clone, Copy, Debug, PartialEq)]

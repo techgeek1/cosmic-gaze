@@ -11,7 +11,6 @@ gaze-capture            = { workspace = true }
 gaze-detect             = { workspace = true }
 gaze-overlay            = { workspace = true }
 gaze-inject             = { workspace = true }
-gaze-provider-synthetic = { workspace = true }
 gaze-provider-et5       = { workspace = true }
 gaze-clicks             = { workspace = true }
 gaze-a11y               = { workspace = true }

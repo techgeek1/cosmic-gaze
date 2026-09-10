@@ -42,7 +42,7 @@ use tracing::{info, warn};
 use crossbeam_channel::{RecvTimeoutError, TryRecvError};
 use glam::{DQuat, DVec3};
 use gaze_core::{DesktopGeometry, GazeSample, GlobalPx, Ray};
-use gaze_provider_synthetic::GazeProvider;
+use gaze_core::GazeProvider;
 
 use crate::blob::BlobReport;
 use crate::calibration::{Et5Calibration, VIRTUAL_AREA, desk_to_sensor};
@@ -1266,7 +1266,6 @@ mod tests {
                 eye_mm     : [0.0, 180.0, 650.0],
                 tracker_mm : [0.0, 0.0, 0.0],
                 outputs    : vec![out],
-                noise      : None,
             },
             calibration    : None,
             direct_output  : Some("DP-9".into()),

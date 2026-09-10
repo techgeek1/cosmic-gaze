@@ -2,7 +2,7 @@
 //! the logical rects gaze-inject needs - the absolute backend's `ABS_X`/`ABS_Y` scaling
 //! range, the relative backend's homing corner, and the per-output centres
 //! `gaze-inject-cli --probe` walks. Deliberately reads only this slice of
-//! `config/desk.toml`; the rest (`eye_mm`, `yaw_deg`, `[noise]`, ...) belongs to
+//! `config/desk.toml`; the rest (`eye_mm`, `yaw_deg`, `position_mm`, ...) belongs to
 //! `gaze_core::DesktopGeometry` and gaze-inject has no use for it.
 
 use std::fs;

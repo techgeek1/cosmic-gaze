@@ -101,18 +101,14 @@ fn configure(options: &Options) -> Result<SessionConfig> {
     Ok(SessionConfig {
         geometry   : geometry,
         models_dir : paths.models_dir.clone(),
-        source     : SourceSpec::Et5 {
+        source     : SourceSpec {
             calibration : calibration.exists().then_some(calibration),
             device_blob : paths.device_blob(),
             offset      : Some(paths.offset()),
         },
-        buttons    : None,
-        grab       : false,
         daydream   : DaydreamSpec::Auto,
         click      : !options.dry_run,
         overlay    : if options.debug { OverlayMode::Debug } else { OverlayMode::Pointer },
-        show_truth : false,
-        record     : None,
         seconds    : None,
     })
 }

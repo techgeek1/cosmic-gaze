@@ -20,7 +20,6 @@
 use glam::{DQuat, DVec3};
 use serde::{Deserialize, Serialize};
 
-use crate::noise::NoiseModel;
 use crate::types::{GlobalPx, Ray};
 
 /// Slack allowed on the `[0, 1]` surface bounds when accepting an intersection. Purely a
@@ -67,8 +66,9 @@ pub struct OutputGeometry {
     pub roll_deg      : f64,
 }
 
-/// The whole desk: outputs plus the nominal eye and tracker placement used when a
-/// provider only supplies a 2D point, and by the synthetic provider's noise model.
+/// The whole desk: outputs plus the nominal eye and tracker placement. The eye is what
+/// the snap engine's angular scale and the ceremony's training rectangle are measured
+/// from; the tracker's own frames carry the real eye.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DesktopGeometry {
     /// Nominal eye position (midpoint between the eyes) for a seated user.
@@ -78,9 +78,6 @@ pub struct DesktopGeometry {
     #[serde(default)]
     pub tracker_mm : [f64; 3],
     pub outputs    : Vec<OutputGeometry>,
-    /// Error model for the synthetic provider; other providers ignore it.
-    #[serde(default)]
-    pub noise      : Option<NoiseModel>,
 }
 
 /// Result of intersecting a ray with the desk: which output, the world point, and the
@@ -162,8 +159,7 @@ impl DesktopGeometry {
 
     /// Angle in degrees between a gaze ray and the tracker axis, which is the direction
     /// from the tracker to the eye. Zero means the user is looking straight into the
-    /// tracker, which is where a PCCR device is most accurate; the sigma profile in
-    /// `crate::noise` is a function of this angle.
+    /// tracker, which is where a PCCR device is most accurate.
     ///
     /// The gaze ray points from the eye out toward a panel, so it is reversed before
     /// comparing: `angle(-dir, eye - tracker)`.
@@ -566,9 +562,6 @@ mod tests {
         assert!(g.outputs[0].radius_mm > 0.0);
         assert!(g.outputs[1].radius_mm > 0.0);
         assert_eq!(g.outputs[2].radius_mm, 0.0);
-
-        let noise = g.noise.expect("desk config carries a noise model");
-        assert_eq!(noise.profile.sigma_deg, 0.7);
     }
 
     #[test]
@@ -727,7 +720,6 @@ mod tests {
                 test_panel("far",  -200.0, 2000.0),
                 test_panel("near",    0.0,    0.0),
             ],
-            noise      : None,
         };
 
         let ray = Ray { origin: DVec3::new(0.0, 0.0, 500.0), dir: -DVec3::Z };

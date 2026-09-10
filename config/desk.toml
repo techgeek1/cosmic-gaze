@@ -81,17 +81,3 @@ radius_mm     = 0.0
 # STALE: pre-pivot values in the old seam-origin frame; unused in direct mode.
 position_mm   = [-40.0, -75.0, 100.0]
 pitch_deg     = -15.0
-
-[noise]
-rate_hz         = 120.0
-jitter_deg      = 0.2    # per-sample precision; bias = sqrt(sigma^2 - jitter^2) per fixation
-bias_redraw_deg = 1.0
-drift_deg       = 0.0
-latency_s       = 0.0
-
-[noise.profile]
-sigma_deg      = 0.7
-flat_to_deg    = 25.0
-ramp_to_deg    = 35.0
-ramp_factor    = 3.0
-invalid_at_deg = 40.0

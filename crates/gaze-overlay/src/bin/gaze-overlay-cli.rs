@@ -410,7 +410,6 @@ fn frame_at(desk: &Desk, t: f64) -> OverlayState {
             w : BOX_W,
             h : BOX_H,
         }),
-        truth      : Some(figure_eight(desk, t + 0.25)),
         label      : Some(format!("GAZE {:.0} {:.0}", gaze.x, gaze.y)),
         background : None,
         pointer    : None,
@@ -424,8 +423,7 @@ fn frame_at(desk: &Desk, t: f64) -> OverlayState {
 ///
 /// The union of three panels in an L is not a rectangle, so the raw curve spends part of
 /// each lap in dead space where no output exists and the marker would simply vanish. The
-/// point is clamped onto the nearest output instead, which is also what the synthetic
-/// provider does with its virtual gaze point.
+/// point is clamped onto the nearest output instead.
 fn figure_eight(desk: &Desk, t: f64) -> GlobalPx {
     let phase  = t / PERIOD_S * std::f64::consts::TAU;
     let bounds = desk.bounds;

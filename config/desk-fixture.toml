@@ -1,7 +1,7 @@
-# Frozen snapshot of the 2026-08-25 desk config, for tests only. The live desk.toml
-# tracks the physical desk and changes with every remount or re-measure; the
-# geometry and webcam test assertions were written against this coherent layout
-# and pin it here. Do not update it to match the desk — that is the point.
+# Frozen snapshot of the 2026-08-25 desk config, for gaze-core's geometry tests only.
+# The live desk.toml tracks the physical desk and changes with every remount or
+# re-measure; the geometry assertions were written against this coherent layout and
+# pin it here. Do not update it to match the desk — that is the point.
 
 # Physical layout of the desk. World frame: origin at the tracker (top edge of the small
 # panel, at the seam between DP-2 and DP-1), +X right, +Y up, +Z toward the user, mm.
@@ -56,17 +56,3 @@ physical_h_mm = 148.0
 radius_mm     = 0.0
 position_mm   = [-40.0, -75.0, 100.0]    # MEASURE
 pitch_deg     = -15.0                    # MEASURE: top tilted away from the user
-
-[noise]
-rate_hz         = 120.0
-jitter_deg      = 0.2    # per-sample precision; bias = sqrt(sigma^2 - jitter^2) per fixation
-bias_redraw_deg = 1.0
-drift_deg       = 0.0
-latency_s       = 0.0
-
-[noise.profile]
-sigma_deg      = 0.7
-flat_to_deg    = 25.0
-ramp_to_deg    = 35.0
-ramp_factor    = 3.0
-invalid_at_deg = 40.0

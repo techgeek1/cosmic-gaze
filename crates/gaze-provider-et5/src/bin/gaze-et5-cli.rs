@@ -34,7 +34,7 @@ use gaze_provider_et5::calibration::{desk_to_sensor, plane_corners};
 use gaze_daydream::{Button, Buttons, Controller};
 use crossbeam_channel::{Receiver, Sender};
 use gaze_provider_et5::ttp::{DisplayArea, DisplayRect};
-use gaze_provider_synthetic::GazeProvider;
+use gaze_core::GazeProvider;
 use gaze_snap::FilterStack;
 use signal_hook::consts::SIGINT;
 use signal_hook::flag;
@@ -1840,7 +1840,6 @@ fn view(config: &std::path::Path, calibration: Option<&std::path::Path>, direct:
         let state = OverlayState {
             gaze       : filtered.sample.point.filter(|_| filtered.sample.valid),
             highlight  : None,
-            truth      : None,
             label      : None,
             background : None,
             pointer    : None,

@@ -30,12 +30,6 @@ const GAZE_DOT_PX: f64 = 2.0;
 /// Stroke width of the highlight box in logical pixels.
 const HIGHLIGHT_STROKE_PX: f64 = 2.0;
 
-/// Half length of a truth cross arm in logical pixels.
-const TRUTH_ARM_PX: f64 = 7.0;
-
-/// Stroke width of the truth cross in logical pixels.
-const TRUTH_STROKE_PX: f64 = 2.0;
-
 /// Size of one font pixel in logical pixels. 2 gives a 10x14 glyph, legible at arm's
 /// length on all three panels.
 const LABEL_PIXEL_PX: f64 = 2.0;
@@ -51,9 +45,6 @@ const HIGHLIGHT_COLOR: [u8; 4] = [255, 190, 60, 235];
 
 /// Highlight interior colour. Faint enough to read text through.
 const HIGHLIGHT_FILL: [u8; 4] = [255, 190, 60, 28];
-
-/// Truth marker colour, magenta, deliberately unlike the gaze ring.
-const TRUTH_COLOR: [u8; 4] = [255, 80, 200, 230];
 
 /// Label text colour.
 const LABEL_COLOR: [u8; 4] = [255, 255, 255, 240];
@@ -99,14 +90,6 @@ pub enum Item {
         stroke : f32,
         color  : [u8; 4],
         fill   : [u8; 4],
-    },
-    /// The ground-truth marker.
-    Cross {
-        cx     : f32,
-        cy     : f32,
-        arm    : f32,
-        stroke : f32,
-        color  : [u8; 4],
     },
     /// A text label on a backing plate, `x`/`y` at the top left of the plate.
     Label {
@@ -165,18 +148,6 @@ pub fn scene(state: &OverlayState, map: &OutputMapping) -> Vec<Item> {
             stroke : map.buffer_len(HIGHLIGHT_STROKE_PX),
             color  : HIGHLIGHT_COLOR,
             fill   : HIGHLIGHT_FILL,
-        });
-    }
-
-    if let Some(t) = state.truth {
-        let (cx, cy) = map.buffer(t);
-
-        items.push(Item::Cross {
-            cx     : cx,
-            cy     : cy,
-            arm    : map.buffer_len(TRUTH_ARM_PX),
-            stroke : map.buffer_len(TRUTH_STROKE_PX),
-            color  : TRUTH_COLOR,
         });
     }
 
@@ -300,27 +271,6 @@ pub fn draw(pixmap: &mut PixmapMut, items: &[Item]) {
                     &path,
                     &paint(*color),
                     FillRule::Winding,
-                    Transform::identity(),
-                    None,
-                );
-            }
-
-            Item::Cross { cx, cy, arm, stroke, color } => {
-                let mut pb = PathBuilder::new();
-
-                pb.move_to(cx - arm, *cy);
-                pb.line_to(cx + arm, *cy);
-                pb.move_to(*cx, cy - arm);
-                pb.line_to(*cx, cy + arm);
-
-                let Some(path) = pb.finish() else {
-                    continue;
-                };
-
-                pixmap.stroke_path(
-                    &path,
-                    &paint(*color),
-                    &stroke_of(*stroke),
                     Transform::identity(),
                     None,
                 );
@@ -472,12 +422,6 @@ fn item_bounds(item: &Item) -> PixelBox {
             let s = stroke * 0.5;
 
             PixelBox::around(x - s, y - s, w + stroke, h + stroke)
-        }
-
-        Item::Cross { cx, cy, arm, stroke, .. } => {
-            let r = arm + stroke * 0.5;
-
-            PixelBox::around(cx - r, cy - r, r * 2.0, r * 2.0)
         }
 
         Item::Label { x, y, px, text } => {

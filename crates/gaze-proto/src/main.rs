@@ -1,4 +1,4 @@
-//! The dev harness: the session loop from flags, with every provider and the debug look.
+//! The dev harness: the session loop from flags, with the debug look.
 //! The daemon runs the same loop from the stored config; see `gazed`.
 
 use anyhow::Result;

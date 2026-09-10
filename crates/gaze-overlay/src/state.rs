@@ -8,7 +8,7 @@ use gaze_core::{GlobalPx, Rect};
 /// replaced on each update rather than mutated field by field, so a producer that stops
 /// sending a highlight makes it disappear without needing a separate clear call.
 ///
-/// Two looks share this struct. `gaze`, `highlight`, `truth` and `label` are the debug
+/// Two looks share this struct. `gaze`, `highlight` and `label` are the debug
 /// look: drawn exactly as given, on the frame they arrive, in fixed colours. `pointer`
 /// is the daily-driver look: an intent the overlay presents on its own clock, fading
 /// the dot and the highlight in and out and colouring both from the desktop theme
@@ -21,9 +21,6 @@ pub struct OverlayState {
     /// The candidate element the snap engine currently favours. Drawn as a stroked box
     /// with a faint interior.
     pub highlight  : Option<Rect>,
-    /// Debug only: where the gaze point really is, before provider noise. Drawn as a
-    /// cross in a colour that cannot be confused with the gaze ring.
-    pub truth      : Option<GlobalPx>,
     /// Debug only: a short ASCII caption drawn next to the highlight. Rendered with the
     /// built in 5x7 bitmap font, so anything outside printable ASCII becomes `?`.
     pub label      : Option<String>,
@@ -100,7 +97,6 @@ impl OverlayState {
     pub fn is_blank(&self) -> bool {
         self.gaze.is_none()
             && self.highlight.is_none()
-            && self.truth.is_none()
             && self.label.is_none()
             && self.background.is_none()
             && self.pointer.is_none()
