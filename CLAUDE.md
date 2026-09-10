@@ -2,7 +2,7 @@
 
 Gaze-based pointing/scrolling/clicking for COSMIC (Wayland). Read `DESIGN.md` for the
 why, `PLAN.md` for the Phase 0 build plan and per-crate contracts, `PLAN-ET5.md` for the
-tracker provider and model, and `PLAN-UX.md` for the overlay, daemon and applet.
+tracker provider and its calibration, and `PLAN-UX.md` for the overlay, daemon and applet.
 
 ## Code style
 Follow `(private notes)` exactly (column-aligned fields/args, `// --- X ---`

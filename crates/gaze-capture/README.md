@@ -109,8 +109,7 @@ watches activation over time and keeps a `focus_rank` per window (higher is more
 recently activated), and `at(point)` takes the highest-ranked containing window, then
 the currently activated one, then the smallest. A fresh tracker has no history, so
 until the first focus change a tie between two unfocused windows falls to the smallest
-and then list order; the collector's tracker runs all day and does better than the
-probe's. The complete answer would be a capture of each candidate toplevel
+and then list order; a tracker that runs all day does better than the probe's. The complete answer would be a capture of each candidate toplevel
 (`ext_foreign_toplevel_image_capture_source_manager_v1`, which cosmic-comp advertises)
 compared with the screen.
 

@@ -21,7 +21,7 @@ install: build
     install -Dm0755 target/release/{{applet}} {{prefix}}/bin/{{applet}}
     install -Dm0644 crates/gaze-applet/data/{{applet_id}}.desktop {{prefix}}/share/applications/{{applet_id}}.desktop
 
-# Copies the desk's files from the checkout to where an installed gazed looks (the offset and flywheel are state gazed writes itself and are not copied)
+# Copies the desk's files from the checkout to where an installed gazed looks (the offset is state gazed writes itself and is not copied)
 install-desk:
     install -Dm0644 config/desk.toml            {{xdg_conf}}/desk.toml
     install -Dm0644 config/calibration-et5.toml {{xdg_conf}}/calibration-et5.toml

@@ -1295,6 +1295,36 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   was Phase 0's). The trainer stays, to bootstrap the flywheel again if it is ever
   needed, and the click collector stays with it: the trainer's presses reach the data
   through the collector's socket.
+- 2026-09-10, **The offset is the whole correction: the residual model, its pipeline
+  and every non-ET5 path removed.** Ruled the same evening, reversing the trainer
+  decision above. The case: the model's held-out gain was 21% (1.83° to 1.44° median,
+  one session worse, "gate not met as written, built anyway to be felt"), which sits
+  under the 2° snap radius; the larger term in that analysis was the per-day bias, which
+  the online offset with its consensus jump now learns from ordinary clicks; and the
+  desk had been running without the model since the 2026-09-09 recalibration orphaned
+  it, which is the "working well as is" that prompted the question. Removed: `model.rs`,
+  `train.rs`, `dataset.rs`, `record.rs`, `flywheel.rs`, the old `sweep.rs` with its
+  pose solver and triangulation, the CLI's fit/record/flywheel/sessions/dataset/refit/
+  collect commands, `gaze-trainer`, the click collector (`gaze-clicks` keeps the mouse
+  reader and the tree thread the session uses), `gaze-provider-synthetic` and the replay,
+  `gaze-proto`'s Lenovo button reader and its provider/record/truth flags, the
+  hit/slip/miss scoring, the overlay's truth cross, `gaze-core`'s noise model and the
+  desk file's `[noise]` section, the `Model` bus property. Three commits, about 23,000
+  lines. Two things changed rather than went: the `GazeProvider` trait moved into
+  `gaze-core`, and the offset no longer lives inside the model state. It runs whenever
+  there is a direct-mode calibration, keyed to the calibration's blob hash, and moves
+  the calibrated point (after the field and the head gain, which the model used to
+  bypass) in angle space: the ray from the eyes through the point, rotated by the
+  offset for the current posture, re-intersected with the desk; a click's leftover is
+  measured against that ray. The desk file keeps the nominal eye and tracker (the snap
+  engine's angular scale and the ceremony's training rectangle are measured from them)
+  and panel curvature; the poses of the two outputs the tracker never reaches went, and
+  `position_mm` became optional. Checked after the change: `gazed --home . --dry-run`
+  comes up on the trimmed desk file with the offset loaded and the real mouse read for
+  labels, and `calibrate --dry-run` prints the same plan; not yet driven with clicks
+  live. U4 is now
+  self-contained setup (PLAN-UX.md): calibrate in the daemon, a generated desk file,
+  the ONNX models as a download.
 
 ## 11. Open questions
 

@@ -1,12 +1,15 @@
 # ET5 provider build plan: host-owned device state, then a state-conditioned model
 
-**Status 2026-09-04: A0–A3, A5, B1–B2, B4–B5, Phase C, D1–D3 and D5 built (DESIGN.md §10c
-results log). Phase C ran on five click sessions: the per-eye direction kernel model takes
-the held-out per-click median from 1.83° to 1.44° (21%, under the 25% gate) and one August
-session gets worse, because the day-to-day bias is the next largest term. D5, a causal
-click-fed offset, reaches 1.20° on the same clicks in simulation (the oracle is 1.22) and
-is live in `gaze-proto`, fed by the real mouse. `gaze-et5-cli fit` writes
-`config/model-et5.json`, `gaze-proto` picks it and `config/offset-et5.json` up.** Background and the research that led here:
+**Status 2026-09-10: Phase A, D5 and E2 are the product. Phases B, C, D1–D3 and E1/E3 were
+built (2026-09-04 to 09-09) and removed on 2026-09-10 by the user's ruling: Phase C ran on
+five click sessions and the per-eye direction kernel model took the held-out per-click
+median from 1.83° to 1.44° (21%, under the 25% gate, one session worse), which sits
+under the snap radius, while D5's click-fed offset reached 1.20° on the same clicks (the
+oracle is 1.22) and carried the day on its own. So the offset is the whole correction on
+top of the on-device calibration, everything that fed the model (recorder, exporter,
+collector, trainer, flywheel, Python harness) is in git history before commit
+`169862f`, and the calibration and the offset are what a new machine sets up.**
+Background and the research that led here:
 DESIGN.md §10c. This plan replaces the compound sweep's client-side fitting (correction
 field + head-gain regression) and, more importantly, the assumption that the tracker
 remembers its own calibration.
@@ -44,14 +47,13 @@ own limit (~0.7° inside the cone), with drift that corrects itself from ordinar
   refilled on every connect and verified afterwards. Nothing is ever "restored" ad hoc.
 - **Retrain the firmware once.** Client-side data is keyed to the blob hash; a retrain
   orphans it. The firmware model is a feature extractor, not the thing that improves.
-- **One model across sessions, conditioned on state.** Head position, interocular vector,
-  pupil diameter, angle from the tracker axis are inputs. No per-session calibration.
-- **Residual, in angle space, before intersection.** Prior = trust the firmware ray. A
-  correction exists whether or not the ray hits a panel; the cone straddles the seam.
-- **Honest evaluation only.** Leave-one-*session*-out is the number. Frames within a hold
-  are correlated; per-sample CV lies.
-- **Confidence is an output.** Away from training data the correction fades to zero and σ
-  widens; the snap engine already consumes σ.
+- **The day's bias is learnt from use.** The offset (D5, E2) is fed by the clicks the user
+  is already making, keyed to posture, and starts over on a retrain.
+- **In angle space, before intersection.** The correction is a rotation of the ray from
+  the eyes through the calibrated point, re-intersected with the desk.
+- *(Retired 2026-09-10 with the model)* one model across sessions conditioned on state;
+  honest leave-one-session-out evaluation; confidence as an output. The numbers those
+  produced are in DESIGN.md §10c.
 - Everything that changes the device or needs a seated user is marked **[user]**. Everything
   else is agent work.
 
@@ -111,7 +113,7 @@ own limit (~0.7° inside the cone), with drift that corrects itself from ordinar
   from `calibrate`; recording moves to Phase B. Keep the pose solver and the lag/saccade
   helpers as library code (B2 uses them).
 
-## Phase B — Recording
+## Phase B — Recording (removed 2026-09-10; git history before `169862f`)
 
 ### B1. `record` command
 - A five-minute session that only records: stop grid on black (4×3 over the device display — `--cone-deg` narrows it to the
@@ -279,7 +281,7 @@ acquisition.
 - ≥ 6 sessions over ≥ 3 days, morning and evening, glasses state noted. Nothing else moves
   (tracker, monitors, desk config) during the collection window.
 
-## Phase C — Model prototype (Python, `uv`, `crates/gaze-provider-et5/model/`)
+## Phase C — Model prototype (Python; removed 2026-09-10, numbers kept in DESIGN.md §10c)
 
 ### C1. Loader and features from B2's export; grouped splits by session.
 ### C2. Baselines on identical splits: firmware only; a quadratic uv field per session
@@ -298,7 +300,7 @@ acquisition.
   bias (the per-session offset oracle on top takes it to −33%). D1–D3 built for the
   feel; D5 next.
 
-## Phase D — Rust runtime
+## Phase D — Rust runtime (D1–D3 removed 2026-09-10; D5 is live)
 
 ### D1. `model.rs`: kernel model (inducing points, weights, lengthscales, variance solve),
   `predict(&Features) -> (dyaw_deg, dpitch_deg, var)`, serde in the calibration file.
@@ -329,8 +331,11 @@ acquisition.
   binocular midpoint) each holding its own yaw/pitch and blended by distance, a new
   posture inheriting the blend and closing most of its gap in ten clicks. Daydream pad commits feed it alongside mouse presses.
   The file format changed; an old file starts cold.
+  **Decoupled 2026-09-10** from the removed model: the offset runs whenever there is a
+  direct-mode calibration, keyed to the calibration's blob, and moves the calibrated
+  point (after the field and the head gain) in angle space.
 
-## Phase E — Flywheel
+## Phase E — Flywheel (E1 and E3 removed 2026-09-10; E2 is live in the offset)
 
 ### E1. Pair logging in `gaze-proto`: on every real click (read-only evdev on the real mouse,
   pointer from `CursorTracker`), attribute the fixation from the ring buffer with a

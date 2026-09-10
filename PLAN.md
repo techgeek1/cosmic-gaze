@@ -2,8 +2,10 @@
 
 **Status 2026-08-26: complete. Verdict and numbers in DESIGN.md §10b. Next phase: fine channel
 (Daydream controller daemon + refine modes in gaze-proto), then online recalibration.
-ET5 provider rebuild (host-owned device state, state-conditioned model, click flywheel):
-`PLAN-ET5.md`.**
+ET5 provider rebuild (host-owned device state, the online offset): `PLAN-ET5.md`. The
+Phase 0 apparatus this plan describes (the synthetic provider, the bench, the truth
+scoring, the noise model) was removed 2026-09-10 once the ET5 was the only path; the
+contracts below are kept as the record of what was built and why.**
 
 Goal: a number. First-commit snap-correct rate on a real mixed desktop at sigma = 0.7
 degrees (ET5-class) and 1.5 degrees, using detector boxes only (no a11y), driven by a
@@ -52,7 +54,7 @@ three outputs of `config/desk.toml`; flat panel as the large-radius limit of the
 `px_per_deg` at the seam roughly 55-65 px/deg for the LG at 650 mm; sigma profile
 breakpoints.
 
-### gaze-provider-synthetic (DONE; live-tested against the grabbed Lenovo mouse)
+### gaze-provider-synthetic (removed 2026-09-10; the `GazeProvider` trait lives in `gaze-core`)
 ```rust
 pub trait GazeProvider { fn next(&mut self) -> Option<GazeSample>; fn stop(&mut self); }
 pub struct SyntheticProvider;   // SyntheticProvider::create().device(path).geometry(g).model(m).start()?
@@ -115,7 +117,7 @@ pub struct SnapTarget { pub element: Element, pub point: GlobalPx, pub score: f6
 Scoring: `cost = 0.6*kind_penalty + 0.15*ln(1+area_deg2) + 1.0*distance_deg` (controls 0, Text 1, Unknown 2).
 Bails to `None` when `sigma_deg > radius_deg` or the sample is invalid.
 
-### gaze-overlay (DONE; `Overlay::spawn() -> (OverlayHandle, JoinHandle)`, `OverlayHandle::set(OverlayState)` / `stop()`, `OverlayState { gaze, highlight, truth, label, background, pointer }`; the pointer look is PLAN-UX.md U1, built 2026-09-09)
+### gaze-overlay (DONE; `Overlay::spawn() -> (OverlayHandle, JoinHandle)`, `OverlayHandle::set(OverlayState)` / `stop()`, `OverlayState { gaze, highlight, label, background, pointer, mark }`; the pointer look is PLAN-UX.md U1, built 2026-09-09; the truth cross went 2026-09-10)
 ```rust
 pub struct Overlay;  // Overlay::connect()? ; fn set(&mut self, state: OverlayState); OverlayState { gaze: Option<GlobalPx>, highlight: Option<Rect>, truth: Option<GlobalPx> }
 ```
@@ -136,32 +138,31 @@ then relative delta) and document the choice. Bin: `gaze-inject-cli --move x y`,
 `--click x y`, and `--probe` that walks the corners of each output and reports (by asking
 the user to confirm) where the cursor landed.
 
-### gaze-clicks (DONE; passive gaze labels from ordinary mouse clicks; PLAN-ET5 B4)
+### gaze-clicks (the collector removed 2026-09-10; the mouse reader and the tree thread remain)
 ```rust
-gaze-clicks-cli run [--out PATH] [--mouse PATH] [--mouse-name SUBSTR] [--models DIR] [--desk config/desk.toml] [--calibration config/calibration-et5.toml] [--blob config/calibration-et5.bin] [--no-tracker] [--capture-hz 1] [--luma-px 256]
-gaze-clicks-cli devices | probe
+gaze-clicks-cli devices | presses
 ```
-A background collector: reads the real mouse read-only (never `EVIOCGRAB`), captures the
-output under the pointer **on the press**, recognises the whole frame (a crop loses every
-wide flat widget: 0/12 on identical pixels), and writes the gaze frames around the press
-against the element's box as a `gaze-provider-et5` session file
-(`config/sessions/<unix>-<blobkey>-clicks.jsonl`). Rejects drags, off-desk clicks, stale
-frames, clicks on nothing, and clicks with no gaze over the approach. Holds the tracker
-for the whole run, so `gaze-proto` and `gaze-et5-cli` cannot run alongside it. Its status
-line's running median firmware offset is the daily drift number. See
+Was the passive click collector (PLAN-ET5 B4): the real mouse read-only, the output
+under the pointer captured on the press, the element recognised, the frames written as
+a session file for the residual model's fit. It went with the model. What the session
+still uses stays: `mouse::MouseReader` (every mouse-shaped evdev node, never grabbed,
+rescanned) feeding presses to the ET5's online offset, and `tree::TreeService`, the
+watched accessibility-tree thread the verifier and the edge scroller ask. See
 `crates/gaze-clicks/README.md`.
 
 ### gaze-bench (removed 2026-09-10)
 The Phase 0 offline Monte Carlo over screenshots and synthetic sigmas. Its report was
-never regenerated after the snap rules changed; the live numbers come from the click
-flywheel now. The reports it produced are in the history (`crates/gaze-bench/report*.md`
-before the removal).
+never regenerated after the snap rules changed. The reports it produced are in the
+history (`crates/gaze-bench/report*.md` before the removal).
 
-### gaze-proto (DONE; `gaze-proto --click --show-truth`; Lenovo left = commit, right = exit, middle = redetect; ~0.45 core idle, ~8 cores while detecting)
+### gaze-proto (DONE; now the dev harness over the session library `gazed` runs; ~0.45 core idle, ~8 cores while detecting)
 
-Also has `--provider synthetic|webcam|replay` and the scroll tier (2026-08-26; the webcam
-provider and its sidecar were removed 2026-09-10, the ET5 having replaced them, and the
-scroll tier went with the borrow-and-return model of 2026-09-09):
+Had `--provider synthetic|webcam|replay`, the Lenovo's buttons as the commit device and
+the scroll tier (2026-08-26). All of that is gone: the webcam provider and its sidecar
+on 2026-09-10 (the ET5 having replaced them), the scroll tier with the borrow-and-return
+model of 2026-09-09, and the synthetic and replay providers with the grabbed mouse, the
+recording and the truth scoring on 2026-09-10 (the ET5 is the only source; the
+controller commits). What follows is the record of those modes:
 
 - **What commits.** The same three buttons on the Lenovo in every mode, and the device is
   `EVIOCGRAB`ed in every mode: `synthetic` grabs it as its gaze device, `webcam` and

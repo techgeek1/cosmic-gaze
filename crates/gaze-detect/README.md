@@ -13,7 +13,7 @@ let elements = detector.detect(&frame.rgba, frame.width, frame.height, origin, s
 
 ## `detect_near`: everything that could be under one point
 
-`detect_near(rgba, w, h, origin, scale, at, near)` is the pass a click collector wants,
+`detect_near(rgba, w, h, origin, scale, at, near)` is the pass a pointer-local caller wants,
 and it makes two opposite trades against the full pass. For **widgets** it builds the
 *same* tile plan `detect_timed` builds and runs only the tiles whose rectangle contains
 `at`, which is one to four instead of ten on the ultrawide. That loses nothing: a box is
@@ -21,7 +21,7 @@ only emitted by a tile that holds it whole, so any box containing the point lies
 containing the point. Note what this is *not* — it is not a crop around the pointer. A
 crop cuts new pixels and hands them to the model as a whole image, which changes the
 context a wide flat list row is recognised by, and it measured 0 agreements out of 12
-(`gaze-clicks/README.md`). Here the model sees the same 1024 px tile at the same scale
+(the click collector's measurement, 2026-08-28, DESIGN.md §10c). Here the model sees the same 1024 px tile at the same scale
 with the same surroundings. For **text** it goes the other way: the model runs at native
 resolution over a `near.ocr_px` square window centred on the point, shrinking at the
 frame edges rather than padding. The full pass caps the frame at `ocr_max_side` for time,

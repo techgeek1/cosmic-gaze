@@ -10,7 +10,9 @@
 
 # Desk-frame eye: the tracked origin rotated back out of the sensor frame by
 # tracker_pitch_deg. 2026-09-09 seated reading (-27, 6, 785) sensor mm with the eye
-# estimated 20 mm below the panel centre, i.e. 175 mm above the camera.
+# estimated 20 mm below the panel centre, i.e. 175 mm above the camera. The snap
+# engine's angular scale and the ceremony's training rectangle are measured from here;
+# the tracker's own frames carry the real eye.
 eye_mm     = [-27.0, 175.0, 765.0]
 tracker_mm = [0.0, 0.0, 0.0]
 
@@ -23,10 +25,11 @@ tracker_mm = [0.0, 0.0, 0.0]
 # the bar. (The 2026-08 DP-1 mount was 13.0 from y +38 at z 714 against ~200 mm.)
 tracker_pitch_deg = 12.4
 
-# LG 38GN950, 38" 21:10, 2300R. Main display, right of the seam.
+# LG 38GN950, 38" 21:10, 2300R. Main display, right of the seam. Out of the tracker's
+# reach since the remount, so no pose: only the tracker's display needs one.
 [[outputs]]
 name          = "DP-1"
-detect        = false                    # out of the tracker's reach since the remount
+detect        = false
 logical_x     = 2559.0
 logical_y     = 0.0
 logical_w     = 3840.0
@@ -34,13 +37,6 @@ logical_h     = 1600.0
 physical_w_mm = 880.0
 physical_h_mm = 370.0
 radius_mm     = 2300.0
-# STALE: this is the pre-remount pose (bar under this panel; 25 mm right of the bar,
-# 207 up, 27 back). With the bar under DP-2 the panel sits to the right of the seam
-# and angled away, roughly 300 + 440 mm right and turned about -20 deg; only multi-
-# display ray mode would care. MEASURE if it ever does.
-position_mm   = [25.0, 207.0, -27.0]
-yaw_deg       = 0.0
-pitch_deg     = -4.0
 
 # VIOTEK GNV27DB, 27" 16:9, 1500R. Left of the seam, angled in. The tracker's display
 # since the remount: the whole 600 mm panel sits inside the gaze envelope at the desk's
@@ -66,11 +62,12 @@ pitch_deg     = -4.0                     # slight recline, top away from the use
 
 # 11" 16:10 portable panel, flat, on the desk below the seam. 1920x1200 physical; the
 # compositor uses fractional scale ~1.15 so the logical size is 1670x1043 (wl_output.scale
-# rounds up to 2 and lies; zxdg_output_v1 is authoritative). Reports no EDID size; 237x148 mm from the panel spec. Tracker mounts on
-# its top edge. Occasionally drops off the compositor's output list; keep enabled.
+# rounds up to 2 and lies; zxdg_output_v1 is authoritative). Reports no EDID size;
+# 237x148 mm from the panel spec. Out of the tracker's reach, and the log terminal lives
+# here, so no pose. Occasionally drops off the compositor's output list; keep enabled.
 [[outputs]]
 name          = "HDMI-A-1"
-detect        = false                    # out of the tracker's reach, and the log terminal lives here
+detect        = false
 logical_x     = 1506.0
 logical_y     = 1600.0
 logical_w     = 1670.0
@@ -78,6 +75,3 @@ logical_h     = 1043.0
 physical_w_mm = 237.0
 physical_h_mm = 148.0
 radius_mm     = 0.0
-# STALE: pre-pivot values in the old seam-origin frame; unused in direct mode.
-position_mm   = [-40.0, -75.0, 100.0]
-pitch_deg     = -15.0

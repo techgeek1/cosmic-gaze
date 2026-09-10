@@ -56,7 +56,9 @@ pub struct OutputGeometry {
     /// Cylinder radius; `0.0` means flat.
     #[serde(default)]
     pub radius_mm     : f64,
-    /// World position of the panel's visible-area centre.
+    /// World position of the panel's visible-area centre. Only the tracker's own
+    /// display needs a real one; an output the tracker never reaches may leave it out.
+    #[serde(default)]
     pub position_mm   : [f64; 3],
     #[serde(default)]
     pub yaw_deg       : f64,

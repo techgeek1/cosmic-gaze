@@ -129,18 +129,18 @@ forty flags sorts into three piles, decided 2026-09-10 after the modes session:
 
 - **Dies with the prototype.** Provider selection and everything it drags in (synthetic,
   replay, webcam, the grabbed mouse, noise overrides, seed, gain), record, seconds,
-  show-truth, the debug look, dry run versus click, freeze-offset, no-flywheel. These stay
-  in `gaze-proto`'s `Args` as the dev harness. Two were features and are cut outright:
+  show-truth, the debug look, dry run versus click, freeze-offset, no-flywheel. Seconds,
+  the debug look, dry run versus click and freeze-offset stay in `gaze-proto`'s `Args` as
+  the dev harness; the rest went with the non-ET5 paths and the model on 2026-09-10. Two were features and are cut outright:
   wheel routing to the window under gaze (`--scroll`) and focus-follows-gaze, both of
   which moved the pointer on their own initiative, which the borrow-and-return model
   abolished. The tier toggles go too: clicking, edge scrolling and the tree verdicts are
   always on, and the Daydream controller is used when one is paired (the first paired
   one), retried in the background while it is asleep. The gyro refine mode and its axes
   go; touch won.
-- **Becomes a fixed location.** `gaze_config::Paths`: the desk file, calibration,
-  device blob and residual model under `$XDG_CONFIG_HOME/cosmic-gaze/`, models under
-  `$XDG_DATA_HOME/cosmic-gaze/models/`, the offset and the flywheel under
-  `$XDG_STATE_HOME/cosmic-gaze/`. `gazed --home DIR` (and `gaze-proto --home DIR`) maps
+- **Becomes a fixed location.** `gaze_config::Paths`: the desk file, calibration and
+  device blob under `$XDG_CONFIG_HOME/cosmic-gaze/`, the ONNX models under
+  `$XDG_DATA_HOME/cosmic-gaze/models/`, the offset under `$XDG_STATE_HOME/cosmic-gaze/`. `gazed --home DIR` (and `gaze-proto --home DIR`) maps
   all three onto a checkout's `config/` and `models/` so a live run needs no copying.
 - **Becomes tuning.** Every number still being moved: the filter quartet, snap and near
   radii, commit latency, pointer settle and linger, the ten edge-scroll knobs, the refine
@@ -169,19 +169,39 @@ the session: the applet's Start button runs it and its Stop button calls `Quit`
 ## U3. Applet — built 2026-09-10
 
 `gaze-applet` (`cosmic-ext-applet-gaze`), a libcosmic panel applet on the same pin as
-the trainer. Status icon; a popup with the live state (tracker, calibration, model,
-controller, mode, offset), a Start/Stop button that runs the installed `gazed` and
+the overlay's cosmic-config. Status icon; a popup with the live state (tracker,
+calibration, controller, mode, offset), a Start/Stop button that runs the installed `gazed` and
 calls `Quit`, a pause toggle, and an "Advanced" section that draws every
 `KNOBS` entry as a slider writing straight to cosmic-config, so the feel can be tuned
 on the running system without a rebuild or a restart. It polls the daemon's properties
 over D-Bus (one `GetAll` a second, faster while open), which survives the daemon
 restarting. Nothing gaze-specific in it beyond `gaze-config`.
 
-## U4. Calibrate moves into the daemon
+## U4. Self-contained: calibrate in the daemon, a generated desk file, downloaded models
 
-The daemon holds the device, so the retrain ceremony leaves `gaze-et5-cli calibrate`
-and runs in the daemon, drawing its targets on the daemon's overlay; the applet only
-triggers it. The most work in the split, last on purpose.
+Ruled 2026-09-10: setting up a new machine and recalibrating must not need the CLI, and
+there is no fit step (the residual model went; the offset is the correction). Three
+pieces:
+
+- **Calibrate in the daemon.** The daemon holds the device, so the retrain ceremony and
+  its health check leave `gaze-et5-cli calibrate` and run in the daemon on its overlay,
+  behind a `Calibrate` method and a `calibrating` mode; the applet has a Calibrate
+  button and a Cancel while it runs. Points are accepted on the gate's vote as the CLI
+  does by default, the controller's pad commits when it is paired, and the prompts that
+  went to stdout become the overlay caption. The blob and the calibration land in the
+  XDG config dir and the session restarts on them; the offset starts over.
+- **A generated desk file.** What the ET5 path reads from `desk.toml` is the tracked
+  output's logical rect and physical size (the compositor knows both), the panel pose
+  relative to the camera (a mount constant for the clip bar, centred under the panel),
+  the nominal eye, and the tracker pitch (derived at calibration from the reported eye
+  origin against the assumed eye height, the derivation the desk file's comments do by
+  hand). The daemon writes the file when there is none, from one choice in the applet:
+  which output the bar is under.
+- **The ONNX models as a download.** The export tooling is AGPL Ultralytics under torch,
+  so `just install` cannot build them; the exported files are hosted as a release asset
+  the justfile fetches into `$XDG_DATA_HOME/cosmic-gaze/models/`.
+
+The most work in the split, last on purpose.
 
 ## Order
 
