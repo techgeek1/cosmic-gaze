@@ -7,7 +7,7 @@
 //! 1.22 with the held-out session's own median offset added (the oracle). A causal
 //! simulation of this filter over the same clicks, in time order, reached 1.20, so the
 //! oracle is attainable from the clicks themselves within about twenty of them
-//! (`model/loso_clicks.py`, `online`).
+//! (the Phase C harness's `loso_clicks.py`, `online`; removed 2026-09-10).
 //!
 //! A single bias was not enough on the desk (2026-09-05): it held in the calibration
 //! posture and broke on a comfortable slouch, and relearning it on every posture change

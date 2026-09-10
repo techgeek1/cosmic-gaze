@@ -61,8 +61,8 @@ const STOP_MIN_FRAMES: usize = 5;
 /// frame that never reported an eye is not the same thing as a frame that reported an
 /// untracked one, and the loader on the other side needs to be able to tell.
 ///
-/// Field names and units follow `model/gaze_model/schema.py`, which the Phase C harness
-/// reads without a rename shim. The fields that schema has no column for
+/// Field names and units follow the Phase C Python harness's `schema.py` (removed
+/// 2026-09-10, in the history under `model/`), which read them without a rename shim. The fields that schema has no column for
 /// ([`Row::hold_key`], [`Row::session_phase`], the raw origins, the alternative
 /// residual and the four passive-click columns) are exported as extra columns;
 /// `load_export.py` prints them and drops them.
@@ -171,8 +171,8 @@ pub struct Row {
 
 /// The CSV header, in the order [`Row::to_csv`] writes the fields.
 ///
-/// The first 38 are `model/gaze_model/schema.py`'s `COLUMNS`, verbatim and in order, so
-/// `load_export.py` needs no aliases. The rest are this exporter's extras.
+/// The first 38 are the Phase C harness's `COLUMNS`, verbatim and in order, as its
+/// loader read them. The rest are this exporter's extras.
 pub const CSV_COLUMNS: &[&str] = &[
     "session_id", "group_key", "background", "phase", "t_s",
     "origin_l_x_mm", "origin_l_y_mm", "origin_l_z_mm",

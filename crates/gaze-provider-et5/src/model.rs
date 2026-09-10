@@ -29,8 +29,8 @@ pub const MODEL_FORMAT: u32 = 1;
 /// Conventional path of the fitted model.
 pub const DEFAULT_MODEL_PATH: &str = "config/model-et5.json";
 
-/// Every feature the exporter produces, in the column order `model/gaze_model/
-/// features.py` calls `FEATURE_COLS`. A fitted model names the subset it uses, so the
+/// Every feature the exporter produces, in the column order the Phase C harness's
+/// `features.py` called `FEATURE_COLS` (the harness is gone; the order stands). A fitted model names the subset it uses, so the
 /// runtime and the fit agree on columns by name rather than by position.
 pub const FEATURE_NAMES: [&str; FEATURE_COUNT] = [
     "origin_l_x_mm", "origin_l_y_mm", "origin_l_z_mm",

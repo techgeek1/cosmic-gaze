@@ -1290,7 +1290,11 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   accent, filling as the hold progresses, with the captions moved to the log
   (PLAN-UX.md U1). And the webcam provider went: `gaze-provider-webcam`, its sidecar
   socket, the `[camera]` block of the desk file and the `webcam` filter preset, none of
-  which had been run since the ET5 arrived.
+  which had been run since the ET5 arrived. `gaze-bench` and the Python model harness
+  went the same day (the Rust `fit` reproduces the harness's numbers; the bench's report
+  was Phase 0's). The trainer stays, to bootstrap the flywheel again if it is ever
+  needed, and the click collector stays with it: the trainer's presses reach the data
+  through the collector's socket.
 
 ## 11. Open questions
 

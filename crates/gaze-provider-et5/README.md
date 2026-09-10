@@ -253,7 +253,8 @@ enter at `1/(n+1)` over a two-click prior; established anchors move by a tenth. 
 persists to `config/offset-et5.json`, keyed to the blob like the model; `gaze-proto
 --freeze-offset` attributes and logs without moving it, and deleting the file starts
 cold. Leave-one-session-out on the click sessions puts the model alone at 1.44° and
-the model with a single bias at 1.20° (`model/loso_clicks.py`).
+the model with a single bias at 1.20° (the Python harness's `loso_clicks.py`, removed
+2026-09-10 once `fit` reproduced it).
 
 The 3° gate has a way to be wrong: a bias larger than it (glasses moved, a knocked
 mount, a posture the anchors have not seen) rejects every click and the filter can

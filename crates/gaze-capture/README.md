@@ -142,4 +142,4 @@ Files are written as `<connector>-<n>.png`, RGBA8. In loop mode each line also c
 cargo run -p gaze-capture --bin gaze-capture-cli -- --out screenshots/
 ```
 
-against a live COSMIC session, and is the input `gaze-detect` and `gaze-bench` consume.
+against a live COSMIC session, and is the input `gaze-detect` consumes.

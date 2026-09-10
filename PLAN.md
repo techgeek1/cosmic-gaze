@@ -151,11 +151,11 @@ for the whole run, so `gaze-proto` and `gaze-et5-cli` cannot run alongside it. I
 line's running median firmware offset is the daily drift number. See
 `crates/gaze-clicks/README.md`.
 
-### gaze-bench (after core, detect, snap)
-Offline Monte Carlo as described above. Inputs: a directory of `<output>-<n>.png` with
-sidecar JSON from `gaze-detect-cli`. Fixation landing model: uniform inside the box
-shrunk by 20% per side, then noise through `DesktopGeometry` with the desk sigma profile.
-Outputs a markdown report. Bin: `gaze-bench --shots screenshots/ --sigmas 0.5,0.7,1.0,1.5`.
+### gaze-bench (removed 2026-09-10)
+The Phase 0 offline Monte Carlo over screenshots and synthetic sigmas. Its report was
+never regenerated after the snap rules changed; the live numbers come from the click
+flywheel now. The reports it produced are in the history (`crates/gaze-bench/report*.md`
+before the removal).
 
 ### gaze-proto (DONE; `gaze-proto --click --show-truth`; Lenovo left = commit, right = exit, middle = redetect; ~0.45 core idle, ~8 cores while detecting)
 

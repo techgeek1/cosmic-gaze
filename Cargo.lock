@@ -1999,23 +1999,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gaze-bench"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "gaze-core",
- "gaze-detect",
- "gaze-snap",
- "image",
- "rand 0.9.5",
- "rand_distr",
- "rayon",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "gaze-capture"
 version = "0.1.0"
 dependencies = [
