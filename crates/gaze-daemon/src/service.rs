@@ -49,7 +49,7 @@ impl Service {
         self.live.set_paused(false);
     }
 
-    /// Forgets the day's offset: every anchor, back to the model alone.
+    /// Forgets the day's offset: every anchor, back to the calibration alone.
     fn reset_offset(&self) {
         info!("offset reset requested");
         self.live.request_reset_offset();
@@ -69,11 +69,6 @@ impl Service {
     #[zbus(property)]
     fn calibrated(&self) -> bool {
         self.live.status().calibrated
-    }
-
-    #[zbus(property)]
-    fn model(&self) -> bool {
-        self.live.status().model
     }
 
     #[zbus(property)]

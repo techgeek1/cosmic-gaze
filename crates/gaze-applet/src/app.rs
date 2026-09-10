@@ -129,7 +129,6 @@ impl App {
         let flags = [
             ("Tracker"    , status.tracker),
             ("Calibrated" , status.calibrated),
-            ("Model"      , status.model),
             ("Controller" , status.controller),
         ];
 

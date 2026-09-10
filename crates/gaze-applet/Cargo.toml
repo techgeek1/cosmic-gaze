@@ -19,7 +19,7 @@ tracing-subscriber = { workspace = true }
 zbus = { version = "5", default-features = false, features = ["async-io"] }
 
 # The same pin cosmic-term builds against on this machine, so the git checkout is
-# already local (and shared with `gaze-trainer` and `gaze-overlay`). `applet` brings
+# already local (and shared with `gaze-overlay`'s cosmic-config). `applet` brings
 # autosize, multi-window and cosmic-panel-config; `tokio` is iced's executor.
 [dependencies.libcosmic]
 git              = "https://github.com/pop-os/libcosmic.git"

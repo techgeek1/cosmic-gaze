@@ -422,6 +422,31 @@ pub enum CalibrationError {
     Format(u32),
 }
 
+// --- The declared plane ---
+
+/// The three declared corners of a display's posed surface. For a curved panel the
+/// corners are coplanar (the chord plane) while the centre bulges toward the user by
+/// the sagitta, which a three-corner declaration cannot express; the trained mapping
+/// absorbs the 2D consequences, and only the firmware's internal head-translation
+/// compensation sees the residual depth error.
+pub fn plane_corners(out: &OutputGeometry) -> DisplayArea {
+    DisplayArea {
+        tl_mm : out.uv_to_world(0.0, 0.0).to_array(),
+        tr_mm : out.uv_to_world(1.0, 0.0).to_array(),
+        bl_mm : out.uv_to_world(0.0, 1.0).to_array(),
+    }
+}
+
+/// Rotates a desk-frame point into the sensor frame: a rotation about +X by the
+/// mount pitch, so a point high in the desk frame drops in the sensor frame the
+/// way the measured eye origins do (true eye height ~200 mm reads as ~38 mm on
+/// this setup — a frame pitched up ~13 degrees).
+pub fn desk_to_sensor(p: [f64; 3], pitch_deg: f64) -> [f64; 3] {
+    let (sin, cos) = pitch_deg.to_radians().sin_cos();
+
+    [p[0], p[1] * cos - p[2] * sin, p[1] * sin + p[2] * cos]
+}
+
 // --- Tests ---
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
 //! Manual test CLI for the ET5 provider: stream inspection, display-area setup,
-//! calibration blob diagnostics and upload, the compound calibration sweep, and a
-//! live overlay view. Everything here needs the tracker on the bus in runtime mode;
-//! the sweep and the view additionally need a live compositor and a seated user.
+//! calibration blob diagnostics and upload, the retrain ceremony and its health
+//! check, and a live overlay view. Everything here needs the tracker on the bus in
+//! runtime mode; the ceremony and the view additionally need a live compositor and a
+//! seated user.
 //!
 //! `blob-info` and `blob-watch` are read-only and safe to run unattended.
 //! `blob-push` writes the device's eye model and must not be interrupted.
@@ -25,16 +26,11 @@ use gaze_provider_et5::calibration::{
     OutputPose, VIRTUAL_AREA,
 };
 use gaze_provider_et5::field::FieldMap;
-use gaze_provider_et5::flywheel::{self, ClickRecord, ClickVia, DEFAULT_FLYWHEEL_DIR, Verdict};
 use gaze_provider_et5::device::{ConnectOptions, Device};
-use gaze_provider_et5::dataset;
 use gaze_provider_et5::gaze::combined_ray;
-use gaze_provider_et5::model::DEFAULT_MODEL_PATH;
-use gaze_provider_et5::train::{self, FitParams};
 use gaze_provider_et5::provider::Et5Provider;
-use gaze_provider_et5::record::{self, RecordConfig};
-use gaze_provider_et5::retrain::{self, RetrainConfig};
-use gaze_provider_et5::sweep::{self, SweepConfig, SweepError, SweepKey, desk_to_sensor, plane_corners};
+use gaze_provider_et5::retrain::{self, RetrainConfig, RetrainError, RetrainKey};
+use gaze_provider_et5::calibration::{desk_to_sensor, plane_corners};
 use gaze_daydream::{Button, Buttons, Controller};
 use crossbeam_channel::{Receiver, Sender};
 use gaze_provider_et5::ttp::{DisplayArea, DisplayRect};
@@ -57,13 +53,6 @@ const GAUGE_SPAN_DEG: f64 = 20.0;
 
 /// Cells on either side of the gauge's centre.
 const GAUGE_HALF_CELLS: i64 = 8;
-
-/// Directory archived passes accumulate in for pooled head-gain fits. Under
-/// `config/calibration*` so the standard gitignore covers it.
-const DEFAULT_HISTORY_DIR: &str = "config/calibration-et5-history";
-
-/// Directory recording sessions are written to and read back from.
-const DEFAULT_SESSIONS_DIR: &str = "config/sessions";
 
 /// Conventional client-side calibration, whose trained plane a session runs under.
 const DEFAULT_CALIBRATION_PATH: &str = "config/calibration-et5.toml";
@@ -311,164 +300,6 @@ enum Command {
         dry_run : bool,
     },
 
-    /// DEPRECATED (removed in Phase D): re-fit the old correction field and head
-    /// gain from saved sweep readings. Superseded by `record` plus the Phase C/D
-    /// model; nothing in the new calibration flow produces or consumes these fits.
-    Refit {
-        /// Raw readings from a previous `calibrate` run.
-        #[arg(long, default_value = "config/calibration-et5.readings.jsonl")]
-        readings : PathBuf,
-
-        /// Where the re-fitted calibration is written.
-        #[arg(long, default_value = "config/calibration-et5.toml")]
-        out : PathBuf,
-    },
-
-    /// DEPRECATED (removed in Phase D): bank head-gain training data as a wandering
-    /// dot with posture prompts. Use `record` instead — it writes a session file the
-    /// model actually trains from, with the blob hash and the backgrounds attached.
-    Collect {
-        /// How long to run.
-        #[arg(long, default_value_t = 3.0)]
-        minutes : f64,
-
-        /// Calibration whose trained plane the session runs under.
-        #[arg(long, default_value = "config/calibration-et5.toml")]
-        calibration : PathBuf,
-
-        /// On-device blob backup identifying the model the data belongs to.
-        #[arg(long, default_value = DEFAULT_BLOB_PATH)]
-        blob : PathBuf,
-
-        /// Directory the pass is archived into.
-        #[arg(long, default_value = DEFAULT_HISTORY_DIR)]
-        history : PathBuf,
-    },
-
-    /// Record one training session: a stop grid on black, a prompted wander on white,
-    /// then the same grid on white. Nothing is fitted and nothing is uploaded; the
-    /// session file is what a model is trained from later. Keys during the session:
-    /// Enter advances, `s` skips a stop, `q` ends the current phase early.
-    Record {
-        /// Total session length, minutes. The grids take what they take; the wander
-        /// gets the rest.
-        #[arg(long, default_value_t = 5.0)]
-        minutes : f64,
-
-        /// Calibration whose trained plane the session runs under.
-        #[arg(long, default_value = DEFAULT_CALIBRATION_PATH)]
-        calibration : PathBuf,
-
-        /// Connector to record on; defaults to the calibration's trained display.
-        #[arg(long)]
-        display : Option<String>,
-
-        /// Directory the session file is written into.
-        #[arg(long, default_value = DEFAULT_SESSIONS_DIR)]
-        out : PathBuf,
-
-        /// Free-text note stored in the session: lighting, time of day, anything odd.
-        #[arg(long, default_value = "")]
-        note : String,
-
-        /// Advance and skip from the Daydream controller as well: pad click advances,
-        /// App skips, Home ends the phase.
-        #[arg(long)]
-        daydream : bool,
-
-        /// The controller's Bluetooth address, when more than one is paired.
-        #[arg(long, requires = "daydream")]
-        daydream_address : Option<String>,
-
-        /// Half-angle of the gaze cone the stop grid is laid inside, degrees.
-        #[arg(long, default_value_t = record::CONE_MAX_DEG)]
-        cone_deg : f64,
-
-        /// Stop grid, columns x rows.
-        #[arg(long, default_value = "4x3")]
-        grid : String,
-
-        /// Record `glasses = true` without asking on the terminal.
-        #[arg(long)]
-        glasses : bool,
-
-        /// Record `glasses = false` without asking on the terminal.
-        #[arg(long, conflicts_with = "glasses")]
-        no_glasses : bool,
-
-        /// Print the schedule and exit. Needs neither the device nor a compositor.
-        #[arg(long)]
-        dry_run : bool,
-    },
-
-    /// Fit the residual model (PLAN-ET5 D2) from session files: leave-one-session-out
-    /// evaluation first, then a fit on everything, written as JSON for the provider.
-    /// Only sessions recorded under the calibration's device blob are used; the
-    /// firmware residual is that model's, and another blob's rows describe a
-    /// different device. Needs neither the device nor a compositor.
-    Fit {
-        /// Session files, or directories of them.
-        #[arg(long, num_args = 1.., default_value = DEFAULT_SESSIONS_DIR)]
-        sessions : Vec<PathBuf>,
-
-        /// Where the model goes.
-        #[arg(long, default_value = DEFAULT_MODEL_PATH)]
-        out : PathBuf,
-
-        /// Calibration whose device blob the sessions have to match.
-        #[arg(long, default_value = DEFAULT_CALIBRATION_PATH)]
-        calibration : PathBuf,
-
-        /// ARD length scale in standardised units.
-        #[arg(long, default_value_t = 2.0)]
-        length_scale : f64,
-
-        /// Ridge on the kernel weights.
-        #[arg(long, default_value_t = 3.0)]
-        ridge : f64,
-
-        /// Inducing points.
-        #[arg(long, default_value_t = 200)]
-        centers : usize,
-
-        /// Clicks with a firmware residual at or past this many degrees are not
-        /// trained on: those are look-away clicks, not calibration error.
-        #[arg(long, default_value_t = 8.0)]
-        cap_deg : f64,
-
-        /// Use every exported feature (head position, interocular vector, lagged
-        /// head) instead of the per-eye direction field. Worse held out on the
-        /// 2026-09-04 data; kept for the comparison.
-        #[arg(long)]
-        all_features : bool,
-
-        /// Evaluate and report without writing the model.
-        #[arg(long)]
-        dry_run : bool,
-    },
-
-    /// Summarise the flywheel: the clicks the running sessions wrote down
-    /// (`gaze-proto --provider et5`, see `flywheel.rs`), per day and verdict, with the
-    /// median leftover after model and offset and the median firmware residual the
-    /// next fit would see.
-    Flywheel {
-        /// The flywheel directory.
-        #[arg(long, default_value = DEFAULT_FLYWHEEL_DIR)]
-        dir : PathBuf,
-    },
-
-    /// Session-file utilities.
-    Sessions {
-        #[command(subcommand)]
-        command : SessionsCommand,
-    },
-
-    /// Training-row utilities.
-    Dataset {
-        #[command(subcommand)]
-        command : DatasetCommand,
-    },
-
     /// Run the health check alone against the committed model: upload the blob,
     /// declare the trained plane, dwell on an n by n grid of stops, replace the
     /// calibration's health table with the result and refit the correction field
@@ -511,7 +342,7 @@ enum Command {
 
     /// Draw the live gaze point on every display until interrupted.
     ///
-    /// Three mappings: `--calibration` applies a sweep's client-side fits; `--direct`
+    /// Three mappings: `--calibration` applies a calibration's client-side fits; `--direct`
     /// declares one display's configured plane to the firmware and draws its own 2D
     /// output on that display, no client fit at all (the range check after a remount:
     /// where the eyes can and cannot be followed, whatever the bias); neither is the
@@ -524,48 +355,6 @@ enum Command {
         /// Connector to declare and draw on directly, from the desk config's pose.
         #[arg(long)]
         direct      : Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum SessionsCommand {
-    /// Convert a pre-`record` readings file into a session file, so the data banked
-    /// before sessions existed can serve as session zero. The plane and the blob hash
-    /// the readings were taken under have to be supplied: the readings format does not
-    /// carry them.
-    Import {
-        /// The readings file to convert.
-        readings : PathBuf,
-
-        /// Directory the session file is written into.
-        #[arg(long, default_value = DEFAULT_SESSIONS_DIR)]
-        out : PathBuf,
-
-        /// Blob backup of the on-device model the readings were taken under.
-        #[arg(long, default_value = DEFAULT_BLOB_PATH)]
-        blob : PathBuf,
-
-        /// Calibration supplying the plane the readings were taken under.
-        #[arg(long, default_value = DEFAULT_CALIBRATION_PATH)]
-        calibration : PathBuf,
-
-        /// Free-text note stored in the synthesised meta line.
-        #[arg(long, default_value = "imported from the pre-record readings archive")]
-        note : String,
-    },
-}
-
-#[derive(Subcommand)]
-enum DatasetCommand {
-    /// Turn session files into model rows and write them as CSV.
-    Export {
-        /// Session files, or directories of them.
-        #[arg(long, num_args = 1.., default_value = DEFAULT_SESSIONS_DIR)]
-        sessions : Vec<PathBuf>,
-
-        /// Where the CSV goes.
-        #[arg(long)]
-        csv : PathBuf,
     },
 }
 
@@ -635,43 +424,6 @@ fn main() -> Result<()> {
             health_grid      : health_grid,
             dry_run          : dry_run,
         }),
-        Command::Refit { readings, out }    => refit_cmd(&cli.config, &readings, &out),
-        Command::Collect { minutes, calibration, blob, history } => {
-            collect_cmd(&cli.config, minutes, &calibration, &blob, &history)
-        }
-        Command::Record {
-            minutes,
-            calibration,
-            display,
-            out,
-            note,
-            daydream,
-            daydream_address,
-            cone_deg,
-            grid,
-            glasses,
-            no_glasses,
-            dry_run,
-        } => record_cmd(&cli.config, minutes, &calibration, display, &out, note,
-                        daydream, daydream_address.as_deref(), cone_deg, &grid, glasses,
-                        no_glasses, dry_run),
-        Command::Fit {
-            sessions, out, calibration, length_scale, ridge, centers, cap_deg,
-            all_features, dry_run,
-        } => {
-            let params = FitParams {
-                length_scale : length_scale,
-                ridge        : ridge,
-                centers      : centers,
-                cap_deg      : cap_deg,
-                ..if all_features { FitParams::all_features() } else { FitParams::position_field() }
-            };
-
-            fit_cmd(&cli.config, &sessions, &out, &calibration, &params, dry_run)
-        }
-        Command::Flywheel { dir }           => flywheel_cmd(&dir),
-        Command::Sessions { command }       => sessions_cmd(&cli.config, command),
-        Command::Dataset { command }        => dataset_cmd(&cli.config, command),
         Command::Health { calibration, blob, grid, daydream, daydream_address } => {
             health_cmd(&cli.config, &calibration, &blob, grid, daydream, daydream_address.as_deref())
         }
@@ -1454,10 +1206,10 @@ struct CalibrateArgs {
 /// asked, both into one channel. On the controller the pad click commits, App skips
 /// and Home quits; there is no Advance, since Enter is the operator's override and a
 /// thumb should not have it.
-fn key_sources(daydream: bool, address: Option<&str>) -> Result<Receiver<SweepKey>> {
+fn key_sources(daydream: bool, address: Option<&str>) -> Result<Receiver<RetrainKey>> {
     let (tx, rx) = crossbeam_channel::unbounded();
 
-    sweep::terminal_keys_into(tx.clone());
+    retrain::terminal_keys_into(tx.clone());
 
     if daydream {
         let controller = Controller::open(address).context("opening the Daydream controller")?;
@@ -1474,18 +1226,18 @@ fn key_sources(daydream: bool, address: Option<&str>) -> Result<Receiver<SweepKe
     Ok(rx)
 }
 
-/// Turns the controller's button press edges into sweep keys until the channel
+/// Turns the controller's button press edges into ceremony keys until the channel
 /// closes. Holds the controller for as long as it runs, so the link stays up.
-fn controller_keys(controller: Controller, tx: Sender<SweepKey>) {
+fn controller_keys(controller: Controller, tx: Sender<RetrainKey>) {
     let mut buttons = Buttons::default();
 
     loop {
         for report in controller.reports() {
             for button in report.packet.buttons.pressed_since(buttons) {
                 let key = match button {
-                    Button::Click => Some(SweepKey::Commit),
-                    Button::App   => Some(SweepKey::Skip),
-                    Button::Home  => Some(SweepKey::Quit),
+                    Button::Click => Some(RetrainKey::Commit),
+                    Button::App   => Some(RetrainKey::Skip),
+                    Button::Home  => Some(RetrainKey::Quit),
                     _             => None,
                 };
 
@@ -1730,7 +1482,7 @@ fn calibrate(args: CalibrateArgs) -> Result<()> {
                 // The refusal and the reboot are the design working, not a crash: say
                 // what is still on disk, because "nothing was written" is the point.
                 match e {
-                    SweepError::TooFewPoints { .. } => {
+                    RetrainError::TooFewPoints { .. } => {
                         eprintln!("{e}. {} and {} are untouched; the device holds \
                                    whatever the applied rounds taught it, so re-run \
                                    the ceremony (or push the old blob back with \
@@ -1738,7 +1490,7 @@ fn calibrate(args: CalibrateArgs) -> Result<()> {
                                   blob_path.display(), out.display(),
                                   blob_path.display());
                     }
-                    SweepError::TrackerLost(_)      => {
+                    RetrainError::TrackerLost(_)      => {
                         eprintln!("{e}. The model this ceremony was building is lost \
                                    and the device is back on its factory blob; run \
                                    the ceremony again. Nothing was written, so {} is \
@@ -1920,8 +1672,7 @@ fn calibrate(args: CalibrateArgs) -> Result<()> {
     calibration.save(out)
         .with_context(|| format!("writing {}", out.display()))?;
     println!("calibration written to {}", out.display());
-    println!("client data is keyed to blob {}: record fresh sessions before training \
-              anything on it", report.short());
+    println!("the online offset is keyed to blob {} and starts over under it", report.short());
 
     Ok(())
 }
@@ -2011,426 +1762,6 @@ fn print_plan(
     }
 }
 
-/// Names the on-device model: the first 16 hex characters of the SHA-256 of its
-/// blob's *body*, so the history key and the calibration file's
-/// `device_blob_sha256` are the same identity. The body rather than the whole blob
-/// because the result trailer is re-normalised on every retrieve. (Passes archived
-/// before 2026-08-28 were keyed by `DefaultHasher`, and those from 2026-08-28 by the
-/// whole-blob hash; neither matches. That directory is orphaned either way.)
-fn blob_key(path: &std::path::Path) -> Result<String> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-
-    Ok(body_sha256_hex(&bytes)[..16].to_string())
-}
-
-/// Runs the collect session and archives its pass under the committed model's key.
-fn collect_cmd(
-    config      : &std::path::Path,
-    minutes     : f64,
-    calibration : &std::path::Path,
-    blob        : &std::path::Path,
-    history     : &std::path::Path,
-)
-    -> Result<()>
-{
-    let geometry = load_geometry(config)?;
-
-    let cal = Et5Calibration::load(calibration)
-        .with_context(|| format!("loading {}", calibration.display()))?;
-    let area = cal.device_area
-        .context("the calibration has no trained plane; run `calibrate` first")?;
-    let out_name = cal.device_output.clone()
-        .context("the calibration has no device output; run `calibrate` first")?;
-
-    let key = blob_key(blob)
-        .context("hashing the blob backup (run `calibrate` to create it)")?;
-
-    std::fs::create_dir_all(history)
-        .with_context(|| format!("creating {}", history.display()))?;
-
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let path  = history.join(format!("{key}-{stamp}.jsonl"));
-
-    let mut device = Device::connect().context("connecting to the ET5")?;
-
-    // The trained mapping only applies under the exact plane it was trained on.
-    device.set_display_area_corners(area).context("declaring the trained plane")?;
-
-    let (overlay, join) = Overlay::spawn().context("spawning the overlay")?;
-    let keys = sweep::terminal_keys();
-
-    println!("collect: eyes on the dot, do what the caption says. Enter advances, \
-              s skips a hold, q ends early (data collected so far is kept)");
-
-    let holds = sweep::run_collect(&mut device, &geometry, &out_name, &overlay,
-                                   Some(&keys), minutes, &path);
-
-    overlay.stop();
-    let _ = join.join();
-
-    let holds = holds?;
-
-    println!("{holds} holds archived to {}", path.display());
-    println!("they pool into the next `calibrate` (or `refit`) automatically");
-
-    Ok(())
-}
-
-/// Runs one recording session, or prints its schedule under `--dry-run`.
-#[allow(clippy::too_many_arguments)]
-fn record_cmd(
-    config      : &std::path::Path,
-    minutes     : f64,
-    calibration : &std::path::Path,
-    display     : Option<String>,
-    out         : &std::path::Path,
-    note        : String,
-    daydream    : bool,
-    address     : Option<&str>,
-    cone_deg    : f64,
-    grid        : &str,
-    glasses     : bool,
-    no_glasses  : bool,
-    dry_run     : bool,
-)
-    -> Result<()>
-{
-    let desk     = std::fs::read_to_string(config)
-        .with_context(|| format!("reading {}", config.display()))?;
-    let geometry = DesktopGeometry::from_toml(&desk).context("parsing desk geometry")?;
-
-    let cal = Et5Calibration::load(calibration)
-        .with_context(|| format!("loading {}", calibration.display()))?;
-    let area = cal.device_area
-        .context("the calibration has no trained plane; run `calibrate` first")?;
-
-    let name = display
-        .or_else(|| cal.device_output.clone())
-        .context("no display given and the calibration names none")?;
-
-    let (cols, rows) = parse_grid(grid)?;
-
-    // Ask before the key reader takes stdin: both cannot read it at once.
-    let glasses = {
-        if glasses || no_glasses {
-            glasses
-        }
-        else {
-            prompt_yes_no("were you wearing glasses for this session?")?
-        }
-    };
-
-    let record_config = RecordConfig {
-        display           : name,
-        minutes           : minutes,
-        cone_max_deg      : cone_deg,
-        grid_cols         : cols,
-        grid_rows         : rows,
-        tracker_pitch_deg : load_tracker_pitch(config),
-        glasses           : glasses,
-        note              : note,
-        out_dir           : out.to_path_buf(),
-        ..RecordConfig::default()
-    };
-
-    let plan = record::plan(&geometry, &record_config)?;
-
-    println!("{} stops in a {:.1} deg cone (u {:.2}..{:.2}, v {:.2}..{:.2}), \
-              {:.0}s per grid, {:.0}s of wander, {:.1} min total",
-             plan.stops.len(), plan.cone_max_deg, plan.cone_uv.0, plan.cone_uv.1,
-             plan.cone_uv.2, plan.cone_uv.3, plan.grid_s, plan.wander_s,
-             (2.0 * plan.grid_s + plan.wander_s) / 60.0);
-
-    if dry_run {
-        println!("dry run: no device touched, nothing written");
-
-        for (i, (u, v, px)) in plan.stops.iter().enumerate() {
-            println!("  stop {:>2}: uv ({u:.3}, {v:.3}) px ({:.0}, {:.0})",
-                     i + 1, px.x, px.y);
-        }
-
-        return Ok(());
-    }
-
-    let mut device = Device::connect().context("connecting to the ET5")?;
-
-    let (overlay, join) = Overlay::spawn().context("spawning the overlay")?;
-    let keys = key_sources(daydream, address)?;
-
-    println!("record: eyes on the dot throughout. The screen goes black, then white; \
-              do what the caption says during the wander. Enter (or the pad) advances, \
-              s (or App) skips a stop, q (or Home) ends the current phase early.");
-
-    let outcome = record::run_record(&mut device, &geometry, area, &overlay, Some(&keys),
-                                     &record_config, &desk);
-
-    overlay.stop();
-    let _ = join.join();
-
-    let outcome = outcome?;
-
-    println!("session {} written to {}", outcome.session_id, outcome.path.display());
-    println!("{} frames ({} valid), {} stops", outcome.frames, outcome.valid_frames,
-             outcome.stops);
-
-    if outcome.blob_start.sha256 == outcome.blob_end.sha256 {
-        println!("blob {} unchanged over the session", outcome.blob_start);
-    }
-    else {
-        println!("WARNING: the blob changed mid-session ({} -> {}); these rows describe \
-                  two different firmware models and should not be trained on",
-                 outcome.blob_start.short(), outcome.blob_end.short());
-    }
-
-    Ok(())
-}
-
-/// `fit`: rows from the sessions under the calibration's blob, a leave-one-session-out
-/// report, then the model fitted on all of them.
-fn fit_cmd(
-    config      : &std::path::Path,
-    sessions    : &[PathBuf],
-    out         : &std::path::Path,
-    calibration : &std::path::Path,
-    params      : &FitParams,
-    dry_run     : bool,
-)
-    -> Result<()>
-{
-    let geometry = load_geometry(config)?;
-
-    let wanted = Et5Calibration::load(calibration)
-        .with_context(|| format!("loading {}", calibration.display()))?
-        .device_blob_sha256
-        .context("the calibration names no device blob; retrain first")?;
-
-    // Keep the sessions under the calibration's blob and remember the pitch they
-    // were recorded under, which the provider needs to place the corrected ray.
-    let mut files = Vec::new();
-    let mut pitch = None;
-
-    for path in dataset::expand(sessions)? {
-        let session = dataset::Session::load(&path)?;
-
-        if session.meta.blob_sha256 != wanted {
-            println!("skipping {}: blob {} is not the calibration's {}",
-                     path.display(), &session.meta.blob_sha256[..8], &wanted[..8]);
-
-            continue;
-        }
-
-        match pitch {
-            None                             => pitch = Some(session.meta.tracker_pitch_deg),
-            Some(p) if p == session.meta.tracker_pitch_deg => {}
-            Some(p)                          => bail!(
-                "{} was recorded at {} degrees of tracker pitch, others at {p}",
-                path.display(), session.meta.tracker_pitch_deg,
-            ),
-        }
-
-        files.push(path);
-    }
-
-    let pitch = pitch.context("no session matches the calibration's blob")?;
-    let rows  = dataset::load_rows(&files, &geometry)?;
-    let sel   = train::select(&rows);
-
-    println!("{} session file(s), {} rows, {} training clicks (one row each, carets \
-              refused, cap {} deg at fit time)",
-             files.len(), rows.len(), sel.len(), params.cap_deg);
-    println!("features {:?}, explicit {:?}, length scale {}, ridge {}, centres {}",
-             params.features, params.explicit, params.length_scale, params.ridge,
-             params.centers);
-
-    let report = train::evaluate(&sel, params)?;
-
-    println!("leave-one-session-out, per-click residual (deg):");
-    println!("  firmware  p50 {:.2}  p90 {:.2}", report.firmware_p50_deg, report.firmware_p90_deg);
-    println!("  model     p50 {:.2}  p90 {:.2}", report.model_p50_deg   , report.model_p90_deg);
-
-    for (session, p50) in report.sessions.iter().zip(&report.per_session_p50) {
-        println!("  {session}: firmware {:.2} -> model {:.2}", p50[0], p50[1]);
-    }
-
-    if dry_run {
-        return Ok(());
-    }
-
-    let mut model = train::fit(&sel, params, Some(wanted), pitch)?;
-    model.report = Some(report);
-    model.save(out)?;
-
-    println!("model written to {} ({} centres, fade {:.3}..{:.3} deg^2)",
-             out.display(), model.centers(), model.var_fade_lo, model.var_fade_hi);
-
-    Ok(())
-}
-
-fn flywheel_cmd(dir: &std::path::Path) -> Result<()> {
-    let files = flywheel::day_files(dir)
-        .with_context(|| format!("listing {}", dir.display()))?;
-
-    if files.is_empty() {
-        println!("no flywheel days under {}", dir.display());
-
-        return Ok(());
-    }
-
-    let magnitude = |v: [f64; 2]| v[0].hypot(v[1]);
-
-    let mut all: Vec<ClickRecord> = Vec::new();
-
-    for file in &files {
-        let records = flywheel::load(file)
-            .with_context(|| format!("reading {}", file.display()))?;
-
-        let name = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-
-        let count = |v: Verdict| records.iter().filter(|r| r.verdict == v).count();
-        let mut leftover: Vec<f64> = records.iter().map(|r| magnitude(r.leftover_deg)).collect();
-        let mut residual: Vec<f64> = records.iter().map(|r| magnitude(r.residual_deg)).collect();
-
-        println!(
-            "{name}: {} clicks (mouse {}, pad {}); accepted {}, rejected {}, adopted {}; \
-             median leftover {:.2} deg, median firmware residual {:.2} deg",
-            records.len(),
-            records.iter().filter(|r| r.via == ClickVia::Mouse).count(),
-            records.iter().filter(|r| r.via == ClickVia::Pad).count(),
-            count(Verdict::Accepted), count(Verdict::Rejected), count(Verdict::Adopted),
-            median_or_nan(&mut leftover), median_or_nan(&mut residual),
-        );
-
-        all.extend(records);
-    }
-
-    let mut blobs: Vec<String> = all.iter()
-        .filter_map(|r| r.device_blob_sha256.clone())
-        .collect();
-    blobs.sort();
-    blobs.dedup();
-
-    let mut leftover: Vec<f64> = all.iter().map(|r| magnitude(r.leftover_deg)).collect();
-    let mut residual: Vec<f64> = all.iter().map(|r| magnitude(r.residual_deg)).collect();
-
-    println!(
-        "total: {} clicks over {} days under {} device blob(s); median leftover {:.2} deg, \
-         median firmware residual {:.2} deg",
-        all.len(), files.len(), blobs.len(),
-        median_or_nan(&mut leftover), median_or_nan(&mut residual),
-    );
-
-    for blob in blobs {
-        println!("  blob {}: {} clicks", &blob[..blob.len().min(12)],
-                 all.iter().filter(|r| r.device_blob_sha256.as_deref() == Some(&blob)).count());
-    }
-
-    Ok(())
-}
-
-/// Median of the finite values, NaN when there are none.
-fn median_or_nan(values: &mut Vec<f64>) -> f64 {
-    values.retain(|v| v.is_finite());
-
-    if values.is_empty() {
-        return f64::NAN;
-    }
-
-    values.sort_by(f64::total_cmp);
-
-    let n = values.len();
-
-    if n % 2 == 1 { values[n / 2] } else { 0.5 * (values[n / 2 - 1] + values[n / 2]) }
-}
-
-fn sessions_cmd(config: &std::path::Path, command: SessionsCommand) -> Result<()> {
-    match command {
-        SessionsCommand::Import { readings, out, blob, calibration, note } => {
-            let desk = std::fs::read_to_string(config)
-                .with_context(|| format!("reading {}", config.display()))?;
-
-            let cal = Et5Calibration::load(&calibration)
-                .with_context(|| format!("loading {}", calibration.display()))?;
-            let area = cal.device_area.context(
-                "the calibration has no trained plane, so the readings cannot be \
-                 placed in tracker space")?;
-
-            let bytes = std::fs::read(&blob)
-                .with_context(|| format!("reading {}", blob.display()))?;
-
-            let (path, records) = record::import_readings(
-                &readings, &out, &bytes, area, &desk, load_tracker_pitch(config), &note,
-            )?;
-
-            println!("{records} records imported to {}", path.display());
-            println!("blob {}", BlobReport::of(&bytes));
-
-            Ok(())
-        }
-    }
-}
-
-fn dataset_cmd(config: &std::path::Path, command: DatasetCommand) -> Result<()> {
-    match command {
-        DatasetCommand::Export { sessions, csv } => {
-            let geometry = load_geometry(config)?;
-            let rows     = dataset::load_rows(&sessions, &geometry)?;
-
-            dataset::write_csv(&rows, &csv)?;
-
-            println!("{} rows written to {}", rows.len(), csv.display());
-            report_rows(&rows);
-
-            Ok(())
-        }
-    }
-}
-
-/// Prints what a set of exported rows contains and how far the firmware alone misses.
-/// This is the Phase C baseline: any model has to beat it on held-out sessions.
-fn report_rows(rows: &[dataset::Row]) {
-    let mut sessions: Vec<&str> = rows.iter().map(|r| r.session_id.as_str()).collect();
-    sessions.sort_unstable();
-    sessions.dedup();
-
-    println!("{} session(s), {} stop frames, {} hold frames, {} means, {} glide rows",
-             sessions.len(),
-             rows.iter().filter(|r| r.phase == "stop" && !r.is_mean).count(),
-             rows.iter().filter(|r| r.phase == "hold" && !r.is_mean).count(),
-             rows.iter().filter(|r| r.is_mean).count(),
-             rows.iter().filter(|r| r.phase == "glide").count());
-
-    let summarise = |label: &str, selected: Vec<&dataset::Row>| {
-        let mut errors: Vec<f64> = selected.iter()
-            .map(|r| r.residual_deg())
-            .filter(|d| d.is_finite())
-            .collect();
-
-        if errors.is_empty() {
-            return;
-        }
-
-        let rms = (errors.iter().map(|d| d * d).sum::<f64>() / errors.len() as f64).sqrt();
-
-        errors.sort_by(f64::total_cmp);
-
-        let at = |q: f64| errors[((errors.len() - 1) as f64 * q) as usize];
-
-        println!("  {label:<12} n {:>6}  rms {:.2} deg  p50 {:.2}  p90 {:.2}",
-                 errors.len(), rms, at(0.5), at(0.9));
-    };
-
-    println!("firmware-only residual (in sample, no split):");
-    summarise("all"        , rows.iter().collect());
-    summarise("stops"      , rows.iter().filter(|r| r.phase == "stop" && !r.is_mean).collect());
-    summarise("holds"      , rows.iter().filter(|r| r.phase == "hold" && !r.is_mean).collect());
-    summarise("means"      , rows.iter().filter(|r| r.is_mean).collect());
-    summarise("glides"     , rows.iter().filter(|r| r.phase == "glide").collect());
-}
-
 /// Asks a yes/no question on the terminal. Anything but `y` is no.
 fn prompt_yes_no(question: &str) -> Result<bool> {
     print!("{question} [y/N] ");
@@ -2440,46 +1771,6 @@ fn prompt_yes_no(question: &str) -> Result<bool> {
     std::io::stdin().read_line(&mut line).context("reading the answer")?;
 
     Ok(line.trim().eq_ignore_ascii_case("y"))
-}
-
-fn refit_cmd(config: &std::path::Path, readings: &std::path::Path, out: &std::path::Path)
-    -> Result<()>
-{
-    let geometry = load_geometry(config)?;
-
-    // Refitting cannot know which plane the readings were collected under; assume
-    // the ray path (virtual plane) unless told otherwise. Direct-mode readings
-    // should be refitted with the same trained plane the file already records.
-    let previous = Et5Calibration::load(out).ok();
-    let refit_config = SweepConfig {
-        direct      : previous.as_ref().is_some_and(|p| p.device_area.is_some()),
-        history_dir : Some(PathBuf::from(DEFAULT_HISTORY_DIR)),
-        history_key : blob_key(std::path::Path::new(DEFAULT_BLOB_PATH)).ok(),
-        ..SweepConfig::default()
-    };
-
-    let mut outcome = sweep::refit(&geometry, readings, &refit_config)?;
-
-    if let Some(previous) = previous {
-        outcome.calibration.device_output      = previous.device_output;
-        outcome.calibration.device_area        = previous.device_area;
-        outcome.calibration.device_blob_sha256 = previous.device_blob_sha256;
-    }
-
-    for s in &outcome.summaries {
-        println!(
-            "{:>10}: {} targets, pose rms {:.2} deg (moved {:.0} mm), lag {:.0} ms, \
-             {} glide rows ({} saccade frames cut), field cv {:.4}",
-            s.name, s.targets, s.pose_rms_deg, s.pose_shift_mm, s.lag_s * 1000.0,
-            s.glide_rows, s.saccade_frames, s.field_rms_norm,
-        );
-    }
-
-    outcome.calibration.save(out)
-        .with_context(|| format!("writing {}", out.display()))?;
-    println!("re-fitted calibration written to {}", out.display());
-
-    Ok(())
 }
 
 fn view(config: &std::path::Path, calibration: Option<&std::path::Path>, direct: Option<&str>)
@@ -2623,18 +1914,3 @@ fn parse_area(area: &str) -> Result<(f64, f64)> {
     Ok((w_mm, h_mm))
 }
 
-/// Parses a `COLSxROWS` grid spec.
-fn parse_grid(grid: &str) -> Result<(usize, usize)> {
-    let Some((c, r)) = grid.split_once('x') else {
-        bail!("grid must look like 4x3, got {grid}");
-    };
-
-    let cols: usize = c.parse().context("grid columns")?;
-    let rows: usize = r.parse().context("grid rows")?;
-
-    if cols < 2 || rows < 2 {
-        bail!("grid needs at least 2x2 stops");
-    }
-
-    Ok((cols, rows))
-}

@@ -8,17 +8,11 @@ __pycache__/
 /sidecar/.venv/
 /sidecar/debug/
 /sidecar/tests/data/
-# Personal: desk-specific calibration and raw gaze readings (regenerate with gaze-webcam-cli calibrate).
+# Personal: desk-specific calibration and its blob (regenerate with gaze-et5-cli calibrate).
 /config/calibration*.toml
 /config/calibration*.jsonl
 /config/calibration*
-# Recording sessions: personal gaze data, keyed to one device blob.
-/config/sessions/
-# The fitted residual model: personal, keyed to one device blob (gaze-et5-cli fit).
-/config/model*.json
-# The online offset: the day's bias, learnt from real clicks (gaze-proto).
+# The online offset: the day's bias, learnt from real clicks.
 /config/offset*.json
 # Local experiments and captures; not part of the tree.
 /scratchpad/
-# The flywheel: every attributed click, one JSONL file per day.
-/config/flywheel/

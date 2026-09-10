@@ -129,5 +129,5 @@ gaze-a11y-cli chain 4919,698       # that node and every ancestor, role and exte
 gaze-a11y-cli follow --seconds 30  # the node under the pointer whenever it moves
 ```
 
-`follow` is the one to run beside `gaze-clicks-cli probe`: put the pointer on a card, an
+`follow` is the one to run while checking an application: put the pointer on a card, an
 input, an avatar, and read what the tree calls it and how long it took.

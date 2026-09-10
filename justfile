@@ -2,7 +2,7 @@
 # under ~/.local/bin and the applet's desktop entry where the panel looks for applets;
 # `just uninstall` removes them. The daemon is started and stopped from the applet, not
 # with the session. `just install-desk` copies the desk's files (desk.toml, the ET5
-# calibration and its device blob, the residual model, the ONNX models) from the
+# calibration and its device blob, the ONNX models) from the
 # checkout to the XDG locations the installed gazed reads; without it, run
 # `gazed --home .` from the checkout instead.
 
@@ -26,7 +26,6 @@ install-desk:
     install -Dm0644 config/desk.toml            {{xdg_conf}}/desk.toml
     install -Dm0644 config/calibration-et5.toml {{xdg_conf}}/calibration-et5.toml
     install -Dm0644 config/calibration-et5.bin  {{xdg_conf}}/calibration-et5.bin
-    install -Dm0644 config/model-et5.json       {{xdg_conf}}/model-et5.json
     install -Dm0644 -t {{xdg_data}} models/*.onnx
 
 uninstall:

@@ -93,14 +93,9 @@ fn configure(options: &Options) -> Result<SessionConfig> {
 
     // Optional files are used when present and loud when absent, as the prototype was.
     let calibration = paths.calibration();
-    let model       = paths.model();
 
     if !calibration.exists() {
         error!(path = %calibration.display(), "no calibration: gaze-et5-cli calibrate fits one");
-    }
-
-    if !model.exists() {
-        warn!(path = %model.display(), "no residual model: gaze-et5-cli fit fits one");
     }
 
     Ok(SessionConfig {
@@ -108,10 +103,8 @@ fn configure(options: &Options) -> Result<SessionConfig> {
         models_dir : paths.models_dir.clone(),
         source     : SourceSpec::Et5 {
             calibration : calibration.exists().then_some(calibration),
-            model       : model.exists().then_some(model),
             device_blob : paths.device_blob(),
             offset      : Some(paths.offset()),
-            flywheel    : Some(paths.flywheel()),
         },
         buttons    : None,
         grab       : false,

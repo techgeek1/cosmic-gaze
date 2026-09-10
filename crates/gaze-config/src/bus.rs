@@ -46,8 +46,6 @@ pub struct Status {
     pub tracker          : bool,
     /// A calibration file was loaded.
     pub calibrated       : bool,
-    /// A residual model is running, and with it the online offset.
-    pub model            : bool,
     /// The Daydream controller is connected.
     pub controller       : bool,
     /// Paused from the applet.
@@ -76,7 +74,7 @@ pub trait Gaze {
     /// Undoes `Pause`.
     fn resume(&self) -> zbus::Result<()>;
 
-    /// Forgets the day's offset: every anchor, back to the model alone.
+    /// Forgets the day's offset: every anchor, back to the calibration alone.
     fn reset_offset(&self) -> zbus::Result<()>;
 
     /// Ends the session and exits the daemon, as SIGTERM would: the pointer is returned
@@ -88,9 +86,6 @@ pub trait Gaze {
 
     #[zbus(property)]
     fn calibrated(&self) -> zbus::Result<bool>;
-
-    #[zbus(property)]
-    fn model(&self) -> zbus::Result<bool>;
 
     #[zbus(property)]
     fn controller(&self) -> zbus::Result<bool>;
@@ -166,7 +161,6 @@ impl Status {
         Status {
             tracker          : get(props, "Tracker").unwrap_or(false),
             calibrated       : get(props, "Calibrated").unwrap_or(false),
-            model            : get(props, "Model").unwrap_or(false),
             controller       : get(props, "Controller").unwrap_or(false),
             paused           : get(props, "Paused").unwrap_or(false),
             mode             : get::<String>(props, "Mode").map(|s| Mode::parse(&s)).unwrap_or_default(),

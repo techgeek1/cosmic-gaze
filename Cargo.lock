@@ -2027,14 +2027,7 @@ dependencies = [
  "gaze-a11y",
  "gaze-capture",
  "gaze-core",
- "gaze-detect",
- "gaze-overlay",
- "gaze-provider-et5",
- "glam 0.30.10",
- "serde",
- "serde_json",
  "signal-hook",
- "toml 0.9.12+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2221,21 +2214,6 @@ version = "0.1.0"
 dependencies = [
  "gaze-core",
  "glam 0.30.10",
-]
-
-[[package]]
-name = "gaze-trainer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "gaze-core",
- "libcosmic",
- "rand 0.9.5",
- "serde",
- "serde_json",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

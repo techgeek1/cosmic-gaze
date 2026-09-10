@@ -1,9 +1,7 @@
-//! Real clicks as gaze labels for the running session (PLAN-ET5 D5's feed and E1's
-//! source; the record itself is written by the provider, `flywheel.rs`).
+//! Real clicks as gaze labels for the running session (PLAN-ET5 D5's feed).
 //!
-//! People look at what they click. `gaze-clicks` collects that as training data; this
-//! feeds it straight back into the live provider instead, so the day's bias is learnt
-//! while the session runs. The real mouse is read read-only, the pointer is polled from
+//! People look at what they click. This feeds that straight into the live provider, so
+//! the day's bias is learnt while the session runs. The real mouse is read read-only, the pointer is polled from
 //! the compositor, and every press is handed to the source with the pointer position at
 //! that moment. The source decides what to make of it.
 //!

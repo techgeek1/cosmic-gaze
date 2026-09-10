@@ -13,7 +13,7 @@
 //! because the compositor acts on the clone rather than on the remapped hardware. That
 //! bet lost a whole evening of data: the G502 re-enumerated (a new `eventN` appeared),
 //! input-remapper kept grabbing the *old* node, the compositor quietly switched to
-//! reading the new hardware node directly, and the collector sat on a clone that would
+//! reading the new hardware node directly, and the reader sat on a clone that would
 //! never speak again. The desktop worked, so nothing looked wrong; the session file
 //! stayed empty.
 //!
@@ -78,7 +78,7 @@ struct Reading {
 
 /// A running reader thread over every mouse-shaped node.
 pub struct MouseReader {
-    /// Where button events surface, drained by the collector.
+    /// Where button events surface, drained by the caller.
     events : Receiver<ButtonEvent>,
     /// Set to stop the thread. Polled every [`POLL_INTERVAL`].
     stop   : Arc<AtomicBool>,
@@ -102,12 +102,13 @@ impl MouseReader {
     /// [`wanted`] accepts is opened, and nodes that appear later are picked up by the
     /// rescan. Nothing is ever grabbed, so every press still reaches the compositor.
     ///
-    /// `t0` is the collector's clock: events are stamped with the reader's own arrival
+    /// `t0` is the caller's clock: events are stamped with the reader's own arrival
     /// time against it rather than with the kernel's, because the kernel stamps on
     /// `CLOCK_REALTIME` and everything else in a session is monotonic.
     ///
-    /// Every press also fires a `capture` request carrying a fresh id, so the screen
-    /// capture starts here rather than after the event has crossed two more threads.
+    /// Every press also fires a `capture` request carrying a fresh id, so a screen
+    /// capture keyed to the press can start here rather than after the event has
+    /// crossed more threads (the session has no use for it and drops the ids).
     pub fn open(
         path        : Option<&Path>,
         name_substr : &str,
@@ -306,7 +307,7 @@ fn run(
 )
 {
     // Capture ids are unique for the life of the process, so a reply that arrives
-    // after the collector gave up on it can never be mistaken for a later click's.
+    // after the caller gave up on it can never be mistaken for a later click's.
     let mut next_id: u64 = 0;
 
     let mut next_rescan = Instant::now() + RESCAN_INTERVAL;

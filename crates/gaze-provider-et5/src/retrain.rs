@@ -113,25 +113,31 @@
 //! committed. All three are fixed here, and [`RetrainConfig::min_points`] is the last
 //! line: a ceremony that accepted fewer points than that writes nothing at all.
 
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, TryRecvError};
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use glam::DVec3;
 use tracing::{info, warn};
 use gaze_core::{DesktopGeometry, GlobalPx, OutputGeometry};
-use gaze_overlay::{OverlayHandle, OverlayState};
+use gaze_overlay::{Mark, OverlayHandle, OverlayState};
 
 use crate::blob::{CalibrationResult, body, body_sha256_hex, decode_trailer};
-use crate::calibration::HealthStop;
+use crate::calibration::{HealthStop, desk_to_sensor, plane_corners};
 use crate::device::{Device, DeviceError};
 use crate::gaze::{Et5Frame, GAZE_HZ};
-use crate::record::{BLACK, WHITE};
-use crate::sweep::{
-    FALLBACK_PX_PER_DEG, SweepError, SweepKey, desk_to_sensor, median, plane_corners,
-    set_overlay_background, show_target,
-};
 use crate::ttp::DisplayArea;
+
+/// Fully opaque black, the low-illumination half of the ceremony's rounds.
+pub const BLACK: [u8; 4] = [0, 0, 0, 255];
+
+/// Fully opaque white, the high-illumination half.
+pub const WHITE: [u8; 4] = [255, 255, 255, 255];
+
+/// Pixels per degree fallback when the geometry cannot supply a local scale.
+const FALLBACK_PX_PER_DEG: f64 = 60.0;
 
 /// Talon's training rectangle width, millimetres. Measured along the panel surface,
 /// so a curved panel gets the same arc length a flat one would.
@@ -271,7 +277,7 @@ pub struct RetrainConfig {
     /// Ask the device what point it would like after each round and log the answer.
     /// Exploratory: nothing depends on the reply.
     pub suggest           : bool,
-    /// Accept a point only on `SweepKey::Commit` (or Enter): the vote checks the
+    /// Accept a point only on `RetrainKey::Commit` (or Enter): the vote checks the
     /// click instead of deciding, and the dwell fallback is off. See "Manual
     /// acceptance" in the module docs.
     pub manual            : bool,
@@ -348,7 +354,7 @@ pub struct SeedChoice {
 /// Reads the file; the caller does this before opening the device so a bad path costs
 /// nothing.
 pub fn resolve_seed(explicit: Option<&Path>, blob: &Path, no_seed: bool)
-    -> Result<SeedChoice, SweepError>
+    -> Result<SeedChoice, RetrainError>
 {
     if no_seed {
         return Ok(SeedChoice {
@@ -360,9 +366,9 @@ pub fn resolve_seed(explicit: Option<&Path>, blob: &Path, no_seed: bool)
     // An explicit file is a request, not a preference: report what went wrong with it.
     if let Some(path) = explicit {
         let bytes = std::fs::read(path)
-            .map_err(|e| SweepError::Seed(format!("reading {}: {e}", path.display())))?;
+            .map_err(|e| RetrainError::Seed(format!("reading {}: {e}", path.display())))?;
         let Some((_, table)) = decode_trailer(&bytes) else {
-            return Err(SweepError::Seed(format!(
+            return Err(RetrainError::Seed(format!(
                 "{} has no result trailer, so it is not a trained model of this device",
                 path.display())));
         };
@@ -619,11 +625,11 @@ fn nearest(targets: &[[f64; 2]], sample: [f64; 2], aspect: f64) -> Option<usize>
 ///
 /// Fails only when the display is missing from the desk config or disabled.
 pub fn plan(geometry: &DesktopGeometry, config: &RetrainConfig)
-    -> Result<RetrainPlan, SweepError>
+    -> Result<RetrainPlan, RetrainError>
 {
     let out = geometry.outputs.iter()
         .find(|o| o.name == config.display && o.enabled)
-        .ok_or(SweepError::NoDisplays)?;
+        .ok_or(RetrainError::NoDisplays)?;
 
     // The corners are derived in the desk frame; the device speaks its own frame,
     // pitched up by the mount wedge.
@@ -930,7 +936,7 @@ pub struct RetrainOutcome {
 ///
 /// Three ways this ends without a blob. `q` aborts; a ceremony that accepted fewer
 /// than `config.min_points` targets refuses to commit; and the tracker leaving the USB
-/// bus is reported as [`SweepError::TrackerLost`], because on this device that is a
+/// bus is reported as [`RetrainError::TrackerLost`], because on this device that is a
 /// firmware reboot and a reboot resets the eye model to the factory blob. The first
 /// two close the session on the way out. In every case the caller writes nothing, and
 /// in none of them is the device as it was: it holds whatever the applied rounds
@@ -939,12 +945,12 @@ pub struct RetrainOutcome {
 pub fn run_retrain(
     device   : &mut Device,
     overlay  : &OverlayHandle,
-    keys     : Option<&Receiver<SweepKey>>,
+    keys     : Option<&Receiver<RetrainKey>>,
     config   : &RetrainConfig,
     plan     : &RetrainPlan,
     seed     : Option<&Seed>,
 )
-    -> Result<RetrainOutcome, SweepError>
+    -> Result<RetrainOutcome, RetrainError>
 {
     let gate = Gate {
         window   : GATE_WINDOW,
@@ -1030,7 +1036,7 @@ pub fn run_retrain(
         set_overlay_background(None);
         let _ = overlay.set(OverlayState::default());
 
-        return Err(SweepError::TooFewPoints { accepted: accepted, needed: needed });
+        return Err(RetrainError::TooFewPoints { accepted: accepted, needed: needed });
     }
 
     // `cal_end` fits nothing, so anything still unapplied would be collected and then
@@ -1111,7 +1117,7 @@ fn log_summary(summaries: &[RoundSummary]) {
 fn run_round(
     device      : &mut Device,
     overlay     : &OverlayHandle,
-    keys        : Option<&Receiver<SweepKey>>,
+    keys        : Option<&Receiver<RetrainKey>>,
     config      : &RetrainConfig,
     plan        : &RetrainPlan,
     gate        : &Gate,
@@ -1124,7 +1130,7 @@ fn run_round(
     results     : &mut Vec<PointResult>,
     suggestions : &mut Vec<String>,
 )
-    -> Result<RoundSummary, SweepError>
+    -> Result<RoundSummary, RetrainError>
 {
     // The pupil is still moving for seconds after a flip; a round collected during
     // that would be labelled with an illumination the eye had not reached.
@@ -1136,7 +1142,7 @@ fn run_round(
         // the adaptation dot only has to give the eye something to hold.
         let anchor = plan.points.get(4)
             .or_else(|| round.points.first().and_then(|i| plan.points.get(*i)))
-            .ok_or(SweepError::NoDisplays)?;
+            .ok_or(RetrainError::NoDisplays)?;
         info!("adapting to {}: eyes on the dot", round.background.name());
 
         show_target(overlay, anchor.px, 0.0)?;
@@ -1243,7 +1249,7 @@ fn run_round(
 #[allow(clippy::too_many_arguments)]
 fn run_point(
     overlay   : &OverlayHandle,
-    keys      : Option<&Receiver<SweepKey>>,
+    keys      : Option<&Receiver<RetrainKey>>,
     config    : &RetrainConfig,
     gate      : &Gate,
     frames_rx : &Receiver<Et5Frame>,
@@ -1253,7 +1259,7 @@ fn run_point(
     px        : GlobalPx,
     name      : &str,
 )
-    -> Result<PointResult, SweepError>
+    -> Result<PointResult, RetrainError>
 {
     let start = Instant::now();
 
@@ -1276,15 +1282,15 @@ fn run_point(
 
         if let Some(keys) = keys {
             match keys.try_recv() {
-                Ok(SweepKey::Quit)    => return Err(SweepError::Aborted),
-                Ok(SweepKey::Skip)    => {
+                Ok(RetrainKey::Quit)    => return Err(RetrainError::Aborted),
+                Ok(RetrainKey::Skip)    => {
                     return Ok(tally.result(index, PointOutcome::Skipped, 0, now));
                 }
                 // The operator can see the dot and the user; when the gate will not
                 // trip but the fixation is plainly good, Enter takes the point.
-                Ok(SweepKey::Advance) => forced = true,
+                Ok(RetrainKey::Advance) => forced = true,
                 // The user says they are on it; the vote below gets to disagree.
-                Ok(SweepKey::Commit)  => clicked = true,
+                Ok(RetrainKey::Commit)  => clicked = true,
                 Err(_)                => {}
             }
         }
@@ -1478,15 +1484,15 @@ pub fn run_health(
     device   : &mut Device,
     geometry : &DesktopGeometry,
     overlay  : &OverlayHandle,
-    keys     : Option<&Receiver<SweepKey>>,
+    keys     : Option<&Receiver<RetrainKey>>,
     config   : &RetrainConfig,
     plan     : &RetrainPlan,
 )
-    -> Result<Vec<HealthStop>, SweepError>
+    -> Result<Vec<HealthStop>, RetrainError>
 {
     let out = geometry.outputs.iter()
         .find(|o| o.name == config.display && o.enabled)
-        .ok_or(SweepError::NoDisplays)?;
+        .ok_or(RetrainError::NoDisplays)?;
 
     let eye        = geometry.eye();
     let frames_rx  = device.gaze_stream();
@@ -1523,11 +1529,11 @@ pub fn run_health(
 
             while start.elapsed().as_secs_f64() < HEALTH_DWELL_S {
                 if let Some(keys) = keys
-                    && matches!(keys.try_recv(), Ok(SweepKey::Quit))
+                    && matches!(keys.try_recv(), Ok(RetrainKey::Quit))
                 {
                     set_overlay_background(None);
 
-                    return Err(SweepError::Aborted);
+                    return Err(RetrainError::Aborted);
                 }
 
                 let t = start.elapsed().as_secs_f64();
@@ -1628,7 +1634,7 @@ impl Persistence {
 /// committed, whatever `cal_retrieve` said while the session was still warm, so
 /// nothing is written until this passes.
 pub fn verify_persistence(committed: &[u8], before: (u8, u8))
-    -> Result<Persistence, SweepError>
+    -> Result<Persistence, RetrainError>
 {
     // Long enough that a reboot in progress fails the open rather than racing it.
     std::thread::sleep(RECONNECT_SETTLE);
@@ -1654,7 +1660,7 @@ pub fn verify_persistence(committed: &[u8], before: (u8, u8))
     let got  = body_sha256_hex(&retrieved);
 
     if want != got {
-        return Err(SweepError::ModelNotKept {
+        return Err(RetrainError::ModelNotKept {
             committed_sha256 : want,
             actual_sha256    : got,
             committed_len    : body(committed).len(),
@@ -1723,10 +1729,10 @@ fn aspect_of(plan: &RetrainPlan) -> f64 {
 /// reboot, and a reboot resets the eye model to the factory blob, so everything the
 /// ceremony has done up to that point is gone: it must abort and write nothing rather
 /// than retry into a device that is no longer the one it was talking to.
-fn device_error(e: DeviceError) -> SweepError {
+fn device_error(e: DeviceError) -> RetrainError {
     match e {
-        DeviceError::Transport(e) => SweepError::TrackerLost(e.to_string()),
-        e                         => SweepError::Device(e),
+        DeviceError::Transport(e) => RetrainError::TrackerLost(e.to_string()),
+        e                         => RetrainError::Device(e),
     }
 }
 
@@ -1735,11 +1741,11 @@ fn device_error(e: DeviceError) -> SweepError {
 /// `Err` only when the reader thread has dropped its sender, which it does when the
 /// USB transport fails under it. That is the same reboot [`device_error`] names, seen
 /// from the stream side instead of from a request.
-fn next_frame(frames_rx: &Receiver<Et5Frame>) -> Result<Option<Et5Frame>, SweepError> {
+fn next_frame(frames_rx: &Receiver<Et5Frame>) -> Result<Option<Et5Frame>, RetrainError> {
     match frames_rx.try_recv() {
         Ok(frame)                       => Ok(Some(frame)),
         Err(TryRecvError::Empty)        => Ok(None),
-        Err(TryRecvError::Disconnected) => Err(SweepError::TrackerLost(
+        Err(TryRecvError::Disconnected) => Err(RetrainError::TrackerLost(
             "the gaze stream ended: the reader thread lost the USB transport".into())),
     }
 }
@@ -1762,9 +1768,9 @@ fn wait(
     px         : GlobalPx,
     duration_s : f64,
     frames_rx  : &Receiver<Et5Frame>,
-    keys       : Option<&Receiver<SweepKey>>,
+    keys       : Option<&Receiver<RetrainKey>>,
 )
-    -> Result<(), SweepError>
+    -> Result<(), RetrainError>
 {
     let start = Instant::now();
 
@@ -1777,8 +1783,8 @@ fn wait(
 
         if let Some(keys) = keys {
             match keys.try_recv() {
-                Ok(SweepKey::Quit) => return Err(SweepError::Aborted),
-                Ok(SweepKey::Advance | SweepKey::Commit | SweepKey::Skip) => return Ok(()),
+                Ok(RetrainKey::Quit) => return Err(RetrainError::Aborted),
+                Ok(RetrainKey::Advance | RetrainKey::Commit | RetrainKey::Skip) => return Ok(()),
                 Err(_)             => {}
             }
         }
@@ -1787,6 +1793,160 @@ fn wait(
     }
 
     Ok(())
+}
+
+// --- Keys ---
+
+/// User input during a ceremony.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetrainKey {
+    /// End the current collection early.
+    Advance,
+    /// The user says they are on the target now: the controller's pad click, or `c`.
+    /// The retrain treats it as the acceptance itself, checked against the gate's
+    /// vote; the health check treats it as `Advance`.
+    Commit,
+    /// Skip the current point (behind a bezel, uncomfortable).
+    Skip,
+    /// Abort the ceremony.
+    Quit,
+}
+
+/// Spawns a stdin reader translating lines into keys: empty line advances, `c`
+/// commits, `s` skips, `q` quits.
+pub fn terminal_keys() -> Receiver<RetrainKey> {
+    let (tx, rx) = crossbeam_channel::unbounded();
+
+    terminal_keys_into(tx);
+
+    rx
+}
+
+/// The stdin reader behind [`terminal_keys`], feeding a channel the caller owns so
+/// another source (a controller) can share it.
+pub fn terminal_keys_into(tx: Sender<RetrainKey>) {
+    std::thread::Builder::new()
+        .name("retrain-keys".into())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+
+            for line in stdin.lock().lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+
+                let key = {
+                    match line.trim() {
+                        ""  => RetrainKey::Advance,
+                        "c" => RetrainKey::Commit,
+                        "s" => RetrainKey::Skip,
+                        "q" => RetrainKey::Quit,
+                        _   => continue,
+                    }
+                };
+
+                if tx.send(key).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("spawn key thread");
+}
+
+// --- Target drawing ---
+
+/// The overlay background the ceremony currently draws its targets on, packed RGBA
+/// with the red byte in the high bits. Zero is the transparent overlay.
+///
+/// A module static rather than a parameter because [`show_target`] is called from
+/// every wait in the ceremony, and threading a colour through all of them for the
+/// benefit of the round loop buys nothing: only one target is ever animating at a time.
+static OVERLAY_BACKGROUND: AtomicU32 = AtomicU32::new(0);
+
+/// Sets the background every subsequent target frame is drawn on. `None` restores the
+/// transparent overlay.
+pub(crate) fn set_overlay_background(color: Option<[u8; 4]>) {
+    let packed = {
+        match color {
+            Some(c) => u32::from_be_bytes(c),
+            None    => 0,
+        }
+    };
+
+    OVERLAY_BACKGROUND.store(packed, Ordering::Relaxed);
+}
+
+/// The background [`show_target`] is currently painting.
+fn overlay_background() -> Option<[u8; 4]> {
+    let packed = OVERLAY_BACKGROUND.load(Ordering::Relaxed);
+
+    (packed != 0).then(|| packed.to_be_bytes())
+}
+
+/// Draws the target: the pointer look's mark, a ring with the dot at its centre, its
+/// interior filling with `progress` (0 to 1) as the hold at it runs. No caption: what
+/// the user needs to know goes to the terminal.
+pub(crate) fn show_target(overlay: &OverlayHandle, px: GlobalPx, progress: f32)
+    -> Result<(), RetrainError>
+{
+    overlay.set(OverlayState {
+        background : overlay_background(),
+        mark       : Some(Mark { at: px, progress: progress.clamp(0.0, 1.0) }),
+        ..OverlayState::default()
+    }).map_err(|e| RetrainError::Overlay(e.to_string()))
+}
+
+/// Median of a slice; zero when empty.
+pub(crate) fn median(values: &mut [f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    values[values.len() / 2]
+}
+
+// --- Errors ---
+
+/// Ceremony failure.
+#[derive(Debug, thiserror::Error)]
+pub enum RetrainError {
+    #[error("no enabled display matched the configured tracker display")]
+    NoDisplays,
+    #[error("aborted by the user")]
+    Aborted,
+    #[error("device error during the ceremony: {0}")]
+    Device(#[source] DeviceError),
+    #[error("overlay error: {0}")]
+    Overlay(String),
+    #[error("the retrain accepted only {accepted} of the points it needed ({needed}); \
+             nothing was written")]
+    TooFewPoints {
+        /// Targets that were fed to the device.
+        accepted : usize,
+        /// The floor the ceremony refused below.
+        needed   : usize,
+    },
+    #[error("calibration seed: {0}")]
+    Seed(String),
+    #[error("the tracker dropped off the bus mid-ceremony ({0}); on this device that \
+             is a firmware reboot, which resets the eye model to the factory blob")]
+    TrackerLost(String),
+    #[error("the tracker did not keep the model across a reconnect: committed a \
+             {committed_len} byte body (sha256 {committed_sha256}), read back a \
+             {actual_len} byte body (sha256 {actual_sha256}) after reopening")]
+    ModelNotKept {
+        /// Body hash of what the ceremony committed.
+        committed_sha256 : String,
+        /// Body hash of what the reopened device handed back.
+        actual_sha256    : String,
+        /// Body length committed, bytes.
+        committed_len    : usize,
+        /// Body length read back, bytes. Around 1478 is the factory blob, which is
+        /// what a rebooted device holds.
+        actual_len       : usize,
+    },
 }
 
 // --- Tests ---

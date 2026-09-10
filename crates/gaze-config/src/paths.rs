@@ -12,12 +12,12 @@ const APP_DIR: &str = "cosmic-gaze";
 /// The three roots everything hangs off.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Paths {
-    /// The desk file, the calibration and its device blob, the residual model. What a
-    /// user sets up once per desk.
+    /// The desk file, the calibration and its device blob. What a user sets up once
+    /// per desk.
     pub config_dir : PathBuf,
     /// The ONNX models. Large, downloaded, never edited.
     pub models_dir : PathBuf,
-    /// The online offset and the flywheel: what the daemon writes as it runs.
+    /// The online offset: what the daemon writes as it runs.
     pub state_dir  : PathBuf,
 }
 
@@ -40,7 +40,7 @@ impl Paths {
     }
 
     /// A checkout's layout: `DIR/config` for config and state both (the prototype kept
-    /// the offset and the flywheel next to the calibration) and `DIR/models`.
+    /// the offset next to the calibration) and `DIR/models`.
     pub fn home(dir: &Path) -> Paths {
         Paths {
             config_dir : dir.join("config"),
@@ -64,20 +64,11 @@ impl Paths {
         self.config_dir.join("calibration-et5.bin")
     }
 
-    /// The residual model (`gaze-et5-cli fit`).
-    pub fn model(&self) -> PathBuf {
-        self.config_dir.join("model-et5.json")
-    }
-
     /// Where the online offset persists across runs.
     pub fn offset(&self) -> PathBuf {
         self.state_dir.join("offset-et5.json")
     }
 
-    /// Where the flywheel writes attributed clicks, one file per UTC day.
-    pub fn flywheel(&self) -> PathBuf {
-        self.state_dir.join("flywheel")
-    }
 }
 
 // --- Tests ---
@@ -95,9 +86,7 @@ mod tests {
         assert_eq!(paths.desk(),        Path::new("./config/desk.toml"));
         assert_eq!(paths.calibration(), Path::new("./config/calibration-et5.toml"));
         assert_eq!(paths.device_blob(), Path::new("./config/calibration-et5.bin"));
-        assert_eq!(paths.model(),       Path::new("./config/model-et5.json"));
         assert_eq!(paths.offset(),      Path::new("./config/offset-et5.json"));
-        assert_eq!(paths.flywheel(),    Path::new("./config/flywheel"));
         assert_eq!(paths.models_dir,    Path::new("./models"));
     }
 

@@ -7,7 +7,8 @@
 //! calibration ops, and the 0x500 gaze notification stream. The device does the eye
 //! tracking; this crate turns its tracker-space output into `gaze_core::GazeSample`s
 //! with a desk-frame ray, and owns the calibration story: the on-device eye model,
-//! per-display pose solving, and a client-side correction field.
+//! the declared plane, a client-side correction field fitted from the health check,
+//! and the day's offset learnt from real clicks.
 //!
 //! Layering, bottom up:
 //!
@@ -17,38 +18,30 @@
 //! - [`gaze`]: decoded 0x500 frames (`Et5Frame`).
 //! - [`blob`]: identity of the on-device calibration blob (the model body's hash,
 //!   diff, check policy) and the firmware's per-point result table off its trailer.
-//! - [`retrain`]: the ceremony that writes the on-device eye model, once.
-//! - [`record`], [`dataset`]: recording sessions and the rows a model trains on.
-//! - [`model`], [`train`]: the residual model a frame runs through, and its fit.
-//! - [`triangulate`], [`pose`]: the plane pass geometry (ray-bundle intersection,
-//!   pose from points or rays).
+//! - [`retrain`]: the ceremony that writes the on-device eye model, once, and the
+//!   health check that follows it.
+//! - [`calibration`], [`field`]: the calibration file and the correction field.
+//! - [`offset`]: the online offset the real clicks feed.
 //! - [`provider`]: the `GazeProvider` implementation on top of it all.
+//!
+//! The residual model, its trainer and the click flywheel that fed it were removed on
+//! 2026-09-10 (git history): the offset alone carried the day.
 
 pub mod blob;
 pub mod calibration;
-pub mod dataset;
 pub mod device;
 pub mod field;
-pub mod flywheel;
 pub mod gaze;
-pub mod model;
 pub mod offset;
-pub mod pose;
 pub mod provider;
-pub mod record;
 pub mod retrain;
-pub mod sweep;
-pub mod train;
 pub mod transport;
-pub mod triangulate;
 pub mod ttp;
 
 pub use blob::{BlobCheck, BlobReport, CalibrationResult};
 pub use calibration::{Et5Calibration, HealthStop};
 pub use device::{ConnectOptions, Device, DeviceError};
-pub use flywheel::{ClickRecord, ClickVia, FlywheelLog};
 pub use gaze::Et5Frame;
-pub use model::{Features, ResidualModel};
-pub use offset::{ClickFeedback, OffsetParams, OnlineOffset};
+pub use offset::{ClickFeedback, ClickVia, OffsetParams, OnlineOffset};
 pub use provider::{Et5Provider, OffsetSummary};
 pub use ttp::{DisplayArea, DisplayRect};

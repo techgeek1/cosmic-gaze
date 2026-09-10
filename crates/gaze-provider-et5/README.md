@@ -190,11 +190,10 @@ nottobii keeps one session across its whole init; nothing observed here needs th
   re-enumerated as it finished, so the file it wrote described a model the device no
   longer had.
 
-  **Retrain once.** The firmware model is a feature extractor, not the thing that
-  improves: every session file and every host-side fit is keyed to the blob's hash, so
-  a retrain orphans all of it. Run this after a remount, a fresh device, or a
-  deliberate experiment — not when a session feels off. Accuracy work happens in
-  `record` + the Phase C/D model, on top of a fixed blob.
+  **Retrain once.** The correction field and the online offset are keyed to the
+  blob's hash, so a retrain starts both over. Run this after a remount, a fresh
+  device, or a deliberate experiment — not when a session feels off; the offset
+  absorbs a day's drift by itself.
 
 - `health [--grid 4] [--daydream]` — the health check on its own against the committed
   model: uploads the blob, declares the trained plane, dwells on the grid, replaces the
@@ -203,58 +202,34 @@ nottobii keeps one session across its whole init; nothing observed here needs th
 - `fit-field [--dry-run]` — refit the correction field from the health stops already in
   the calibration file. The identity competes on held-out error, so a sparse or noisy
   health table leaves the field alone and says so.
-- `record --minutes 5 [--daydream]` — one training session (stop grid on black, prompted
-  wander on white, stop grid on white) written to `config/sessions/`. With `--daydream`
-  the pad advances, App skips a stop and Home ends the phase. This is where data for the
-  model comes from; nothing is fitted and nothing is uploaded.
-- `flywheel [--dir DIR]` — the flywheel by day: clicks by channel and verdict, the
-  median leftover after model and offset, and the median firmware residual a pooled
-  fit would see, plus the device blobs the days were recorded under.
-- `dataset export --csv out.csv` — every session under `config/sessions/` as one
-  row per surviving frame plus one aggregated (median) row per stop or click, for the
-  Python harness under `model/`.
-- `fit [--dry-run]` — the residual model (PLAN-ET5 D2). Loads the sessions recorded
-  under the calibration's device blob (others are skipped and said so), keeps one
-  median row per click (carets refused, look-away clicks past `--cap-deg` not trained
-  on), prints the leave-one-session-out per-click residual for the firmware and the
-  model, then fits on everything and writes `config/model-et5.json`. Fifteen seconds
-  for five sessions, no device. `--all-features` fits the 27-column model instead of
-  the per-eye direction field; it is worse held out on the 2026-09-04 data.
-- `collect`, `refit` — **deprecated**, removed in Phase D. They belong to the old
-  compound sweep (client-side correction field, head-gain regression) that `calibrate`
-  no longer runs. `--help` points at `record`. The pass archive under
-  `config/calibration-et5-history/` is also orphaned twice over: its files were keyed
-  by a `DefaultHasher` digest (`blob_key` now uses the first 16 hex characters of the
-  blob *body*'s SHA-256, matching `device_blob_sha256`), and they describe an eye
-  model that no longer exists.
 - `view [--calibration F | --direct OUTPUT]` — live gaze marker on every display through
   `gaze-overlay`. `--direct DP-2` declares that display's configured plane to the firmware
   and draws its own 2D output on it with no client fit: the range check after a remount.
 
-`gaze-proto --provider et5` runs the full snap/click prototype on this provider;
-it picks up `config/calibration-et5.toml` and `config/model-et5.json` automatically
-(`--calibration`, `--model` override) and takes commits from the grabbed Lenovo's
-buttons. With a model the provider corrects the firmware's ray
-in angle space before intersecting the configured desk (`model.rs`), widens sigma by
-the model's own variance, and fades the correction out where the variance says the
-frame is off the training data; the old correction field and head gain are bypassed.
-A model fitted under another blob is ignored with a warning.
+`gaze-proto` (and `gazed`) run the full snap/click session on this provider; they pick
+up `config/calibration-et5.toml` from the desk's files. In direct mode the firmware's
+trained 2D output is mapped to the panel, run through the head-gain correction and the
+correction field the health check fitted, and then moved by the online offset.
 
-On top of the model sits the online offset (`offset.rs`, PLAN-ET5 D5): the day's
-yaw/pitch bias, learnt from the real mouse and the Daydream pad while `gaze-proto` runs.
-Every physical press (and every pad commit) is attributed against the corrected rays of
-the 0.4 s before it and the median leftover, if under 3°, enters the offset clipped at
-2°. The bias is keyed to where the eyes are: a set of anchors in tracker space, one per
+The online offset (`offset.rs`, PLAN-ET5 D5) is the day's yaw/pitch bias, learnt from
+the real mouse and the Daydream pad while the session runs. The ray from the eyes
+through the calibrated point is rotated by the offset for the current posture and
+intersected with the desk again (`correct_direction`, the inverse of the leftover a
+click measures). Every physical press (and every pad commit) is attributed against the
+corrected rays of the 0.4 s before it and the median leftover, if under 3°, enters the
+offset clipped at 2°. The bias is keyed to where the eyes are: a set of anchors in tracker space, one per
 posture (60 mm reach on the binocular midpoint, rebuilt from the last eye spacing when
 one eye drops), each holding its own bias and blended by distance, so sitting up and
 slouching each keep their own correction instead of relearning one over twenty clicks.
 A click far from every anchor founds a new one at the blended prediction and its clicks
 enter at `1/(n+1)` over a two-click prior; established anchors move by a tenth. It
-persists to `config/offset-et5.json`, keyed to the blob like the model; `gaze-proto
+persists to `config/offset-et5.json`, keyed to the calibration's blob; `gaze-proto
 --freeze-offset` attributes and logs without moving it, and deleting the file starts
-cold. Leave-one-session-out on the click sessions puts the model alone at 1.44° and
-the model with a single bias at 1.20° (the Python harness's `loso_clicks.py`, removed
-2026-09-10 once `fit` reproduced it).
+cold. Leave-one-session-out on the 2026-09-04 click sessions put a single bias at
+0.2 to 0.3° of median error, the largest term after the firmware's own; the residual
+model that sat under it (1.83° to 1.44° held out, Phases C and D) was removed on
+2026-09-10 along with its trainer, recorder, exporter and flywheel, because the
+offset alone carried the day and the model's gain sat under the snap radius.
 
 The 3° gate has a way to be wrong: a bias larger than it (glasses moved, a knocked
 mount, a posture the anchors have not seen) rejects every click and the filter can
@@ -265,44 +240,32 @@ the session log says so (`click adopted`). Scattered rejects, and one widget cli
 four times, stay rejected. A jump count lives in the offset file; a day with several
 wants a retrain, not a filter.
 
-Every click the offset is offered is also written down (`flywheel.rs`, PLAN-ET5 E1):
-one JSONL line per click under `config/flywheel/<UTC date>.jsonl` with the click,
-the median feature vector of its window, the firmware ray's own residual against the
-clicked point (the label a fit wants), the model and offset that were applied, the
-leftover, and the verdict. `ClickRecord::row` turns one into the row the session
-exporter writes, so a pooled fit needs no second reader. `gaze-proto --no-flywheel`
-writes nothing; `--flywheel DIR` moves it.
-
-Calibration files, blobs, the pass history, the model and the offset are gitignored
-(`/config/calibration*`, `/config/model*.json`, `/config/offset*.json`).
+Calibration files, blobs and the offset are gitignored (`/config/calibration*`,
+`/config/offset*.json`).
 
 ## What was and was not run
 
 Unit tests cover the wire protocol against captured reference vectors, the gaze
-decoder, the pose solver (synthetic flat and curved panels, exact and noisy rays),
-the pose-from-points solve and ray-bundle triangulation (outlier and degeneracy
-cases included), the correction field fits, the head-gain regression, the
-retrain's plan (plane pitch, training rectangle, round schedule), its acceptance
-gate as a pure function (the nearest-target vote with and without a radius, and a
-one-target round accepting on frames alone) and its seed resolution against a real
-blob, the point-suggestion decoder, the
-provider's edge-pinning and dropout-hold behaviour and its sensor-to-desk rotation
-against the exporter's, the residual model's file round trip, prediction and
-ray-correction inverse, the fit's eigensolve, Cholesky and k-means and a synthetic
-three-session fit that has to beat its own firmware residual held out, the online
-offset's convergence, gate, clip and file round trip, and the provider's click
-attribution (a click on the gaze point leaves nothing, a click beside it moves the
-next sample towards it, a far click is refused), the connect
-sequence ordering
+decoder, the correction field fits, the head-gain regression, the retrain's plan
+(plane pitch, training rectangle, round schedule), its acceptance gate as a pure
+function (the nearest-target vote with and without a radius, and a one-target round
+accepting on frames alone) and its seed resolution against a real blob, the
+point-suggestion decoder, the provider's edge-pinning and dropout-hold behaviour and
+its sensor-to-desk rotation, the ray-correction inverse and the yaw/pitch
+decomposition against reference values, the online offset's convergence, gate, clip
+and file round trip, and the provider's click attribution (an empty offset leaves the
+calibrated point alone, a click on the gaze point leaves nothing, a click beside it
+moves the next sample towards it, a far click is refused), the connect sequence
+ordering
 (`device::connect_sequence` for every combination of blob, plane and double upload),
 the blob hashing and diff helpers, the trailer decoder against the last 1 KB of two
 real blobs (`tests/fixtures/blob-tail-*.bin`: the same model committed under the
 trained plane and read back under the virtual one, identical bodies and 13 points
-either side), and the sweep's lag/saccade/interpolation helpers.
+either side).
 The `info`/`dump` paths and `blob-info` were exercised against the real device, and
 `calibrate --dry-run` against the real desk config (with a seed, with `--no-seed`,
 with `--accept-deg`/`--apply-from-round`, and against an unusable `--seed` file).
-`blob-push`, `blob-watch`, `calibrate`, `record` and `view` write device state or need
+`blob-push`, `blob-watch`, `calibrate`, `health` and `view` write device state or need
 the user seated and a compositor; run them manually as above. The retrain's device
 sequence, its dwell fallback, the min-points refusal and the post-ceremony persistence
 check have not been run against hardware.

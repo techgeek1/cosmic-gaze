@@ -25,7 +25,7 @@ use gaze_provider_synthetic::{
     ReplayProvider,
     SyntheticProvider,
 };
-use gaze_provider_et5::{ClickFeedback, ClickVia, Et5Calibration, Et5Provider, OffsetParams, OffsetSummary, ResidualModel};
+use gaze_provider_et5::{ClickFeedback, Et5Calibration, Et5Provider, OffsetParams, OffsetSummary};
 use tracing::{info, warn};
 
 use crate::buttons::ButtonSource;
@@ -136,13 +136,11 @@ impl GazeSource {
                 open_synthetic(device, *gain, *seed, *model, geometry)
             }
 
-            SourceSpec::Et5 { calibration, model, device_blob, offset, flywheel } => {
+            SourceSpec::Et5 { calibration, device_blob, offset } => {
                 open_et5(
                     calibration.as_deref(),
-                    model.as_deref(),
                     device_blob,
                     offset.as_deref(),
-                    flywheel.as_deref(),
                     geometry,
                     buttons,
                     grab,
@@ -187,20 +185,22 @@ impl GazeSource {
     }
 
     /// The clock real clicks must be stamped on to be attributed, when this source can
-    /// learn from them: the ET5 provider with a residual model loaded. `None` for every
+    /// learn from them: the ET5 provider running its online offset. `None` for every
     /// other source, which is also the signal not to read the real mouse for labels.
     pub fn click_clock(&self) -> Option<Instant> {
         match self {
-            GazeSource::Et5 { provider, .. } if provider.has_model() => Some(provider.started_at()),
-            _                                                         => None,
+            GazeSource::Et5 { provider, .. } if provider.offset_summary().is_some() => {
+                Some(provider.started_at())
+            }
+            _ => None,
         }
     }
 
     /// Hands a real click to the source's online offset. See
     /// `Et5Provider::observe_click`; every other source ignores it.
-    pub fn observe_click(&mut self, px: GlobalPx, t_s: f64, via: ClickVia) -> Option<ClickFeedback> {
+    pub fn observe_click(&mut self, px: GlobalPx, t_s: f64) -> Option<ClickFeedback> {
         match self {
-            GazeSource::Et5 { provider, .. } => provider.observe_click(px, t_s, via),
+            GazeSource::Et5 { provider, .. } => provider.observe_click(px, t_s),
             _                                => None,
         }
     }
@@ -225,14 +225,6 @@ impl GazeSource {
     pub fn calibrated(&self) -> bool {
         match self {
             GazeSource::Et5 { provider, .. } => provider.calibrated(),
-            _                                => false,
-        }
-    }
-
-    /// Whether a residual model is running.
-    pub fn has_model(&self) -> bool {
-        match self {
-            GazeSource::Et5 { provider, .. } => provider.has_model(),
             _                                => false,
         }
     }
@@ -335,10 +327,8 @@ fn open_synthetic(
 #[allow(clippy::too_many_arguments)]
 fn open_et5(
     calibration : Option<&Path>,
-    model       : Option<&Path>,
     device_blob : &Path,
     offset      : Option<&Path>,
-    flywheel    : Option<&Path>,
     geometry    : &DesktopGeometry,
     buttons     : Option<&str>,
     grab        : bool,
@@ -358,18 +348,6 @@ fn open_et5(
                (gaze-et5-cli calibrate fixes it)");
     }
 
-    let loaded_model = {
-        match model {
-            Some(path) => Some(ResidualModel::load(path)
-                .with_context(|| format!("loading {}", path.display()))?),
-            None       => None,
-        }
-    };
-
-    if loaded_model.is_none() {
-        info!("no residual model: the firmware's ray is used as is (gaze-et5-cli fit fits one)");
-    }
-
     // A frozen offset is a gain of zero with nowhere to write: clicks are still
     // attributed and logged, so a run can watch the leftovers without moving anything.
     let offset_params = match offset {
@@ -380,10 +358,8 @@ fn open_et5(
     let provider = Et5Provider::create()
         .geometry(geometry.clone())
         .calibration(loaded_calibration)
-        .model(loaded_model)
         .offset_path(offset.map(Path::to_path_buf))
         .offset_params(offset_params)
-        .flywheel_dir(flywheel.map(Path::to_path_buf))
         .device_blob(device_blob)
         .start()
         .context("starting the ET5 provider (tracker on the bus, nothing else holding it?)")?;
@@ -392,10 +368,8 @@ fn open_et5(
 
     info!(
         calibration = ?calibration.map(|p| p.display().to_string()),
-        model       = ?model.map(|p| p.display().to_string()),
         offset      = ?offset.map(|p| p.display().to_string()),
         frozen      = offset.is_none(),
-        flywheel    = ?flywheel.map(|p| p.display().to_string()),
         device      = ?buttons.as_ref().map(|b| b.path().display().to_string()),
         grabbed     = ?buttons.as_ref().map(ButtonSource::grabbed),
         commits     = commit_note(buttons.as_ref()),

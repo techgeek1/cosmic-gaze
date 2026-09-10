@@ -1,13 +1,15 @@
 //! The online offset (PLAN-ET5 D5): the day's bias, learnt from the clicks the user is
 //! already making, and keyed to where the head is.
 //!
-//! The residual model is fitted across sessions and cannot know today's seating, glasses
-//! position or mount creep. Leave-one-session-out on the 2026-09-04 data put that
-//! per-session bias at 0.2 to 0.3 degrees of median error: 1.44 with the model alone,
-//! 1.22 with the held-out session's own median offset added (the oracle). A causal
-//! simulation of this filter over the same clicks, in time order, reached 1.20, so the
-//! oracle is attainable from the clicks themselves within about twenty of them
-//! (the Phase C harness's `loso_clicks.py`, `online`; removed 2026-09-10).
+//! A calibration is taken once and cannot know today's seating, glasses position or
+//! mount creep. Leave-one-session-out on the 2026-09-04 click data put that per-session
+//! bias at 0.2 to 0.3 degrees of median error (1.44 with the since-removed residual
+//! model alone, 1.22 with the held-out session's own median offset added, the oracle).
+//! A causal simulation of this filter over the same clicks, in time order, reached
+//! 1.20, so the oracle is attainable from the clicks themselves within about twenty of
+//! them. The model is gone (2026-09-10); the offset is the whole correction on top of
+//! the calibration, applied in angle space to the ray through the calibrated point
+//! (see [`correct_direction`]).
 //!
 //! A single bias was not enough on the desk (2026-09-05): it held in the calibration
 //! posture and broke on a comfortable slouch, and relearning it on every posture change
@@ -46,6 +48,7 @@
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use glam::DVec3;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -107,6 +110,16 @@ const MAX_REJECTS: usize = 16;
 /// It only matters far from every anchor, where it is what the prediction relaxes to;
 /// on an anchor it moves the prediction by under a hundredth of the bias.
 const FAR_WEIGHT: f64 = 0.01;
+
+/// Which channel a click came in on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClickVia {
+    /// A press on the real mouse.
+    Mouse,
+    /// A commit from the controller's pad.
+    Pad,
+}
 
 /// The filter's tunables.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -616,6 +629,105 @@ fn unix_now_s() -> f64 {
         .unwrap_or(0.0)
 }
 
+// --- Ray geometry ---
+
+/// Newton steps for [`correct_direction`]. The map from tangent offsets to the label's
+/// angles is nearly linear, so two or three suffice; six is headroom.
+const CORRECT_STEPS: usize = 6;
+
+/// Yaw and pitch of `dir` relative to `reference`, degrees: azimuth and elevation in the
+/// tangent frame at `reference` (right = up x reference, local up = reference x right),
+/// both zero exactly when the two are parallel.
+///
+/// One function does two jobs. With `reference` a target direction it is an angle-space
+/// residual, the leftover a click measures; with `reference` the tracker axis it is an
+/// absolute direction readout.
+pub fn local_yaw_pitch_deg(dir: DVec3, reference: DVec3) -> (f64, f64) {
+    if dir.length_squared() < 1e-18 || reference.length_squared() < 1e-18 {
+        return (f64::NAN, f64::NAN);
+    }
+
+    let reference         = reference.normalize();
+    let (right, local_up) = tangent_frame(reference);
+    let d                 = dir.normalize();
+    let forward           = d.dot(reference);
+
+    (
+        d.dot(right).atan2(forward).to_degrees(),
+        d.dot(local_up).atan2(forward).to_degrees(),
+    )
+}
+
+/// The direction the eye was actually looking, given a direction and the residual it
+/// carries: the `want` for which `local_yaw_pitch_deg(dir, want)` returns
+/// `(yaw_deg, pitch_deg)`. The inverse of the leftover, so applying the offset a click
+/// measured lands the ray on the point that was clicked.
+pub fn correct_direction(dir: DVec3, yaw_deg: f64, pitch_deg: f64) -> DVec3 {
+    let dir = dir.normalize();
+
+    if !(yaw_deg.is_finite() && pitch_deg.is_finite()) {
+        return dir;
+    }
+
+    // Parametrise the answer as tangent offsets at `dir` and Newton-step on the two
+    // angles that read back. The label's frame is built at `want`, not at `dir`, so a
+    // plain fixed point on the offsets drifts; a finite-difference Jacobian makes the
+    // step exact to second order and it converges in two or three iterations.
+    let (right, up) = tangent_frame(dir);
+
+    let read = |a: f64, b: f64| -> (f64, f64) {
+        local_yaw_pitch_deg(dir, (dir + right * a + up * b).normalize())
+    };
+
+    let mut a = -yaw_deg.to_radians().tan();
+    let mut b = -pitch_deg.to_radians().tan();
+
+    for _ in 0..CORRECT_STEPS {
+        let (y0, p0) = read(a, b);
+        let ey = y0 - yaw_deg;
+        let ep = p0 - pitch_deg;
+
+        if ey.abs() < 1e-9 && ep.abs() < 1e-9 {
+            break;
+        }
+
+        let h = 1e-4;
+        let (ya, pa) = read(a + h, b);
+        let (yb, pb) = read(a, b + h);
+
+        let j = [[(ya - y0) / h, (yb - y0) / h], [(pa - p0) / h, (pb - p0) / h]];
+        let det = j[0][0] * j[1][1] - j[0][1] * j[1][0];
+
+        if det.abs() < 1e-12 {
+            break;
+        }
+
+        a -= ( j[1][1] * ey - j[0][1] * ep) / det;
+        b -= (-j[1][0] * ey + j[0][0] * ep) / det;
+    }
+
+    (dir + right * a + up * b).normalize()
+}
+
+/// The `right` and `local up` axes [`local_yaw_pitch_deg`] builds at a reference
+/// direction. Only reachable with `DVec3::X` if the reference points straight up; the
+/// tracker axis and every target are roughly forward, so that is a definedness guard,
+/// not a real case.
+fn tangent_frame(reference: DVec3) -> (DVec3, DVec3) {
+    let cross = DVec3::Y.cross(reference);
+
+    let right = {
+        if cross.length() < 1e-9 {
+            DVec3::X
+        }
+        else {
+            cross.normalize()
+        }
+    };
+
+    (right, reference.cross(right))
+}
+
 // --- Error ---
 
 /// Offset file failure.
@@ -838,5 +950,66 @@ mod tests {
         assert_eq!(other.offset_deg(SEAT), [0.0, 0.0]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn correcting_by_the_leftover_inverts_the_leftover() {
+        let dirs = [
+            DVec3::new(0.1, -0.3, -1.0),
+            DVec3::new(-0.4, 0.2, -1.0),
+            DVec3::new(0.0, 0.0, -1.0),
+            DVec3::new(0.6, 0.5, -0.8),
+        ];
+
+        for dir in dirs {
+            for (yaw, pitch) in [(2.0, -1.0), (-4.5, 3.2), (0.0, 0.0), (9.0, 9.0), (-0.3, 0.1)] {
+                let want   = correct_direction(dir, yaw, pitch);
+                let (y, p) = local_yaw_pitch_deg(dir, want);
+
+                assert!((y - yaw).abs() < 1e-6 && (p - pitch).abs() < 1e-6,
+                        "dir {dir:?} label ({yaw}, {pitch}) read back ({y}, {p})");
+                assert!((want.length() - 1.0).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_leftover_leaves_the_direction_alone() {
+        let dir = DVec3::new(0.2, 0.1, -1.0).normalize();
+
+        assert!(correct_direction(dir, 0.0, 0.0).abs_diff_eq(dir, 1e-12));
+        assert!(correct_direction(dir, f64::NAN, 1.0).abs_diff_eq(dir, 1e-12));
+    }
+
+    #[test]
+    fn local_yaw_pitch_matches_the_reference_values() {
+        // Reference values from the removed Python harness's `local_yaw_pitch_deg`, run
+        // on the same vectors; the offset files on disk were measured in this frame.
+        let cases: [(DVec3, DVec3, f64, f64); 5] = [
+            (DVec3::new( 0.0,  0.0,   1.0 ), DVec3::new(0.0, 0.0,  1.0 ),
+               0.0          ,   0.0          ),
+            (DVec3::new( 1.0,  0.0,   1.0 ), DVec3::new(0.0, 0.0,  1.0 ),
+              45.0          ,   0.0          ),
+            (DVec3::new( 0.0,  1.0,   1.0 ), DVec3::new(0.0, 0.0,  1.0 ),
+               0.0          ,  45.0          ),
+            (DVec3::new(-0.2,  0.1,   0.95), DVec3::new(0.1, 0.3,  0.9 ),
+             -18.516_302_076, -12.140_345_458),
+            (DVec3::new( 0.5, -0.4,  -0.75), DVec3::new(0.0, 0.2, -0.98),
+             -37.362_147_825, -39.607_107_589),
+        ];
+
+        for (dir, reference, yaw, pitch) in cases {
+            let (y, p) = local_yaw_pitch_deg(dir, reference);
+
+            assert!((y - yaw).abs()   < 1e-8, "yaw {y} vs {yaw} for {dir:?}");
+            assert!((p - pitch).abs() < 1e-8, "pitch {p} vs {pitch} for {dir:?}");
+        }
+
+        // A direction parallel to its reference decomposes to zero whatever the
+        // reference is, which is what makes the same function serve as a residual.
+        let r = DVec3::new(-0.3, 0.7, -0.6);
+        let (y, p) = local_yaw_pitch_deg(r * 2.0, r);
+
+        assert!(y.abs() < 1e-12 && p.abs() < 1e-12);
     }
 }

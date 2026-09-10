@@ -16,9 +16,9 @@ Without `--home` the files are read from the XDG locations, printed at startup:
 
 | what                          | where                                          |
 |-------------------------------|------------------------------------------------|
-| `desk.toml`, calibration, model | `~/.config/cosmic-gaze/`                     |
+| `desk.toml`, calibration      | `~/.config/cosmic-gaze/`                       |
 | ONNX models                   | `~/.local/share/cosmic-gaze/models/`           |
-| offset, flywheel              | `~/.local/state/cosmic-gaze/`                  |
+| offset                        | `~/.local/state/cosmic-gaze/`                  |
 
 `--dry-run` logs clicks, warps and scrolls instead of injecting them;
 `--overlay-debug` draws the debug look. Everything else is tuning, stored by
@@ -41,7 +41,7 @@ busctl --user call dev.techgeek1.CosmicGaze /dev/techgeek1/CosmicGaze dev.techge
 busctl --user get-property dev.techgeek1.CosmicGaze /dev/techgeek1/CosmicGaze dev.techgeek1.CosmicGaze Mode
 ```
 
-Properties: `Tracker`, `Calibrated`, `Model`, `Controller`, `Paused`, `Mode`
+Properties: `Tracker`, `Calibrated`, `Controller`, `Paused`, `Mode`
 (`no-tracker`, `paused`, `reading`, `pointing`, `scrolling`), `OffsetUpdates`,
 `OffsetJumps`, `OffsetYawDeg`, `OffsetPitchDeg`. Methods: `Pause`, `Resume`,
 `ResetOffset`, `Quit`. The Rust side of this is `gaze_config::bus`.

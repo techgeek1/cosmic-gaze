@@ -67,14 +67,10 @@ pub enum SourceSpec {
     Et5 {
         /// Calibration file, when one exists.
         calibration : Option<PathBuf>,
-        /// Residual model, when one exists.
-        model       : Option<PathBuf>,
         /// The on-device calibration blob re-declared on every connect.
         device_blob : PathBuf,
         /// Where the online offset persists; `None` freezes it in memory.
         offset      : Option<PathBuf>,
-        /// Where the flywheel writes attributed clicks; `None` writes none.
-        flywheel    : Option<PathBuf>,
     },
 
     /// A recorded session.

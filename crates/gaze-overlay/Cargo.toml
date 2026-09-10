@@ -29,7 +29,7 @@ ron = "0.12"
 
 # Accent colour and corner radius from the COSMIC theme, read the way every COSMIC
 # app reads them (`~/.config/cosmic/<name>/v1/<key>` in RON, with a watcher). Same pin
-# as `gaze-trainer`'s libcosmic so the checkout is shared. No default features: the
+# as `gaze-applet`'s libcosmic so the checkout is shared. No default features: the
 # subscription feature pulls iced, and the overlay has no use for it.
 [dependencies.cosmic-config]
 git              = "https://github.com/pop-os/libcosmic.git"

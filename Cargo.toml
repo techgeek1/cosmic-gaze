@@ -18,7 +18,6 @@ gaze-provider-synthetic = { path = "crates/gaze-provider-synthetic" }
 gaze-provider-et5       = { path = "crates/gaze-provider-et5" }
 gaze-clicks             = { path = "crates/gaze-clicks" }
 gaze-a11y               = { path = "crates/gaze-a11y" }
-gaze-trainer            = { path = "crates/gaze-trainer" }
 gaze-daydream           = { path = "crates/gaze-daydream" }
 gaze-config             = { path = "crates/gaze-config" }
 gaze-proto              = { path = "crates/gaze-proto" }

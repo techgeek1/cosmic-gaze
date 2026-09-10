@@ -53,8 +53,8 @@ pub enum Provider {
 #[command(name = "gaze-proto", version)]
 pub struct Args {
     /// A checkout to read the desk's files from: `DIR/config` holds the desk file, the
-    /// calibration, the residual model, the offset and the flywheel, `DIR/models` the
-    /// ONNX models. The daemon reads the XDG locations instead.
+    /// calibration and the offset, `DIR/models` the ONNX models. The daemon reads the
+    /// XDG locations instead.
     #[arg(long, default_value = ".")]
     pub home: PathBuf,
 
@@ -88,10 +88,6 @@ pub struct Args {
     /// do not move it, and nothing is written to the offset file.
     #[arg(long)]
     pub freeze_offset: bool,
-
-    /// Write no flywheel records this run.
-    #[arg(long)]
-    pub no_flywheel: bool,
 
     /// Override one tuning knob for this run, `KEY=VALUE`; repeatable. The keys are
     /// the fields of `gaze_config::Tuning`, e.g. `--tune edge_dwell_s=0.4`. The stored
@@ -183,8 +179,8 @@ impl Args {
         let geometry = DesktopGeometry::from_toml(&text)
             .with_context(|| format!("parsing {}", desk.display()))?;
 
-        // Files the provider only reads when they exist, so a freshly fitted model is
-        // never silently ignored and a missing one is loud where it is opened.
+        // Files the provider only reads when they exist, so a missing one is loud
+        // where it is opened.
         let existing = |path: PathBuf| path.exists().then_some(path);
 
         let source = match self.provider {
@@ -197,10 +193,8 @@ impl Args {
 
             Provider::Et5 => SourceSpec::Et5 {
                 calibration : existing(paths.calibration()),
-                model       : existing(paths.model()),
                 device_blob : paths.device_blob(),
                 offset      : (!self.freeze_offset).then(|| paths.offset()),
-                flywheel    : (!self.no_flywheel).then(|| paths.flywheel()),
             },
 
             Provider::Replay => SourceSpec::Replay {
