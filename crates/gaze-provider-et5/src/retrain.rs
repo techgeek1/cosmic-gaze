@@ -41,6 +41,17 @@
 //!    3x3 health grid reads the firmware's own gaze back against known targets and the
 //!    numbers travel with the blob in the calibration file. Nothing is fitted.
 //!
+//! # The quick ceremony
+//!
+//! [`plan_quick`] is the same plane and grid with one round: the centre and the four
+//! corners on the desktop dimmed under translucent black, seeded with the current
+//! blob, applied once. The daemon runs it from the applet's Calibrate button when a
+//! session feels off. Five points so the device's fourteen-point store keeps nine of
+//! the seed's beside them, which is how the two-background coverage of the full
+//! ceremony survives a top-up; no adaptation wait, so the round takes seconds, and the
+//! same health check afterwards. The files are written by [`write_calibration`],
+//! shared with the CLI.
+//!
 //! Nothing here fits a correction field, a head gain, or a pose: those were the old
 //! `calibrate`'s client-side stages, and they are replaced by the session recordings
 //! of `crate::record` and the model of Phase C/D.
@@ -125,7 +136,12 @@ use gaze_core::{DesktopGeometry, GlobalPx, OutputGeometry};
 use gaze_overlay::{Mark, OverlayHandle, OverlayState};
 
 use crate::blob::{CalibrationResult, body, body_sha256_hex, decode_trailer};
-use crate::calibration::{HealthStop, desk_to_sensor, plane_corners};
+use crate::blob::BlobReport;
+use crate::calibration::{
+    CALIBRATION_FORMAT, CalibrationError, Et5Calibration, FieldFit, HealthStop, OutputCalibration,
+    OutputPose, desk_to_sensor, plane_corners,
+};
+use crate::field::FieldMap;
 use crate::device::{Device, DeviceError};
 use crate::gaze::{Et5Frame, GAZE_HZ};
 use crate::ttp::DisplayArea;
@@ -135,6 +151,11 @@ pub const BLACK: [u8; 4] = [0, 0, 0, 255];
 
 /// Fully opaque white, the high-illumination half.
 pub const WHITE: [u8; 4] = [255, 255, 255, 255];
+
+/// Translucent black over the desktop, the quick ceremony's background: dark enough
+/// that the target reads against anything under it, light enough that the screen
+/// still shows through and the pupil stays put.
+pub const DIM: [u8; 4] = [0, 0, 0, 176];
 
 /// Pixels per degree fallback when the geometry cannot supply a local scale.
 const FALLBACK_PX_PER_DEG: f64 = 60.0;
@@ -201,6 +222,17 @@ const STATUS_S: f64 = 1.0;
 /// as `crate::record`: sized for dilation, which is the slow direction.
 const ADAPT_S: f64 = 4.0;
 
+/// Settle on the anchor dot after the dim background comes up, seconds. No pupil
+/// change to wait out; only the saccade to the dot.
+const DIM_SETTLE_S: f64 = 1.0;
+
+/// The quick ceremony's targets, indices into the nine-point grid: the centre, then
+/// the four corners of the training rectangle in Talon's far-apart order. Five, so
+/// that under the [`DEVICE_POINT_CAP`] of fourteen the device keeps nine of the seed's
+/// points beside them and the two-background coverage of the full ceremony survives
+/// a top-up.
+pub const QUICK_POINTS: [usize; 5] = [4, 0, 8, 6, 2];
+
 /// Poll interval of the target loops. Short enough that the gate sees every frame the
 /// device sends and the caption stays responsive.
 const TICK: Duration = Duration::from_millis(8);
@@ -230,8 +262,7 @@ const HEALTH_MEDIAN_S: f64 = 0.6;
 /// quadratic, at sixteen seconds of dwelling.
 pub const HEALTH_STEPS: usize = 4;
 
-/// Mid grey: the health check runs on neither pupil extreme, so its numbers describe
-/// an ordinary screen rather than the training conditions.
+/// Mid grey, [`Background::Neutral`].
 const NEUTRAL: [u8; 4] = [128, 128, 128, 255];
 
 /// Lag written into a fresh calibration file when there is no previous one to inherit
@@ -283,6 +314,9 @@ pub struct RetrainConfig {
     pub manual            : bool,
     /// Health-check stops per axis (`n` by `n`), at least 2.
     pub health_steps      : usize,
+    /// What the health check runs on. Grey by default, so its numbers compare across
+    /// runs; the daemon keeps the quick ceremony's dim so the two read as one thing.
+    pub health_background : Background,
 }
 
 impl Default for RetrainConfig {
@@ -301,6 +335,7 @@ impl Default for RetrainConfig {
             suggest           : false,
             manual            : false,
             health_steps      : HEALTH_STEPS,
+            health_background : Background::Neutral,
         }
     }
 }
@@ -424,13 +459,21 @@ pub fn resolve_seed(explicit: Option<&Path>, blob: &Path, no_seed: bool)
 // --- Background ---
 
 /// The overlay colour a round runs on. Two rounds of the same schedule on opposite
-/// backgrounds walk the pupil across most of its range.
+/// backgrounds walk the pupil across most of its range; the dim one leaves the pupil
+/// where the desktop had it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Background {
     /// Fully dark: the dilated end.
     Black,
     /// Fully bright: the constricted end.
     White,
+    /// Opaque mid grey, the health check's default: neither pupil extreme, so its
+    /// numbers describe an ordinary screen rather than the training conditions.
+    Neutral,
+    /// The desktop dimmed under a translucent black, for the quick ceremony: the
+    /// targets are visible, the screen is still there, and the pupil stays near the
+    /// state it works at.
+    Dim,
 }
 
 impl Background {
@@ -438,7 +481,9 @@ impl Background {
     pub fn color(&self) -> [u8; 4] {
         match self {
             Self::Black => BLACK,
-            Self::White => WHITE,
+            Self::White   => WHITE,
+            Self::Neutral => NEUTRAL,
+            Self::Dim     => DIM,
         }
     }
 
@@ -446,7 +491,19 @@ impl Background {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Black => "black",
-            Self::White => "white",
+            Self::White   => "white",
+            Self::Neutral => "grey",
+            Self::Dim     => "dim",
+        }
+    }
+
+    /// How long the eye is given on the anchor dot after the flip to this
+    /// background, seconds. The extremes need the pupil to settle; the dim one only
+    /// needs the eye to find the dot.
+    pub fn adapt_s(&self) -> f64 {
+        match self {
+            Self::Black | Self::White | Self::Neutral => ADAPT_S,
+            Self::Dim                                => DIM_SETTLE_S,
         }
     }
 }
@@ -651,6 +708,25 @@ pub fn plan(geometry: &DesktopGeometry, config: &RetrainConfig)
         rounds   : rounds(),
         tol_uv   : tol_uv,
     })
+}
+
+/// The quick ceremony: the same plane and grid as [`plan`], one round of
+/// [`QUICK_POINTS`] on the dimmed desktop, applied once. What the applet's Calibrate
+/// button runs when a session merely feels off: seeded with the current blob, it
+/// tops the model up with five fresh points in a few seconds instead of retraining it
+/// from thirteen over two backgrounds. `config.min_points` should be at most five.
+pub fn plan_quick(geometry: &DesktopGeometry, config: &RetrainConfig)
+    -> Result<RetrainPlan, RetrainError>
+{
+    let mut plan = self::plan(geometry, config)?;
+
+    plan.rounds = vec![Round {
+        name       : "quick",
+        background : Background::Dim,
+        points     : QUICK_POINTS.to_vec(),
+    }];
+
+    Ok(plan)
 }
 
 /// The training rectangle in panel uv: Talon's rectangle, bottom-aligned to the panel
@@ -969,6 +1045,23 @@ pub fn run_retrain(
     info!("tracker on bus {}.{} at the start of the ceremony",
           usb_before.0, usb_before.1);
 
+    // The first round's background and its anchor dot go up before the plane and the
+    // seed, so the screen answers the request at once and the seconds the upload
+    // takes count as the eye's adaptation rather than adding to it.
+    let shown = {
+        match plan.rounds.first() {
+            Some(round) => {
+                let anchor = anchor_point(plan, round)?;
+
+                set_overlay_background(Some(round.background.color()));
+                show_target(overlay, anchor.px, 0.0)?;
+
+                Some((round.background, anchor.px, Instant::now()))
+            }
+            None => None,
+        }
+    };
+
     device.set_display_area_corners(plan.area).map_err(device_error)?;
     std::thread::sleep(PLANE_SETTLE);
 
@@ -994,6 +1087,19 @@ pub fn run_retrain(
     let mut suggestions = Vec::new();
     let mut background  = None;
     let mut pending     = 0usize;
+
+    // Whatever of the adaptation the seeding did not already cover.
+    if let Some((first, anchor_px, since)) = shown {
+        let remaining = first.adapt_s() - since.elapsed().as_secs_f64();
+
+        info!("adapting to {}: eyes on the dot", first.name());
+
+        if remaining > 0.0 {
+            wait(overlay, anchor_px, remaining, &frames_rx, keys)?;
+        }
+
+        background = Some(first);
+    }
 
     let total_rounds = plan.rounds.len();
 
@@ -1048,9 +1154,8 @@ pub fn run_retrain(
 
     let blob = device.cal_end().map_err(device_error)?;
 
-    set_overlay_background(None);
-    let _ = overlay.set(OverlayState::default());
-
+    // The background is left up for the health check; its end clears the overlay,
+    // and a caller that runs no health check stops the overlay anyway.
     info!("retrain committed: {accepted}/{} points over {applied} applied rounds, \
            {} byte blob", results.len(), blob.len());
 
@@ -1138,15 +1243,12 @@ fn run_round(
         *background = Some(round.background);
         set_overlay_background(Some(round.background.color()));
 
-        // The centre point if the plan has one, otherwise wherever the round starts:
-        // the adaptation dot only has to give the eye something to hold.
-        let anchor = plan.points.get(4)
-            .or_else(|| round.points.first().and_then(|i| plan.points.get(*i)))
-            .ok_or(RetrainError::NoDisplays)?;
+        let anchor = anchor_point(plan, round)?;
+
         info!("adapting to {}: eyes on the dot", round.background.name());
 
         show_target(overlay, anchor.px, 0.0)?;
-        wait(overlay, anchor.px, ADAPT_S, frames_rx, keys)?;
+        wait(overlay, anchor.px, round.background.adapt_s(), frames_rx, keys)?;
     }
 
     let targets: Vec<[f64; 2]> = round.points.iter()
@@ -1217,6 +1319,14 @@ fn run_round(
                {} points held", config.apply_from_round, *pending);
 
         return Ok(summary);
+    }
+
+    // The last apply is the slow one: the firmware refits the whole model, which
+    // takes seconds. The dot goes so the eye is not asked to hold a target through
+    // it; the background stays, because the health check that follows runs on it and
+    // the two should read as one operation.
+    if number == total {
+        let _ = overlay.set(OverlayState { background: overlay_background(), ..OverlayState::default() });
     }
 
     device.cal_points_apply().map_err(device_error)?;
@@ -1498,7 +1608,7 @@ pub fn run_health(
     let frames_rx  = device.gaze_stream();
     let (u_lo, u_hi, v_lo, v_hi) = plan.train_uv;
 
-    set_overlay_background(Some(NEUTRAL));
+    set_overlay_background(Some(config.health_background.color()));
 
     let steps     = config.health_steps.max(2);
     let mut stops = Vec::with_capacity(steps * steps);
@@ -1581,6 +1691,107 @@ pub fn run_health(
     let _ = overlay.set(OverlayState::default());
 
     Ok(stops)
+}
+
+// --- Writing the files ---
+
+/// Where a committed ceremony is written.
+#[derive(Clone, Copy, Debug)]
+pub struct CalibrationFiles<'a> {
+    /// The device blob backup the provider re-declares on every connect.
+    pub blob        : &'a Path,
+    /// The calibration file.
+    pub calibration : &'a Path,
+}
+
+/// What [`write_calibration`] did.
+#[derive(Debug)]
+pub struct Written {
+    /// The committed blob's identity.
+    pub report           : BlobReport,
+    /// The correction field fit from the health stops, `None` when there were too
+    /// few to fit one (the field is then the identity).
+    pub field            : Option<FieldFit>,
+    /// Where the previous blob was kept, when there was one.
+    pub blob_kept        : Option<PathBuf>,
+    /// Where the previous calibration was kept, when there was one.
+    pub calibration_kept : Option<PathBuf>,
+}
+
+/// Writes a verified ceremony out: the blob first (the one artefact that cannot be
+/// recreated without the user sitting down again), then the calibration file
+/// describing it, each previous file kept as `*.prev-<unix>`. The calibration
+/// carries the display's configured pose (the ceremony declares the measured plane
+/// and fits nothing), the health stops, and the correction field fitted from them
+/// when it beats leaving the firmware's mapping alone. `lag_s` is inherited from the
+/// previous calibration when there is one.
+///
+/// Only call this after [`verify_persistence`] passed: the files must describe a
+/// model the device still holds.
+pub fn write_calibration(
+    files    : CalibrationFiles<'_>,
+    geometry : &DesktopGeometry,
+    config   : &RetrainConfig,
+    plan     : &RetrainPlan,
+    outcome  : &RetrainOutcome,
+    health   : Vec<HealthStop>,
+)
+    -> Result<Written, RetrainError>
+{
+    let report = BlobReport::of(&outcome.blob);
+    let lag_s  = Et5Calibration::load(files.calibration).map(|c| c.lag_s).unwrap_or(DEFAULT_LAG_S);
+
+    let out_geometry = geometry.outputs.iter()
+        .find(|o| o.name == config.display)
+        .ok_or_else(|| RetrainError::DisplayVanished(config.display.clone()))?;
+
+    let blob_kept = keep_previous(files.blob).map_err(|source| {
+        RetrainError::Write { path: files.blob.to_path_buf(), source: source }
+    })?;
+
+    std::fs::write(files.blob, &outcome.blob).map_err(|source| {
+        RetrainError::Write { path: files.blob.to_path_buf(), source: source }
+    })?;
+
+    let mut calibration = Et5Calibration {
+        format             : CALIBRATION_FORMAT,
+        created_unix_s     : Et5Calibration::now_unix_s(),
+        lag_s              : lag_s,
+        device_output      : Some(config.display.clone()),
+        device_area        : Some(plan.area),
+        device_blob_sha256 : Some(report.body_sha256.clone()),
+        device_result      : outcome.result.clone(),
+        outputs            : vec![OutputCalibration {
+            name           : config.display.clone(),
+            pose           : OutputPose {
+                position_mm : out_geometry.position_mm,
+                yaw_deg     : out_geometry.yaw_deg,
+                pitch_deg   : out_geometry.pitch_deg,
+                roll_deg    : out_geometry.roll_deg,
+            },
+            field          : FieldMap::identity(),
+            pose_rms_deg   : 0.0,
+            field_rms_norm : 0.0,
+            targets        : outcome.accepted,
+            head_gain      : None,
+        }],
+        health             : health,
+    };
+
+    let field = calibration.fit_field_from_health();
+
+    let calibration_kept = keep_previous(files.calibration).map_err(|source| {
+        RetrainError::Write { path: files.calibration.to_path_buf(), source: source }
+    })?;
+
+    calibration.save(files.calibration).map_err(RetrainError::Calibration)?;
+
+    Ok(Written {
+        report           : report,
+        field            : field,
+        blob_kept        : blob_kept,
+        calibration_kept : calibration_kept,
+    })
 }
 
 /// RMS and median of a health pass, degrees. `None` for an empty pass.
@@ -1883,6 +2094,14 @@ fn overlay_background() -> Option<[u8; 4]> {
     (packed != 0).then(|| packed.to_be_bytes())
 }
 
+/// The dot a round adapts on: the centre point if the plan has one, otherwise
+/// wherever the round starts. It only has to give the eye something to hold.
+fn anchor_point<'a>(plan: &'a RetrainPlan, round: &Round) -> Result<&'a TrainPoint, RetrainError> {
+    plan.points.get(4)
+        .or_else(|| round.points.first().and_then(|i| plan.points.get(*i)))
+        .ok_or(RetrainError::NoDisplays)
+}
+
 /// Draws the target: the pointer look's mark, a ring with the dot at its centre, its
 /// interior filling with `progress` (0 to 1) as the hold at it runs. No caption: what
 /// the user needs to know goes to the terminal.
@@ -1930,6 +2149,16 @@ pub enum RetrainError {
     },
     #[error("calibration seed: {0}")]
     Seed(String),
+    #[error("writing {path}: {source}")]
+    Write {
+        path   : PathBuf,
+        #[source]
+        source : std::io::Error,
+    },
+    #[error("the retrained display {0} vanished from the desk config")]
+    DisplayVanished(String),
+    #[error("writing the calibration file: {0}")]
+    Calibration(#[source] CalibrationError),
     #[error("the tracker dropped off the bus mid-ceremony ({0}); on this device that \
              is a firmware reboot, which resets the eye model to the factory blob")]
     TrackerLost(String),

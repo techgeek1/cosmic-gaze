@@ -3,7 +3,7 @@
 //! One object, `/dev/techgeek1/CosmicGaze`, on the well-known name
 //! `dev.techgeek1.CosmicGaze`, with the interface of the same name. Properties say what
 //! the session is doing ([`Status`]); three methods tell it to pause, resume, and forget
-//! the day's offset. The daemon implements the interface; the applet, and anything
+//! the session. The daemon implements the interface; the applet, and anything
 //! `busctl`-shaped, talks to it through [`GazeProxy`].
 //!
 //! Properties rather than a status struct so `busctl introspect` reads well, and so a
@@ -36,6 +36,8 @@ pub enum Mode {
     Pointing,
     /// An edge scroll is running.
     Scrolling,
+    /// The quick calibration is running on the tracker; no session until it ends.
+    Calibrating,
 }
 
 /// The daemon's properties, as one struct. Filled by the session loop, read by the
@@ -51,13 +53,6 @@ pub struct Status {
     /// Paused from the applet.
     pub paused           : bool,
     pub mode             : Mode,
-    /// Accepted clicks folded into the offset over the life of its state.
-    pub offset_updates   : u64,
-    /// Bias jumps adopted from a consensus of rejects.
-    pub offset_jumps     : u64,
-    /// The offset's global mean, degrees.
-    pub offset_yaw_deg   : f64,
-    pub offset_pitch_deg : f64,
 }
 
 /// The interface, as the client sees it. `zbus` derives an async `GazeProxy` and a
@@ -74,11 +69,20 @@ pub trait Gaze {
     /// Undoes `Pause`.
     fn resume(&self) -> zbus::Result<()>;
 
-    /// Forgets the day's offset: every anchor, back to the calibration alone.
-    fn reset_offset(&self) -> zbus::Result<()>;
+    /// Whether the applet's popup is open. The popup sits over whatever scrolls under
+    /// it, and the compositor reports layer surfaces but not their popups, so while it
+    /// is open no edge scroll starts and no band shows anywhere; a scroll already
+    /// running finishes.
+    fn set_popup_open(&self, open: bool) -> zbus::Result<()>;
 
-    /// Ends the session and exits the daemon, as SIGTERM would: the pointer is returned
-    /// and the offset saved. The applet's Stop button.
+    /// Runs the quick calibration: the session ends, five targets are shown on the
+    /// dimmed desktop, the on-device model is topped up and written out, and the next
+    /// session starts on it. `Mode` reads `calibrating` meanwhile. The applet's
+    /// Calibrate button.
+    fn calibrate(&self) -> zbus::Result<()>;
+
+    /// Ends the session and exits the daemon, as SIGTERM would: the pointer is returned.
+    /// The applet's Stop button.
     fn quit(&self) -> zbus::Result<()>;
 
     #[zbus(property)]
@@ -95,18 +99,6 @@ pub trait Gaze {
 
     #[zbus(property)]
     fn mode(&self) -> zbus::Result<String>;
-
-    #[zbus(property)]
-    fn offset_updates(&self) -> zbus::Result<u64>;
-
-    #[zbus(property)]
-    fn offset_jumps(&self) -> zbus::Result<u64>;
-
-    #[zbus(property)]
-    fn offset_yaw_deg(&self) -> zbus::Result<f64>;
-
-    #[zbus(property)]
-    fn offset_pitch_deg(&self) -> zbus::Result<f64>;
 }
 
 // --- Mode ---
@@ -119,7 +111,8 @@ impl Mode {
             Mode::Paused    => "paused",
             Mode::Reading   => "reading",
             Mode::Pointing  => "pointing",
-            Mode::Scrolling => "scrolling",
+            Mode::Scrolling   => "scrolling",
+            Mode::Calibrating => "calibrating",
         }
     }
 
@@ -130,8 +123,9 @@ impl Mode {
             "paused"    => Mode::Paused,
             "reading"   => Mode::Reading,
             "pointing"  => Mode::Pointing,
-            "scrolling" => Mode::Scrolling,
-            _           => Mode::NoTracker,
+            "scrolling"   => Mode::Scrolling,
+            "calibrating" => Mode::Calibrating,
+            _             => Mode::NoTracker,
         }
     }
 
@@ -142,7 +136,8 @@ impl Mode {
             Mode::Paused    => "Paused",
             Mode::Reading   => "Reading",
             Mode::Pointing  => "Pointing",
-            Mode::Scrolling => "Scrolling",
+            Mode::Scrolling   => "Scrolling",
+            Mode::Calibrating => "Calibrating",
         }
     }
 }
@@ -164,10 +159,6 @@ impl Status {
             controller       : get(props, "Controller").unwrap_or(false),
             paused           : get(props, "Paused").unwrap_or(false),
             mode             : get::<String>(props, "Mode").map(|s| Mode::parse(&s)).unwrap_or_default(),
-            offset_updates   : get(props, "OffsetUpdates").unwrap_or(0),
-            offset_jumps     : get(props, "OffsetJumps").unwrap_or(0),
-            offset_yaw_deg   : get(props, "OffsetYawDeg").unwrap_or(0.0),
-            offset_pitch_deg : get(props, "OffsetPitchDeg").unwrap_or(0.0),
         }
     }
 }
@@ -196,15 +187,13 @@ mod tests {
 
         props.insert("Tracker".to_string(),       OwnedValue::try_from(Value::Bool(true)).unwrap());
         props.insert("Mode".to_string(),          OwnedValue::try_from(Value::from("scrolling")).unwrap());
-        props.insert("OffsetUpdates".to_string(), OwnedValue::try_from(Value::U64(42)).unwrap());
-        props.insert("OffsetYawDeg".to_string(),  OwnedValue::try_from(Value::from("not a number")).unwrap());
+        props.insert("Paused".to_string(),        OwnedValue::try_from(Value::from("not a bool")).unwrap());
 
         let status = Status::from_properties(&props);
 
         assert!(status.tracker);
         assert!(!status.calibrated);
         assert_eq!(status.mode, Mode::Scrolling);
-        assert_eq!(status.offset_updates, 42);
-        assert_eq!(status.offset_yaw_deg, 0.0);
+        assert!(!status.paused);
     }
 }

@@ -17,13 +17,14 @@ use gaze_config::{CONFIG_ID, CONFIG_VERSION, KNOBS, Knob, Mode, Status, Tuning, 
 use tracing::warn;
 
 use crate::daemon;
-use crate::knobs::{format_offset, format_value};
+use crate::knobs::format_value;
 
 /// The applet's id, in the desktop entry and the panel config.
 const APP_ID: &str = "dev.techgeek1.CosmicGazeApplet";
 
-/// The panel icon. A symbolic theme icon, so it follows the panel's colour.
-const ICON_NAME: &str = "preferences-desktop-accessibility-symbolic";
+/// The panel icon: the eye shipped in `data/`, installed under hicolor by `just
+/// install`. Symbolic, so it follows the panel's colour.
+const ICON_NAME: &str = "dev.techgeek1.CosmicGazeApplet-symbolic";
 
 /// How often the daemon is asked for its state while the popup is closed.
 const POLL_CLOSED: Duration = Duration::from_secs(1);
@@ -75,10 +76,15 @@ pub enum Message {
     Started(Result<(), String>),
     /// Ask the daemon to exit.
     Stop,
+    /// The switch at the top: on runs the daemon, off asks it to exit.
+    SetRunning(bool),
     SetPaused(bool),
-    ResetOffset,
+    /// Ask the daemon for the quick calibration.
+    Calibrate,
     /// A fire-and-forget daemon call finished; poll again so the popup catches up.
     Called,
+    /// The daemon answered its first poll after a start.
+    Ready,
     ToggleAdvanced,
     /// A slider moved: the knob's key and its new value.
     SetKnob(&'static str, f64),
@@ -120,47 +126,74 @@ impl App {
         }
     }
 
-    /// The status rows of the popup.
-    fn status_rows(&self, spacing: &Spacing) -> Vec<Element<'_, Message>> {
-        let Some(status) = &self.status else {
-            return vec![padded_control(text::body("Not running")).into()];
+    /// The Status group: what the daemon is doing beside the switch that runs it, and
+    /// whether it is calibrated beside the button that calibrates it. Every row is
+    /// always there, so the popup never reflows as the daemon comes and goes.
+    fn status_group(&self, spacing: &Spacing) -> Vec<Element<'_, Message>> {
+        let running = self.status.is_some();
+
+        let state = match (&self.status, self.starting) {
+            (Some(s), _)       => (if s.paused { Mode::Paused } else { s.mode }).label(),
+            (None, Some(_))    => "Starting",
+            (None, None)       => "Not running",
         };
 
+        // The switch reads as on from the press until the daemon is on the bus or the
+        // start is given up on, so it does not flick back while the daemon comes up.
+        let on = running || self.starting.is_some();
+
+        let calibrated  = self.status.as_ref().is_some_and(|s| s.calibrated);
+        let calibrating = self.status.as_ref().is_some_and(|s| s.mode == Mode::Calibrating);
+
+        let calibrate = match (running, calibrating) {
+            (true, false) => widget::button::standard("Calibrate").on_press(Message::Calibrate),
+            (true, true)  => widget::button::standard("Calibrating"),
+            (false, _)    => widget::button::standard("Calibrate"),
+        };
+
+        vec![
+            padded_control(text::heading("Status")).into(),
+            padded_control(
+                row![
+                    text::body(state),
+                    widget::Space::new().width(Length::Fill),
+                    toggler(on).on_toggle(Message::SetRunning),
+                ]
+                .spacing(spacing.space_xs)
+                .align_y(Alignment::Center),
+            )
+            .into(),
+            padded_control(
+                row![
+                    dot(if calibrated { DOT_RUNNING } else { DOT_OFF }),
+                    text::body("Calibrated"),
+                    widget::Space::new().width(Length::Fill),
+                    calibrate,
+                ]
+                .spacing(spacing.space_xs)
+                .align_y(Alignment::Center),
+            )
+            .into(),
+        ]
+    }
+
+    /// The Gaze group: the tracker and the controller, lit when connected.
+    fn gaze_group(&self, spacing: &Spacing) -> Vec<Element<'_, Message>> {
         let flags = [
-            ("Tracker"    , status.tracker),
-            ("Calibrated" , status.calibrated),
-            ("Controller" , status.controller),
+            ("Tracker"    , self.status.as_ref().is_some_and(|s| s.tracker)),
+            ("Controller" , self.status.as_ref().is_some_and(|s| s.controller)),
         ];
 
-        let mut rows: Vec<Element<'_, Message>> = flags
-            .into_iter()
-            .map(|(label, on)| {
-                padded_control(
-                    row![dot(if on { DOT_RUNNING } else { DOT_OFF }), text::body(label)]
-                        .spacing(spacing.space_xs)
-                        .align_y(Alignment::Center),
-                )
-                .into()
-            })
-            .collect();
+        let mut rows: Vec<Element<'_, Message>> = vec![padded_control(text::heading("Gaze")).into()];
 
-        let mode = if status.paused { Mode::Paused } else { status.mode };
-
-        rows.push(padded_control(
-            row![
-                text::body("Mode"),
-                widget::Space::new().width(Length::Fill),
-                text::body(mode.label()),
-            ]
-            .align_y(Alignment::Center),
-        ).into());
-
-        rows.push(padded_control(text::caption(format_offset(
-            status.offset_yaw_deg,
-            status.offset_pitch_deg,
-            status.offset_updates,
-            status.offset_jumps,
-        ))).into());
+        rows.extend(flags.into_iter().map(|(label, on)| {
+            padded_control(
+                row![dot(if on { DOT_RUNNING } else { DOT_OFF }), text::body(label)]
+                    .spacing(spacing.space_xs)
+                    .align_y(Alignment::Center),
+            )
+            .into()
+        }));
 
         rows
     }
@@ -247,7 +280,7 @@ impl cosmic::Application for App {
         match message {
             Message::TogglePopup => {
                 if let Some(id) = self.popup.take() {
-                    return destroy_popup(id);
+                    return Task::batch(vec![destroy_popup(id), popup_open(false)]);
                 }
 
                 let id = window::Id::unique();
@@ -262,12 +295,14 @@ impl cosmic::Application for App {
                     None,
                 );
 
-                return Task::batch(vec![get_popup(settings), self.poll()]);
+                return Task::batch(vec![get_popup(settings), popup_open(true), self.poll()]);
             }
 
             Message::PopupClosed(id) => {
                 if self.popup == Some(id) {
                     self.popup = None;
+
+                    return popup_open(false);
                 }
             }
 
@@ -275,13 +310,20 @@ impl cosmic::Application for App {
 
             Message::Status(status) => {
                 self.polling = false;
-                self.status  = status;
+
+                let came_up = status.is_some() && self.status.is_none();
+
+                self.status = status;
 
                 // Up, or given up on.
                 if self.status.is_some()
                     || self.starting.is_some_and(|since| since.elapsed() > STARTING_GRACE)
                 {
                     self.starting = None;
+                }
+
+                if came_up {
+                    return self.update(Message::Ready);
                 }
             }
 
@@ -300,6 +342,17 @@ impl cosmic::Application for App {
                 }
 
                 return self.poll();
+            }
+
+            Message::Ready => {
+                // A daemon that came up while the popup was open has not been told.
+                return popup_open(self.popup.is_some());
+            }
+
+            Message::SetRunning(on) => {
+                let next = if on { Message::Start } else { Message::Stop };
+
+                return self.update(next);
             }
 
             Message::Stop => {
@@ -323,9 +376,14 @@ impl cosmic::Application for App {
                 });
             }
 
-            Message::ResetOffset => {
+            Message::Calibrate => {
+                // Shown at once; the next poll says whether it took.
+                if let Some(status) = self.status.as_mut() {
+                    status.mode = Mode::Calibrating;
+                }
+
                 return cosmic::task::future(async {
-                    daemon::reset_offset().await;
+                    daemon::calibrate().await;
 
                     Message::Called
                 });
@@ -400,40 +458,16 @@ impl cosmic::Application for App {
 
         let mut content = column![].spacing(space_xxs).width(Length::Fixed(POPUP_WIDTH));
 
-        content = content.push(padded_control(text::heading("Gaze")));
-
-        for row in self.status_rows(&spacing) {
+        for row in self.status_group(&spacing) {
             content = content.push(row);
         }
 
-        // --- controls ---
+        content = content.push(
+            padded_control(widget::divider::horizontal::default()).padding([space_xxs, space_s]),
+        );
 
-        let running = self.status.is_some();
-
-        let run_button = match (running, self.starting) {
-            (true,  _)       => widget::button::standard("Stop").on_press(Message::Stop),
-            (false, Some(_)) => widget::button::standard("Starting"),
-            (false, None)    => widget::button::suggested("Start").on_press(Message::Start),
-        };
-
-        content = content.push(padded_control(run_button));
-
-        if running {
-            let paused = self.status.as_ref().is_some_and(|s| s.paused);
-
-            content = content.push(padded_control(
-                row![
-                    text::body("Paused"),
-                    widget::Space::new().width(Length::Fill),
-                    toggler(paused).on_toggle(Message::SetPaused),
-                ]
-                .spacing(space_xs)
-                .align_y(Alignment::Center),
-            ));
-
-            content = content.push(padded_control(
-                widget::button::standard("Reset offset").on_press(Message::ResetOffset),
-            ));
+        for row in self.gaze_group(&spacing) {
+            content = content.push(row);
         }
 
         content = content.push(
@@ -459,6 +493,18 @@ impl cosmic::Application for App {
         ));
 
         if self.advanced {
+            let paused = self.status.as_ref().is_some_and(|s| s.paused);
+
+            content = content.push(padded_control(
+                row![
+                    text::body("Paused"),
+                    widget::Space::new().width(Length::Fill),
+                    toggler(paused).on_toggle(Message::SetPaused),
+                ]
+                .spacing(space_xs)
+                .align_y(Alignment::Center),
+            ));
+
             content = content.push(padded_control(
                 row![
                     text::body("Highlight text"),
@@ -512,6 +558,15 @@ impl cosmic::Application for App {
 // --- Widgets ---
 
 /// An 8 px dot in `color`, for the status rows.
+/// Tells the daemon the popup's state, then polls.
+fn popup_open(open: bool) -> app::Task<Message> {
+    cosmic::task::future(async move {
+        daemon::set_popup_open(open).await;
+
+        Message::Called
+    })
+}
+
 fn dot(color: Color) -> Element<'static, Message> {
     dot_sized(color, 8.0)
 }

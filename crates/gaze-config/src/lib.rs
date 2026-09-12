@@ -8,7 +8,7 @@
 //! * [`Tuning`] is every number the feel still depends on, one cosmic-config key per
 //!   field under [`CONFIG_ID`]; [`KNOBS`] describes the numeric ones so a UI can draw
 //!   them without naming any. [`TuningStore`] reads the config and watches it.
-//! * [`Paths`] is where the desk file, the calibration, the ONNX models and the offset
+//! * [`Paths`] is where the desk file, the calibration, the ONNX models and the state
 //!   live, XDG by default and a checkout's layout on request.
 //! * [`bus`] is the daemon's D-Bus name, path, proxy and the [`Status`] its properties
 //!   describe.

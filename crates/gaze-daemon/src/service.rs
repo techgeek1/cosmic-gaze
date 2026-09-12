@@ -49,10 +49,15 @@ impl Service {
         self.live.set_paused(false);
     }
 
-    /// Forgets the day's offset: every anchor, back to the calibration alone.
-    fn reset_offset(&self) {
-        info!("offset reset requested");
-        self.live.request_reset_offset();
+    /// The applet's popup opened or closed. See `Live::set_popup_open`.
+    fn set_popup_open(&self, open: bool) {
+        self.live.set_popup_open(open);
+    }
+
+    /// Runs the quick calibration between sessions. See `supervise::calibrate`.
+    fn calibrate(&self) {
+        info!("calibration requested");
+        self.live.request_calibrate();
     }
 
     /// Ends the session and exits, as a signal would.
@@ -84,25 +89,5 @@ impl Service {
     #[zbus(property)]
     fn mode(&self) -> String {
         self.live.status().mode.as_str().to_string()
-    }
-
-    #[zbus(property)]
-    fn offset_updates(&self) -> u64 {
-        self.live.status().offset_updates
-    }
-
-    #[zbus(property)]
-    fn offset_jumps(&self) -> u64 {
-        self.live.status().offset_jumps
-    }
-
-    #[zbus(property)]
-    fn offset_yaw_deg(&self) -> f64 {
-        self.live.status().offset_yaw_deg
-    }
-
-    #[zbus(property)]
-    fn offset_pitch_deg(&self) -> f64 {
-        self.live.status().offset_pitch_deg
     }
 }

@@ -18,8 +18,10 @@ pub struct Live {
     /// Set by [`Live::set_tuning`], cleared when the loop takes the change.
     tuning_changed : AtomicBool,
     paused         : AtomicBool,
-    /// Set by [`Live::request_reset_offset`], cleared when the loop acts on it.
-    reset_offset   : AtomicBool,
+    popup_open     : AtomicBool,
+    /// Set by [`Live::request_calibrate`]; the loop ends when it sees it, the owner
+    /// clears it with [`Live::take_calibrate`] once the loop has returned.
+    calibrate      : AtomicBool,
     stop           : AtomicBool,
     status         : Mutex<Status>,
 }
@@ -33,7 +35,8 @@ impl Live {
             tuning         : Mutex::new(tuning),
             tuning_changed : AtomicBool::new(false),
             paused         : AtomicBool::new(false),
-            reset_offset   : AtomicBool::new(false),
+            popup_open     : AtomicBool::new(false),
+            calibrate      : AtomicBool::new(false),
             stop           : AtomicBool::new(false),
             status         : Mutex::new(Status::default()),
         })
@@ -68,14 +71,31 @@ impl Live {
         self.paused.load(Ordering::Relaxed)
     }
 
-    /// Asks the loop to forget the day's offset.
-    pub fn request_reset_offset(&self) {
-        self.reset_offset.store(true, Ordering::Relaxed);
+    /// Whether the applet's popup is open. Open, it covers whatever scrolls under it
+    /// and the compositor cannot say where, so the loop starts no edge scroll and
+    /// shows no band until it closes.
+    pub fn set_popup_open(&self, open: bool) {
+        self.popup_open.store(open, Ordering::Relaxed);
     }
 
-    /// Whether a reset was asked for since the last call.
-    pub fn take_reset_offset(&self) -> bool {
-        self.reset_offset.swap(false, Ordering::Relaxed)
+    pub fn popup_open(&self) -> bool {
+        self.popup_open.load(Ordering::Relaxed)
+    }
+
+    /// Asks for the quick calibration. The loop ends as for a stop, and the owner runs
+    /// the ceremony on the released tracker before starting the next session.
+    pub fn request_calibrate(&self) {
+        self.calibrate.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a calibration is wanted. The loop's exit condition; not cleared here.
+    pub fn calibrate_requested(&self) -> bool {
+        self.calibrate.load(Ordering::Relaxed)
+    }
+
+    /// Whether a calibration was asked for since the last call, clearing it.
+    pub fn take_calibrate(&self) -> bool {
+        self.calibrate.swap(false, Ordering::Relaxed)
     }
 
     /// Asks the loop to end. It notices within one sample interval.
@@ -138,10 +158,12 @@ mod tests {
     fn flags_are_taken_once_and_status_is_what_was_last_set() {
         let live = Live::new(Tuning::default());
 
-        live.request_reset_offset();
+        live.request_calibrate();
 
-        assert!(live.take_reset_offset());
-        assert!(!live.take_reset_offset());
+        assert!(live.calibrate_requested());
+        assert!(live.take_calibrate());
+        assert!(!live.take_calibrate());
+        assert!(!live.calibrate_requested());
 
         let status = Status { tracker: true, ..Status::default() };
 

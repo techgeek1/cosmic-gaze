@@ -31,7 +31,7 @@
 //!
 //! The owner can pause it (nothing drawn or injected, the tracker still streaming),
 //! replace the tuning (the filter stack and snap engine are rebuilt, everything else
-//! takes its new parameters in place), ask for the offset to be forgotten, and stop it;
+//! takes its new parameters in place), and stop it;
 //! it reports a [`Status`] in return. All through [`Live`].
 
 use std::sync::Arc;
@@ -42,9 +42,8 @@ use crossbeam_channel::{Receiver, TryRecvError};
 use gaze_config::{Mode, Status, Tuning};
 use gaze_core::{DesktopGeometry, Element, ElementKind, GazeSample, GlobalPx};
 use gaze_daydream::DaydreamError;
-use gaze_inject::{Button as InjectButton, Injector, Key};
+use gaze_inject::{Backend, Button as InjectButton, DeskLayout, Injector, Key};
 use gaze_overlay::{Overlay, OverlayState, Pointer, Target, Zone};
-use gaze_provider_et5::ClickFeedback;
 use gaze_snap::{FixationState, Filtered, SnapEngine};
 use tracing::{debug, error, info, warn};
 
@@ -54,7 +53,6 @@ use crate::config::{
 };
 use crate::daydream::{Daydream, DaydreamConfig};
 use crate::edge_scroll::{APPROACH_FRACTION, Action as EdgeAction, EdgeScroller, Eyes, Scrollable};
-use crate::feedback::{self, ClickFeed, Press};
 use crate::keys::LatchKeys;
 use crate::live::Live;
 use crate::perception::{ElementStore, Perception, PerceptionConfig};
@@ -221,7 +219,9 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
             warn!("clicks are live: committed targets will be clicked for real");
             warn!("edge scrolling is live: surfaces under a dwelling gaze will scroll, and the pointer will be borrowed for it");
 
-            Some(Injector::create().context("creating the uinput injector")?)
+            let layout = DeskLayout::from_geometry(geometry).context("desk layout for the injector")?;
+
+            Some(Injector::create_with(Backend::default(), &layout).context("creating the uinput injector")?)
         }
         else {
             info!("dry run: commits, scrolls and warps will be logged, not injected");
@@ -237,13 +237,6 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
     // --- controller ---
 
     let mut daydream = DaydreamSlot::new(&config.daydream, daydream_config(&tuning));
-
-    // --- click feedback ---
-
-    // The real mouse is read when a source learns from its clicks. The feed stamps
-    // the source's clock; nothing else reads those timestamps.
-    let labels     = source.click_clock().is_some();
-    let mut clicks = feedback::open_if_useful(source.click_clock());
 
     // --- filters and snap ---
 
@@ -347,6 +340,14 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
             break;
         }
 
+        // The ceremony needs the tracker to itself; the owner runs it once this
+        // session has let go, then starts the next one on the new model.
+        if live.calibrate_requested() {
+            reason = "a calibrate request";
+
+            break;
+        }
+
         // A tuning change rebuilds what is built from it and hands the rest their new
         // parameters. The filter and the engine start cold, which costs one fixation.
         if let Some(t) = live.take_tuning_change() {
@@ -369,10 +370,6 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
             tuning = t;
         }
 
-        if live.take_reset_offset() {
-            source.reset_offset();
-        }
-
         // A paired controller that was asleep may have woken; a connect that finished
         // lands here.
         daydream.poll();
@@ -385,17 +382,6 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
             last_gen = generation;
 
             debug!(count = elements.len(), generation = generation, "elements updated");
-        }
-
-        // Real clicks feed the source's online offset. Before the controls, so a press
-        // is attributed against the rays that preceded it and not against a sample
-        // drawn after it.
-        if let Some(feed) = clicks.as_mut() {
-            let presses = feed.presses(warper.last_point());
-
-            if labels {
-                offer_clicks(feed, &mut source, presses);
-            }
         }
 
         // Controls before samples: a commit should not wait out a sample tick.
@@ -434,7 +420,7 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
                         })
                         .or(marked);
 
-                    let clicked = commit(
+                    commit(
                         &mut engine,
                         if paused { None } else { injector.as_mut() },
                         &mut board,
@@ -443,14 +429,6 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
                         at,
                         button,
                     );
-
-                    // A pad commit is a gaze label like a mouse press is: the user was
-                    // looking at what they committed.
-                    if let (Some(px), Some(sample)) = (clicked, last_sample) {
-                        let feedback = source.observe_click(px, sample.t_s);
-
-                        log_click_feedback("pad", px, feedback);
-                    }
                 }
 
                 Control::Exit => {
@@ -653,7 +631,17 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
         // all this sample, and a scroll that starts here takes the highlight down with it.
         let (scrolling, zone) = {
             let was                = scroller.scrolling();
-            let quiet              = input || paused;
+            // A gaze on a layer surface above the windows (the panel, shown or
+            // auto-shown; a notification) is not on the window under it, so no scroll
+            // starts and no band shows there. The applet's popup is over a window too,
+            // but the compositor does not report popups, so while it is open the same
+            // holds everywhere. A scroll already running keeps going: its parked
+            // pointer at the screen's edge is what shows an auto-hidden panel, and
+            // the band it is scrolling has not moved.
+            let covered            = !was
+                && (live.popup_open()
+                    || gaze.is_some_and(|g| overlay.occluders().iter().any(|o| o.rect.contains(g))));
+            let quiet              = input || paused || covered;
             let (stopped, surface) = edge_scroll(
                 &mut scroller,
                 &mut surfaces,
@@ -943,10 +931,6 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
         _                           => None,
     };
 
-    if let Some(feed) = clicks.as_mut() {
-        feed.stop();
-    }
-
     source.stop();
     daydream.stop();
 
@@ -1078,75 +1062,6 @@ fn commit(
 
     click_at
 }
-
-// --- Click feedback ---
-
-/// Hands every new real press to the source and tallies what it made of it. One log
-/// line per press, because a user tuning the feel wants to see each leftover as it
-/// happens.
-fn offer_clicks(feed: &mut ClickFeed, source: &mut GazeSource, presses: Vec<Press>) {
-    for press in presses {
-        feed.offered += 1;
-
-        let feedback = source.observe_click(press.px, press.t_s);
-
-        log_click_feedback("mouse", press.px, feedback);
-
-        match feedback {
-            Some(ClickFeedback::Accepted { .. }) => feed.accepted += 1,
-            Some(ClickFeedback::Adopted { .. })  => feed.adopted += 1,
-            Some(ClickFeedback::Rejected { .. }) => feed.rejected += 1,
-            None                                 => feed.unplaced += 1,
-        }
-    }
-}
-
-/// One line per label offered to the source's online offset, whatever offered it.
-fn log_click_feedback(via: &str, px: GlobalPx, feedback: Option<ClickFeedback>) {
-    match feedback {
-        Some(ClickFeedback::Accepted { leftover_deg, offset_deg, anchors }) => {
-            info!(
-                via = via,
-                x = px.x, y = px.y,
-                leftover_yaw_deg   = format_args!("{:+.2}", leftover_deg[0]),
-                leftover_pitch_deg = format_args!("{:+.2}", leftover_deg[1]),
-                offset_yaw_deg     = format_args!("{:+.2}", offset_deg[0]),
-                offset_pitch_deg   = format_args!("{:+.2}", offset_deg[1]),
-                anchors            = anchors,
-                "click accepted",
-            );
-        }
-        Some(ClickFeedback::Rejected { leftover_deg }) => {
-            info!(
-                via = via,
-                x = px.x, y = px.y,
-                leftover_yaw_deg   = format_args!("{:+.2}", leftover_deg[0]),
-                leftover_pitch_deg = format_args!("{:+.2}", leftover_deg[1]),
-                "click rejected: past the gate",
-            );
-        }
-        Some(ClickFeedback::Adopted { leftover_deg, jump_deg, offset_deg, anchors, clicks }) => {
-            warn!(
-                via = via,
-                x = px.x, y = px.y,
-                leftover_yaw_deg   = format_args!("{:+.2}", leftover_deg[0]),
-                leftover_pitch_deg = format_args!("{:+.2}", leftover_deg[1]),
-                jump_yaw_deg       = format_args!("{:+.2}", jump_deg[0]),
-                jump_pitch_deg     = format_args!("{:+.2}", jump_deg[1]),
-                offset_yaw_deg     = format_args!("{:+.2}", offset_deg[0]),
-                offset_pitch_deg   = format_args!("{:+.2}", offset_deg[1]),
-                anchors            = anchors,
-                clicks             = clicks,
-                "click adopted: the last few rejects agreed, the bias jumped",
-            );
-        }
-        None => {
-            debug!(via = via, x = px.x, y = px.y, "click unplaced: no rays or no panel");
-        }
-    }
-}
-
-// --- Scroll and warp ---
 
 /// Injects one wheel event from the controller's volume keys at the pointer, wherever it
 /// is. No warp: with the thumb up the pointer is the user's, and a wheel where it sits
@@ -1377,14 +1292,14 @@ fn pointer_position(injector: Option<&mut Injector>, warper: &Warper) -> Option<
 /// `p` pulled into the nearest enabled output, so a refine cannot run the point off the
 /// desk. A point already on an output is returned as is.
 fn clamp_to_desk(geometry: &DesktopGeometry, p: GlobalPx) -> GlobalPx {
-    if geometry.output_at(p).is_some() {
+    if geometry.output_at(p).is_some_and(|o| o.detect) {
         return p;
     }
 
     geometry
         .outputs
         .iter()
-        .filter(|o| o.enabled)
+        .filter(|o| o.enabled && o.detect)
         .map(|o| {
             let a = o.uv_to_px(0.0, 0.0);
             let b = o.uv_to_px(1.0, 1.0);
@@ -1423,7 +1338,6 @@ fn status_of(
     -> Status
 {
     let tracker = source.connected();
-    let offset  = source.offset_summary();
 
     let mode = match (tracker, paused, scrolling, input) {
         (false, _, _, _)   => Mode::NoTracker,
@@ -1439,10 +1353,6 @@ fn status_of(
         controller       : daydream.daydream.as_ref().is_some_and(Daydream::connected),
         paused           : paused,
         mode             : mode,
-        offset_updates   : offset.map_or(0, |o| o.updates),
-        offset_jumps     : offset.map_or(0, |o| o.jumps),
-        offset_yaw_deg   : offset.map_or(0.0, |o| o.global_deg[0]),
-        offset_pitch_deg : offset.map_or(0.0, |o| o.global_deg[1]),
     }
 }
 

@@ -21,6 +21,11 @@
 //! handled here, including outputs at a scale other than 1 and boxes that straddle the
 //! seam between two panels.
 //!
+//! The overlay also reports back: sitting on the overlay layer, it is told by
+//! cosmic-comp which other layer surfaces overlap it, so [`OverlayHandle::occluders`]
+//! is where the panel is (an auto-hidden one only while it shows), and the session
+//! knows a gaze there is not on the window underneath.
+//!
 //! # Using it from another thread
 //!
 //! The Wayland connection is not `Send`, so the usual pattern is to give the overlay its
@@ -75,4 +80,4 @@ pub use present::{PointerStyle, Presenter};
 pub use state::{Mark, OverlayState, Pointer, Target, Zone};
 pub use theme::{Theme, ThemeWatch};
 pub use tiny_skia::Pixmap;
-pub use wayland::{Overlay, OverlayHandle};
+pub use wayland::{Occluder, Overlay, OverlayHandle};

@@ -22,15 +22,13 @@ use gaze_provider_et5::blob::{
     decode_trailer, first_difference,
 };
 use gaze_provider_et5::calibration::{
-    CALIBRATION_FORMAT, Et5Calibration, FieldFit, MIN_HEALTH_ROWS, OutputCalibration,
-    OutputPose, VIRTUAL_AREA,
+    CALIBRATION_FORMAT, Et5Calibration, FieldFit, MIN_HEALTH_ROWS, VIRTUAL_AREA,
 };
-use gaze_provider_et5::field::FieldMap;
 use gaze_provider_et5::device::{ConnectOptions, Device};
 use gaze_provider_et5::gaze::combined_ray;
 use gaze_provider_et5::provider::Et5Provider;
-use gaze_provider_et5::retrain::{self, RetrainConfig, RetrainError, RetrainKey};
-use gaze_provider_et5::calibration::{desk_to_sensor, plane_corners};
+use gaze_provider_et5::retrain::{self, Background, RetrainConfig, RetrainError, RetrainKey};
+use gaze_provider_et5::calibration::{desk_to_sensor, load_tracker_pitch, plane_corners};
 use gaze_daydream::{Button, Buttons, Controller};
 use crossbeam_channel::{Receiver, Sender};
 use gaze_provider_et5::ttp::{DisplayArea, DisplayRect};
@@ -440,23 +438,6 @@ fn load_geometry(path: &std::path::Path) -> Result<DesktopGeometry> {
         .with_context(|| format!("reading {}", path.display()))?;
 
     DesktopGeometry::from_toml(&text).context("parsing desk geometry")
-}
-
-/// The sensor-frame pitch from the desk config, degrees. Lives in `desk.toml` as a
-/// top-level `tracker_pitch_deg`; the core geometry parser ignores keys it does not
-/// know, so it is read separately here.
-///
-/// Goes through `toml::from_str` rather than `str::parse`: since toml 0.9 `FromStr for
-/// Value` parses a single TOML *value*, not a document, so parsing a config file that way
-/// fails at line 1 column 1 and this silently returned 0. That is what left the trained
-/// plane in `calibration-et5.toml` declared in the desk frame instead of the sensor
-/// frame.
-fn load_tracker_pitch(path: &std::path::Path) -> f64 {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
-        .and_then(|v| v.get("tracker_pitch_deg").and_then(toml::Value::as_float))
-        .unwrap_or(0.0)
 }
 
 // --- Commands ---
@@ -1314,6 +1295,7 @@ fn health_cmd(
         display           : name.clone(),
         tracker_pitch_deg : load_tracker_pitch(config),
         health_steps      : grid.max(2),
+        health_background : Background::Neutral,
         ..RetrainConfig::default()
     };
 
@@ -1426,6 +1408,7 @@ fn calibrate(args: CalibrateArgs) -> Result<()> {
         suggest           : args.suggest,
         manual            : args.manual,
         health_steps      : args.health_grid.max(2),
+        health_background : Background::Neutral,
     };
 
     let plan = retrain::plan(&geometry, &retrain_config)?;
@@ -1545,8 +1528,6 @@ fn calibrate(args: CalibrateArgs) -> Result<()> {
         println!("  point suggestion {line}");
     }
 
-    let report = BlobReport::of(&outcome.blob);
-
     // The health check reads the model that was just committed. A failure here loses
     // numbers, not the retrain, so it never stops the files being written.
     println!("health check: {} stops, a second each, eyes on the dot",
@@ -1616,63 +1597,28 @@ fn calibrate(args: CalibrateArgs) -> Result<()> {
     println!("the tracker still holds the committed model ({} bytes)",
              persistence.retrieved_len);
 
-    // The blob first: it is the only artefact that cannot be recreated without the
-    // user sitting down again.
-    let lag_s = Et5Calibration::load(out).map(|c| c.lag_s).unwrap_or(retrain::DEFAULT_LAG_S);
+    let written = retrain::write_calibration(
+        retrain::CalibrationFiles { blob: blob_path, calibration: out },
+        &geometry, &retrain_config, &plan, &outcome, health,
+    )?;
 
-    if let Some(kept) = retrain::keep_previous(blob_path)? {
+    if let Some(kept) = &written.blob_kept {
         println!("previous blob kept at {}", kept.display());
     }
 
-    std::fs::write(blob_path, &outcome.blob)
-        .with_context(|| format!("writing {}", blob_path.display()))?;
-    println!("device blob backed up to {} ({report})", blob_path.display());
+    println!("device blob backed up to {} ({})", blob_path.display(), written.report);
 
     let out_geometry = geometry.outputs.iter()
         .find(|o| o.name == retrain_config.display)
         .context("the retrained display vanished from the desk config")?;
 
-    let calibration = Et5Calibration {
-        format             : CALIBRATION_FORMAT,
-        created_unix_s     : Et5Calibration::now_unix_s(),
-        lag_s              : lag_s,
-        device_output      : Some(retrain_config.display.clone()),
-        device_area        : Some(plan.area),
-        device_blob_sha256 : Some(report.body_sha256.clone()),
-        device_result      : outcome.result.clone(),
-        outputs            : vec![OutputCalibration {
-            name           : retrain_config.display.clone(),
-            // The desk pose as configured: the retrain declares the measured plane
-            // and fits nothing, so there is no solved pose to prefer over it.
-            pose           : OutputPose {
-                position_mm : out_geometry.position_mm,
-                yaw_deg     : out_geometry.yaw_deg,
-                pitch_deg   : out_geometry.pitch_deg,
-                roll_deg    : out_geometry.roll_deg,
-            },
-            // Replaced below by the field fitted from the health check, when it
-            // beats leaving the firmware's mapping alone.
-            field          : FieldMap::identity(),
-            pose_rms_deg   : 0.0,
-            field_rms_norm : 0.0,
-            targets        : outcome.accepted,
-            head_gain      : None,
-        }],
-        health             : health,
-    };
+    report_field_fit(written.field, out_geometry);
 
-    let mut calibration = calibration;
-
-    report_field_fit(calibration.fit_field_from_health(), out_geometry);
-
-    if let Some(kept) = retrain::keep_previous(out)? {
+    if let Some(kept) = &written.calibration_kept {
         println!("previous calibration kept at {}", kept.display());
     }
 
-    calibration.save(out)
-        .with_context(|| format!("writing {}", out.display()))?;
     println!("calibration written to {}", out.display());
-    println!("the online offset is keyed to blob {} and starts over under it", report.short());
 
     Ok(())
 }

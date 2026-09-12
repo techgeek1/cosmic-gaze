@@ -8,6 +8,12 @@
 //! origins gives each window a rectangle on the same desk the pointer and the captures
 //! use.
 //!
+//! Workspaces come from `ext_workspace_manager_v1`: which are active, and (through the
+//! cosmic handle's `ext_workspace_enter`) which each window is on. A window on no active
+//! workspace is not on screen however recently it was focused, and the compositor keeps
+//! reporting its geometry, so [`ToplevelTracker::at`] leaves it out. A compositor
+//! without the workspace global, or a handle that never named one, counts as visible.
+//!
 //! The protocol carries no stacking order, and it matters: two maximised windows on one
 //! output have identical rectangles, and only one of them is on screen. What the
 //! tracker does see is *activation over time*, and focus is a good proxy for the top of
@@ -40,6 +46,14 @@ use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_tople
 };
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::{
     EVT_TOPLEVEL_OPCODE, Event as ListEvent, ExtForeignToplevelListV1,
+};
+use wayland_protocols::ext::workspace::v1::client::ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1;
+use wayland_protocols::ext::workspace::v1::client::ext_workspace_handle_v1::{
+    Event as WorkspaceEvent, ExtWorkspaceHandleV1, State as WorkspaceState,
+};
+use wayland_protocols::ext::workspace::v1::client::ext_workspace_manager_v1::{
+    EVT_WORKSPACE_GROUP_OPCODE, EVT_WORKSPACE_OPCODE, Event as WorkspaceManagerEvent,
+    ExtWorkspaceManagerV1,
 };
 use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_manager_v1::ZxdgOutputManagerV1;
 use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_v1::{
@@ -74,6 +88,9 @@ pub struct Toplevel {
     /// Has keyboard focus.
     pub activated  : bool,
     pub minimized  : bool,
+    /// On an active workspace, so on screen as far as workspaces go. True when the
+    /// compositor offers no workspace list or never placed this window on one.
+    pub visible    : bool,
     pub fullscreen : bool,
     /// When this window was last activated, as a rank among the tracker's observations:
     /// higher is more recent, zero is never while the tracker was watching.
@@ -113,12 +130,17 @@ impl ToplevelTracker {
                 interface: "zcosmic_toplevel_info_v1 (version 2)",
             })?;
 
+        // Optional: without it every window counts as visible.
+        let workspaces: Option<ExtWorkspaceManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+
         let mut state = ToplevelState {
-            xdg_mgr   : xdg_mgr,
-            info      : info,
-            outputs   : Vec::new(),
-            toplevels : Vec::new(),
-            focus_seq : 0,
+            xdg_mgr    : xdg_mgr,
+            info       : info,
+            _workspace : workspaces,
+            outputs    : Vec::new(),
+            toplevels  : Vec::new(),
+            workspaces : Vec::new(),
+            focus_seq  : 0,
         };
 
         let registry = globals.registry().clone();
@@ -131,7 +153,8 @@ impl ToplevelTracker {
         }
 
         // The list must be bound after the outputs are known, or the first geometry
-        // events would name outputs the tracker cannot resolve yet.
+        // events would name outputs the tracker cannot resolve yet. The same round trip
+        // brings the workspace handles, which the toplevels' workspace events name.
         queue
             .roundtrip(&mut state)
             .map_err(|e| CaptureError::Protocol { detail: e.to_string() })?;
@@ -250,6 +273,7 @@ impl ToplevelTracker {
                     output     : info.name,
                     activated  : entry.activated,
                     minimized  : entry.minimized,
+                    visible    : self.state.visible(entry),
                     fullscreen : entry.fullscreen,
                     focus_rank : entry.focus_rank,
                 });
@@ -261,12 +285,12 @@ impl ToplevelTracker {
 
     /// The window most likely on top at `p`: the most recently activated one containing
     /// the point, then the currently activated one, then the smallest containing one.
-    /// Minimized windows never match.
+    /// Minimized windows and windows on no active workspace never match.
     pub fn at(&self, p: GlobalPx) -> Option<Toplevel> {
         let containing: Vec<Toplevel> = self
             .toplevels()
             .into_iter()
-            .filter(|t| !t.minimized && t.rect.contains(p))
+            .filter(|t| !t.minimized && t.visible && t.rect.contains(p))
             .collect();
 
         containing
@@ -280,12 +304,22 @@ impl ToplevelTracker {
 
 /// Everything the event handlers read and write.
 struct ToplevelState {
-    xdg_mgr   : ZxdgOutputManagerV1,
-    info      : ZcosmicToplevelInfoV1,
-    outputs   : Vec<OutputEntry>,
-    toplevels : Vec<ToplevelEntry>,
+    xdg_mgr    : ZxdgOutputManagerV1,
+    info       : ZcosmicToplevelInfoV1,
+    /// Held so the workspace events keep coming; `None` without the global.
+    _workspace : Option<ExtWorkspaceManagerV1>,
+    outputs    : Vec<OutputEntry>,
+    toplevels  : Vec<ToplevelEntry>,
+    /// Every workspace the compositor announced, with whether it is active.
+    workspaces : Vec<WorkspaceEntry>,
     /// Activations seen so far; the next one gets this plus one.
-    focus_seq : u64,
+    focus_seq  : u64,
+}
+
+/// One workspace and the one thing the tracker wants of it.
+struct WorkspaceEntry {
+    handle : ExtWorkspaceHandleV1,
+    active : bool,
 }
 
 /// One toplevel's handles and the properties received so far.
@@ -303,6 +337,9 @@ struct ToplevelEntry {
     fullscreen : bool,
     /// See [`Toplevel::focus_rank`].
     focus_rank : u64,
+    /// Object ids of the workspaces this window is on. Empty until the compositor
+    /// says, which counts as visible.
+    workspaces : Vec<ObjectId>,
 }
 
 /// A window's rectangle relative to one output.
@@ -325,6 +362,17 @@ impl ToplevelState {
     /// The entry whose foreign handle is `id`.
     fn by_handle(&mut self, id: &ObjectId) -> Option<&mut ToplevelEntry> {
         self.toplevels.iter_mut().find(|t| t.handle.id() == *id)
+    }
+
+    /// Whether `entry` is on an active workspace, or on none the tracker knows of.
+    fn visible(&self, entry: &ToplevelEntry) -> bool {
+        if entry.workspaces.is_empty() {
+            return true;
+        }
+
+        entry.workspaces.iter().any(|id| {
+            self.workspaces.iter().any(|w| w.handle.id() == *id && w.active)
+        })
     }
 
     /// Drops an entry and its proxies.
@@ -440,6 +488,7 @@ impl Dispatch<ExtForeignToplevelListV1, ()> for ToplevelState {
                 minimized  : false,
                 fullscreen : false,
                 focus_rank : 0,
+                workspaces : Vec::new(),
             });
         }
     }
@@ -572,6 +621,20 @@ impl Dispatch<ZcosmicToplevelHandleV1, ()> for ToplevelState {
                 }
             }
 
+            CosmicEvent::ExtWorkspaceEnter { workspace } => {
+                if let Some(entry) = state.by_cosmic(&id)
+                    && !entry.workspaces.contains(&workspace.id())
+                {
+                    entry.workspaces.push(workspace.id());
+                }
+            }
+
+            CosmicEvent::ExtWorkspaceLeave { workspace } => {
+                if let Some(entry) = state.by_cosmic(&id) {
+                    entry.workspaces.retain(|w| *w != workspace.id());
+                }
+            }
+
             CosmicEvent::Closed => {
                 state.close(&id);
             }
@@ -581,4 +644,64 @@ impl Dispatch<ZcosmicToplevelHandleV1, ()> for ToplevelState {
     }
 }
 
+impl Dispatch<ExtWorkspaceManagerV1, ()> for ToplevelState {
+    /// New workspaces are kept; groups are of no interest but must be created.
+    fn event(
+        state : &mut Self,
+        _proxy: &ExtWorkspaceManagerV1,
+        event : WorkspaceManagerEvent,
+        _data : &(),
+        _conn : &Connection,
+        _qh   : &QueueHandle<Self>,
+    ) {
+        if let WorkspaceManagerEvent::Workspace { workspace } = event {
+            state.workspaces.push(WorkspaceEntry { handle: workspace, active: false });
+        }
+    }
+
+    event_created_child!(ToplevelState, ExtWorkspaceManagerV1, [
+        EVT_WORKSPACE_GROUP_OPCODE => (ExtWorkspaceGroupHandleV1, ()),
+        EVT_WORKSPACE_OPCODE       => (ExtWorkspaceHandleV1, ()),
+    ]);
+}
+
+impl Dispatch<ExtWorkspaceHandleV1, ()> for ToplevelState {
+    /// Only the active bit matters; `removed` drops the workspace.
+    fn event(
+        state : &mut Self,
+        proxy : &ExtWorkspaceHandleV1,
+        event : WorkspaceEvent,
+        _data : &(),
+        _conn : &Connection,
+        _qh   : &QueueHandle<Self>,
+    ) {
+        let id = proxy.id();
+
+        match event {
+            WorkspaceEvent::State { state: raw } => {
+                let active = raw
+                    .into_result()
+                    .is_ok_and(|flags| flags.contains(WorkspaceState::Active));
+
+                if let Some(w) = state.workspaces.iter_mut().find(|w| w.handle.id() == id) {
+                    w.active = active;
+                }
+            }
+
+            WorkspaceEvent::Removed => {
+                state.workspaces.retain(|w| w.handle.id() != id);
+
+                for entry in &mut state.toplevels {
+                    entry.workspaces.retain(|w| *w != id);
+                }
+
+                proxy.destroy();
+            }
+
+            _ => {}
+        }
+    }
+}
+
+delegate_noop!(ToplevelState: ignore ExtWorkspaceGroupHandleV1);
 delegate_noop!(ToplevelState: ignore ZxdgOutputManagerV1);

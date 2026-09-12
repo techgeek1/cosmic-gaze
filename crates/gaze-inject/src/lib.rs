@@ -57,7 +57,6 @@
 // other crate in this workspace carries the same allow for the same reason.
 #![allow(clippy::redundant_field_names)]
 
-use std::path::Path;
 
 use gaze_core::GlobalPx;
 
@@ -72,10 +71,6 @@ use codes::WHEEL_HI_RES_PER_CLICK;
 use keys::KeyInjector;
 pub use layout::{DeskLayout, OutputLayout};
 use rel::RelativeInjector;
-
-/// Default desk layout path, resolved relative to the current working directory. Matches
-/// every other crate's bin: run from the workspace root.
-const DEFAULT_DESK_CONFIG: &str = "config/desk.toml";
 
 /// Which mouse button an injected click reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,9 +145,8 @@ trait InjectBackend {
 }
 
 /// Pointer warp, click, and scroll injection through a uinput virtual device. Construct
-/// with [`Injector::create`] (default backend, default desk layout path) or
-/// [`Injector::create_with`] (explicit backend and layout - what `gaze-inject-cli` always
-/// uses).
+/// with [`Injector::create_with`]: an explicit backend and a layout, either loaded from a
+/// file (`gaze-inject-cli`) or taken from the parsed desk geometry (the daemon).
 pub struct Injector {
     backend : Box<dyn InjectBackend>,
     /// The keyboard-shaped device for forwarded keys.
@@ -175,15 +169,6 @@ pub struct WheelAccumulator {
 // --- Injector ---
 
 impl Injector {
-    /// Creates an injector with the default backend ([`Backend::Relative`]) against
-    /// `config/desk.toml` resolved relative to the current directory. Prefer
-    /// [`Injector::create_with`] whenever the backend or layout path matters.
-    pub fn create() -> Result<Injector> {
-        let layout = DeskLayout::load(Path::new(DEFAULT_DESK_CONFIG))?;
-
-        Injector::create_with(Backend::default(), &layout)
-    }
-
     /// Creates an injector with an explicit backend and desk layout.
     pub fn create_with(backend: Backend, layout: &DeskLayout) -> Result<Injector> {
         let inner: Box<dyn InjectBackend> = match backend {

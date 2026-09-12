@@ -429,6 +429,23 @@ pub enum CalibrationError {
 /// the sagitta, which a three-corner declaration cannot express; the trained mapping
 /// absorbs the 2D consequences, and only the firmware's internal head-translation
 /// compensation sees the residual depth error.
+/// The sensor-frame pitch from a desk file, degrees. Lives in `desk.toml` as a
+/// top-level `tracker_pitch_deg`; the core geometry parser ignores keys it does not
+/// know, so it is read separately here. Zero when the file or the key is missing.
+///
+/// Goes through `toml::from_str` rather than `str::parse`: since toml 0.9 `FromStr for
+/// Value` parses a single TOML *value*, not a document, so parsing a config file that
+/// way fails at line 1 column 1 and silently returned 0. That is what left the trained
+/// plane in `calibration-et5.toml` declared in the desk frame instead of the sensor
+/// frame before 2026-08-28.
+pub fn load_tracker_pitch(desk: &Path) -> f64 {
+    std::fs::read_to_string(desk)
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
+        .and_then(|v| v.get("tracker_pitch_deg").and_then(toml::Value::as_float))
+        .unwrap_or(0.0)
+}
+
 pub fn plane_corners(out: &OutputGeometry) -> DisplayArea {
     DisplayArea {
         tl_mm : out.uv_to_world(0.0, 0.0).to_array(),

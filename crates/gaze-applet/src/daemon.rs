@@ -134,14 +134,25 @@ pub async fn set_paused(paused: bool) {
     }
 }
 
-/// Forgets the daemon's online offset.
-pub async fn reset_offset() {
+/// Tells the daemon whether the popup is open, so it holds off scrolling under it.
+pub async fn set_popup_open(open: bool) {
     let Some(proxy) = gaze_proxy().await else {
         return;
     };
 
-    if let Err(e) = proxy.reset_offset().await {
-        tracing::warn!("daemon reset offset failed: {e}");
+    if let Err(e) = proxy.set_popup_open(open).await {
+        tracing::debug!(open, "daemon popup call failed: {e}");
+    }
+}
+
+/// Asks the daemon for the quick calibration.
+pub async fn calibrate() {
+    let Some(proxy) = gaze_proxy().await else {
+        return;
+    };
+
+    if let Err(e) = proxy.calibrate().await {
+        tracing::warn!("daemon calibrate failed: {e}");
     }
 }
 

@@ -18,7 +18,7 @@ Without `--home` the files are read from the XDG locations, printed at startup:
 |-------------------------------|------------------------------------------------|
 | `desk.toml`, calibration      | `~/.config/cosmic-gaze/`                       |
 | ONNX models                   | `~/.local/share/cosmic-gaze/models/`           |
-| offset                        | `~/.local/state/cosmic-gaze/`                  |
+| the log                       | `~/.local/state/cosmic-gaze/`                  |
 
 `--dry-run` logs clicks, warps and scrolls instead of injecting them;
 `--overlay-debug` draws the debug look. Everything else is tuning, stored by
@@ -28,9 +28,9 @@ whether by the applet's Advanced section or by hand.
 
 `just install` from the workspace root puts `gazed` and the applet under `~/.local/bin`;
 `just install-desk` copies the desk's files from the checkout to the XDG locations
-above. The daemon does not start with the session: the applet's Start button runs the
-installed `gazed` (its log goes to `~/.local/state/cosmic-gaze/gazed.log`) and its Stop
-button calls `Quit`, so the tracker only runs while it is wanted. `gazed` from a
+above. The daemon does not start with the session: the applet's switch runs the
+installed `gazed` (its log goes to `~/.local/state/cosmic-gaze/gazed.log`) and, off,
+calls `Quit`, so the tracker only runs while it is wanted. `gazed` from a
 terminal is the same daemon on the same files, with the log on stderr.
 
 ## Control interface
@@ -42,9 +42,20 @@ busctl --user get-property dev.techgeek1.CosmicGaze /dev/techgeek1/CosmicGaze de
 ```
 
 Properties: `Tracker`, `Calibrated`, `Controller`, `Paused`, `Mode`
-(`no-tracker`, `paused`, `reading`, `pointing`, `scrolling`), `OffsetUpdates`,
-`OffsetJumps`, `OffsetYawDeg`, `OffsetPitchDeg`. Methods: `Pause`, `Resume`,
-`ResetOffset`, `Quit`. The Rust side of this is `gaze_config::bus`.
+(`no-tracker`, `paused`, `reading`, `pointing`, `scrolling`, `calibrating`). Methods:
+`Pause`, `Resume`, `SetPopupOpen`, `Calibrate`, `Quit`. The Rust side of this is
+`gaze_config::bus`. `SetPopupOpen` is the applet saying its popup is up: the compositor
+reports where the panel is but not its popups, so while one is open no edge scroll
+starts and no band shows.
+
+`Calibrate` is the quick ceremony (`retrain::plan_quick`): the session ends, the
+current blob seeds the device, five targets are shown one at a time over the dimmed
+desktop (eyes on the dot, hold still until it moves), the model is applied, the tracker
+is reopened to prove it kept it, and the blob and calibration are written to
+`~/.config/cosmic-gaze/` with the previous files kept as `*.prev-<unix>`. The next
+session starts on the new model. Stop (or a signal) aborts it and nothing is written.
+The CLI's 4x4 health check runs after the round (sixteen one-second stops, on the same dim), so
+the log reports rms and median for the run and the correction field is refitted.
 
 ## What it needs
 

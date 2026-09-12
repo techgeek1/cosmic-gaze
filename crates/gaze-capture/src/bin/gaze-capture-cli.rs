@@ -285,6 +285,7 @@ fn list_toplevels(duration_s: Option<f64>) -> Result<()> {
             let flags = [
                 (t.activated , "activated"),
                 (t.minimized , "minimized"),
+                (!t.visible  , "off-workspace"),
                 (t.fullscreen, "fullscreen"),
             ]
             .iter()

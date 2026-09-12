@@ -23,16 +23,11 @@ use crate::config::{DaydreamSpec, OverlayMode, SessionConfig, SourceSpec};
 #[derive(Debug, Parser)]
 #[command(name = "gaze-proto", version)]
 pub struct Args {
-    /// A checkout to read the desk's files from: `DIR/config` holds the desk file, the
-    /// calibration and the offset, `DIR/models` the ONNX models. The daemon reads the
+    /// A checkout to read the desk's files from: `DIR/config` holds the desk file and
+    /// the calibration, `DIR/models` the ONNX models. The daemon reads the
     /// XDG locations instead.
     #[arg(long, default_value = ".")]
     pub home: PathBuf,
-
-    /// Keep the ET5 online offset frozen: real clicks are attributed and logged but
-    /// do not move it, and nothing is written to the offset file.
-    #[arg(long)]
-    pub freeze_offset: bool,
 
     /// Override one tuning knob for this run, `KEY=VALUE`; repeatable. The keys are
     /// the fields of `gaze_config::Tuning`, e.g. `--tune edge_dwell_s=0.4`. The stored
@@ -107,7 +102,6 @@ impl Args {
         let source = SourceSpec {
             calibration : existing(paths.calibration()),
             device_blob : paths.device_blob(),
-            offset      : (!self.freeze_offset).then(|| paths.offset()),
         };
 
         let daydream = match (&self.daydream_address, self.no_daydream) {

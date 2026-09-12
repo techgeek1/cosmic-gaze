@@ -33,7 +33,6 @@
 //! duration of the gap, and reconnects with the same options on a backoff. A stale
 //! held point is never presented as live gaze.
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -41,16 +40,13 @@ use tracing::{info, warn};
 
 use crossbeam_channel::{RecvTimeoutError, TryRecvError};
 use glam::{DQuat, DVec3};
-use gaze_core::{DesktopGeometry, GazeSample, GlobalPx, Ray};
+use gaze_core::{DesktopGeometry, GazeSample, GlobalPx, OutputGeometry, Ray};
 use gaze_core::GazeProvider;
 
 use crate::blob::BlobReport;
-use crate::calibration::{Et5Calibration, VIRTUAL_AREA, desk_to_sensor};
+use crate::calibration::{Et5Calibration, VIRTUAL_AREA};
 use crate::device::{ConnectOptions, Device, DeviceError};
 use crate::gaze::{Et5Frame, EyeCombiner, filtered_ray};
-use crate::offset::{
-    ClickFeedback, Observation, OffsetParams, OnlineOffset, correct_direction, local_yaw_pitch_deg,
-};
 use crate::ttp::DisplayArea;
 
 /// Default 1-sigma angular error for binocular ET5 samples, degrees. The spec figure
@@ -117,21 +113,6 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// stall they have to time out on themselves.
 const GAP_TICK: Duration = Duration::from_millis(10);
 
-/// How far back a click looks for the eye, seconds. The 2026-09 label study on the
-/// click sessions found the firmware residual flat from 0.3 s before the press to the
-/// press itself and rising steeply earlier, as the eye is still arriving; this window
-/// matched the collector's own label to within 0.05 degrees.
-const CLICK_LOOKBACK_S: f64 = 0.4;
-
-/// Corrected rays kept for click attribution, seconds. Covers the lookback plus the
-/// latency between a press on the bus and the call that attributes it.
-const RAY_HISTORY_S: f64 = 1.5;
-
-/// Fewest rays a click needs in its window to count. At the ET5's 33 Hz the window
-/// holds about thirteen; a window this thin means the eyes were untracked for most
-/// of it.
-const CLICK_MIN_RAYS: usize = 3;
-
 // --- Provider ---
 
 /// A `GazeProvider` streaming from a connected ET5.
@@ -161,23 +142,8 @@ pub struct Et5Provider {
     stopped      : bool,
 }
 
-/// The online offset's state, as a status line wants it.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct OffsetSummary {
-    /// Accepted clicks folded in over the life of the state.
-    pub updates    : u64,
-    /// Bias jumps adopted from a consensus of rejects.
-    pub jumps      : u64,
-    /// The global mean bias, yaw and pitch degrees.
-    pub global_deg : [f64; 2],
-}
-
 /// Builder for `Et5Provider`.
 pub struct Et5ProviderBuilder {
-    /// Where the online offset persists, `None` to keep it in memory for the run.
-    offset_path       : Option<PathBuf>,
-    /// The online offset's tunables.
-    offset_params     : OffsetParams,
     geometry          : Option<DesktopGeometry>,
     calibration       : Option<Et5Calibration>,
     tracker_pitch_deg : f64,
@@ -189,8 +155,6 @@ impl Et5Provider {
     /// Starts building a provider.
     pub fn create() -> Et5ProviderBuilder {
         Et5ProviderBuilder {
-            offset_path       : None,
-            offset_params     : OffsetParams::default(),
             geometry          : None,
             calibration       : None,
             tracker_pitch_deg : 0.0,
@@ -260,47 +224,6 @@ impl Et5Provider {
     /// Whether a calibration was loaded for this provider.
     pub fn calibrated(&self) -> bool {
         self.convert.calibration.is_some()
-    }
-
-    /// The online offset's state in brief, `None` outside direct mode (the offset
-    /// needs a calibrated plane to be measured against).
-    pub fn offset_summary(&self) -> Option<OffsetSummary> {
-        self.convert.offset.as_ref().map(|m| {
-            let state = m.offset.state();
-
-            OffsetSummary {
-                updates    : state.updates,
-                jumps      : state.jumps,
-                global_deg : m.offset.global_deg(),
-            }
-        })
-    }
-
-    /// Forgets the day's offset, every anchor, and writes the empty state out where
-    /// the offset persists. Nothing happens outside direct mode.
-    pub fn reset_offset(&mut self) {
-        if let Some(m) = self.convert.offset.as_mut() {
-            m.offset.reset();
-            m.offset.save();
-
-            info!("online offset reset");
-        }
-    }
-
-    /// The instant the provider's clock started: every sample's `t_s` is seconds since
-    /// this, so a caller stamping events from another thread can share the clock.
-    pub fn started_at(&self) -> Instant {
-        self.t0
-    }
-
-    /// Offers a real click to the online offset: the user pressed a physical button
-    /// with the pointer at `px`, at host time `t_s` on this provider's clock. The eye
-    /// over the [`CLICK_LOOKBACK_S`] before the press is compared with the clicked
-    /// point and the leftover, if believable, nudges the offset every later sample is
-    /// corrected by. `None` outside direct mode, when the point is on no configured
-    /// panel, or when too few corrected rays fell in the window.
-    pub fn observe_click(&mut self, px: GlobalPx, t_s: f64) -> Option<ClickFeedback> {
-        self.convert.offset.as_mut()?.observe_click(px, t_s)
     }
 
     /// How many times this provider has had a live session, starting at one. A change
@@ -502,21 +425,6 @@ impl Et5ProviderBuilder {
         self
     }
 
-    /// Where the online offset persists across runs. `None` (the default) keeps the
-    /// offset in memory for the life of the provider.
-    pub fn offset_path(mut self, path: Option<PathBuf>) -> Self {
-        self.offset_path = path;
-
-        self
-    }
-
-    /// Overrides the online offset's gain, clip and gate.
-    pub fn offset_params(mut self, params: OffsetParams) -> Self {
-        self.offset_params = params;
-
-        self
-    }
-
     /// Rotation about +X mapping device vectors into the desk frame, for a tracker
     /// pitched up at the face. Zero once display poses are solved in tracker space.
     pub fn tracker_pitch_deg(mut self, deg: f64) -> Self {
@@ -544,12 +452,6 @@ impl Et5ProviderBuilder {
     /// Connects to the tracker and starts streaming.
     pub fn start(self) -> Result<Et5Provider, DeviceError> {
         let mut geometry = self.geometry.expect("Et5ProviderBuilder requires geometry");
-
-        // A click's leftover is measured against the configured desk, rotated into the
-        // sensor frame by the mount pitch, so that is the geometry the offset's
-        // corrected ray is intersected with: the copy before any solved pose replaces
-        // one.
-        let desk = geometry.clone();
 
         if let Some(calibration) = &self.calibration {
             calibration.apply_poses(&mut geometry);
@@ -592,30 +494,6 @@ impl Et5ProviderBuilder {
             check         : Default::default(),
         };
 
-        // The offset is what is left after the calibration under this blob, so it is
-        // keyed to the blob's hash: a retrain starts it over. It needs the direct-mode
-        // plane to measure clicks against, so without one there is no offset.
-        let offset = direct.as_ref().map(|_| {
-            let blob = self.calibration.as_ref().and_then(|c| c.device_blob_sha256.clone());
-
-            let offset = {
-                match &self.offset_path {
-                    Some(path) => OnlineOffset::persisted(self.offset_params, path, blob),
-                    None       => OnlineOffset::new(self.offset_params, blob),
-                }
-            };
-
-            OffsetState::new(&desk, self.tracker_pitch_deg, offset)
-        });
-
-        if let Some(state) = &offset {
-            let [yaw, pitch] = state.offset.global_deg();
-
-            info!(anchors = state.offset.state().anchors.len(),
-                  yaw_deg = yaw, pitch_deg = pitch,
-                  "online offset loaded");
-        }
-
         let device = Device::connect_with(options.clone())?;
         let frames = device.gaze_stream();
 
@@ -640,7 +518,6 @@ impl Et5ProviderBuilder {
                 combiner       : EyeCombiner::new(),
                 hold           : None,
                 origin_log     : std::collections::VecDeque::new(),
-                offset         : offset,
             },
             t0           : Instant::now(),
             stopped      : false,
@@ -704,154 +581,6 @@ struct Converter {
     /// Recent mean eye origins, so the head correction can be driven by the origin
     /// from the fitted lag ago (the head error trails the head by ~300 ms).
     origin_log     : std::collections::VecDeque<(f64, DVec3)>,
-    /// The online offset and what it needs around it, in direct mode.
-    offset         : Option<OffsetState>,
-}
-
-/// The online offset with the frame it is measured in.
-struct OffsetState {
-    /// The configured desk, whose pixels a click is measured against and whose
-    /// panels the corrected ray is intersected with.
-    desk           : DesktopGeometry,
-    /// The mount pitch: desk frame to sensor frame.
-    pitch_deg      : f64,
-    /// Sensor frame to desk frame: the inverse of the mount pitch.
-    sensor_to_desk : DQuat,
-    /// The day's bias on top of the calibration, fed by real clicks.
-    offset         : OnlineOffset,
-    /// Half the vector from the left eye to the right, from the last frame that had
-    /// both, so a frame with one eye still yields the midpoint (see [`posture_origin`]).
-    half_ipd       : Option<DVec3>,
-    /// Recent corrected rays in the sensor frame, oldest first. What a click is
-    /// attributed against.
-    recent         : VecDeque<RecentRay>,
-}
-
-/// One corrected ray as the click attribution needs it.
-#[derive(Clone, Copy, Debug)]
-struct RecentRay {
-    /// Host time, seconds.
-    t_s       : f64,
-    /// The direction after the offset: what the user saw the pointer follow.
-    corrected : DVec3,
-    /// The posture origin the ray left from and the offset was read at.
-    posture   : DVec3,
-}
-
-// --- OffsetState ---
-
-impl OffsetState {
-    /// Wraps an offset for the desk it will run on.
-    fn new(desk: &DesktopGeometry, pitch_deg: f64, offset: OnlineOffset) -> Self {
-        Self {
-            desk           : desk.clone(),
-            pitch_deg      : pitch_deg,
-            sensor_to_desk : DQuat::from_axis_angle(DVec3::X, -pitch_deg.to_radians()),
-            offset         : offset,
-            half_ipd       : None,
-            recent         : VecDeque::new(),
-        }
-    }
-
-    /// Moves the calibrated point `px` by the day's offset: the ray from the eyes
-    /// through it, rotated by the offset at this posture, is intersected with the
-    /// desk again, and kept for click attribution. `None` when the frame has no eye
-    /// origin, the point is on no panel, or the corrected ray misses every panel, in
-    /// which case the calibrated point stands.
-    fn correct(&mut self, frame: &Et5Frame, t_s: f64, px: GlobalPx) -> Option<(GlobalPx, Ray)> {
-        // The head is keyed by the binocular midpoint, not the tracked eye: a
-        // monocular frame moves the latter by half an interpupillary distance and
-        // would read as a change of posture.
-        let posture = posture_origin(frame, &mut self.half_ipd)?;
-        let target  = DVec3::from_array(desk_to_sensor(self.desk.px_to_world(px)?.to_array(), self.pitch_deg));
-        let delta   = target - posture;
-
-        if delta.length_squared() < 1.0 {
-            return None;
-        }
-
-        let dir                  = delta.normalize();
-        let [off_yaw, off_pitch] = self.offset.offset_deg(posture.to_array());
-        let corrected            = correct_direction(dir, off_yaw, off_pitch);
-
-        self.recent.push_back(RecentRay {
-            t_s       : t_s,
-            corrected : corrected,
-            posture   : posture,
-        });
-
-        while self.recent.front().is_some_and(|r| t_s - r.t_s > RAY_HISTORY_S) {
-            self.recent.pop_front();
-        }
-
-        let ray = Ray {
-            origin : self.sensor_to_desk * posture,
-            dir    : (self.sensor_to_desk * corrected).normalize(),
-        };
-
-        let hit = self.desk.intersect(&ray)
-            .map(|hit| hit.px)
-            .or_else(|| edge_point(&self.desk, &ray))?;
-
-        Some((hit, ray))
-    }
-
-    /// Attributes a click at `px`, pressed at `t_s`, to the corrected rays just before
-    /// it and offers the median leftover to the offset. See
-    /// [`Et5Provider::observe_click`].
-    fn observe_click(&mut self, px: GlobalPx, t_s: f64) -> Option<ClickFeedback> {
-        // The clicked point in the frame the rays live in: the configured desk,
-        // rotated by the mount pitch.
-        let target = DVec3::from_array(desk_to_sensor(self.desk.px_to_world(px)?.to_array(), self.pitch_deg));
-
-        // Each ray's leftover: where the corrected ray still points relative to the
-        // clicked point, in the tangent frame at the truth.
-        let window: Vec<&RecentRay> = self.recent.iter()
-            .filter(|r| r.t_s >= t_s - CLICK_LOOKBACK_S && r.t_s <= t_s)
-            .collect();
-
-        if window.len() < CLICK_MIN_RAYS {
-            return None;
-        }
-
-        let rays = window.len();
-
-        let mut leftover_yaw   = Vec::with_capacity(rays);
-        let mut leftover_pitch = Vec::with_capacity(rays);
-        let mut postures       = DVec3::ZERO;
-
-        for r in &window {
-            let (yaw, pitch) = local_yaw_pitch_deg(r.corrected, target - r.posture);
-
-            leftover_yaw.push(yaw);
-            leftover_pitch.push(pitch);
-            postures += r.posture;
-        }
-
-        // The eyes' mean position over the same window keys the click to its posture.
-        let leftover = [median(&mut leftover_yaw), median(&mut leftover_pitch)];
-        let posture  = postures / rays as f64;
-
-        Some(self.offset.observe(&Observation {
-            leftover_deg : leftover,
-            origin_mm    : posture.to_array(),
-            target_mm    : target.to_array(),
-        }))
-    }
-
-    /// Drops the ray history, for a link that went away.
-    fn forget(&mut self) {
-        self.recent.clear();
-    }
-}
-
-/// Median of a slice, which it sorts. Empty slices are the caller's problem.
-fn median(values: &mut [f64]) -> f64 {
-    values.sort_by(f64::total_cmp);
-
-    let n = values.len();
-
-    if n % 2 == 1 { values[n / 2] } else { 0.5 * (values[n / 2 - 1] + values[n / 2]) }
 }
 
 /// A good sample's landing point and motion state, kept for dropout bridging.
@@ -994,19 +723,13 @@ impl Converter {
 
         let px = out.uv_to_px(u, v);
 
+        // The correction field extrapolates past the panel it was fitted on, and a
+        // point pushed over the edge would be claimed by whatever panel's rect lies
+        // there. The trained plane is this panel; the point stays on it.
         let point = {
             match &self.calibration {
-                Some(cal) => cal.correct_point(out, px),
+                Some(cal) => clamp_to_output(out, cal.correct_point(out, px)),
                 None      => px,
-            }
-        };
-
-        // The day's offset on top of the calibration, in angle space, keyed to where
-        // the head is. Its ray replaces the fused one: it is the ray the point is on.
-        let (point, ray) = {
-            match self.offset.as_mut().and_then(|s| s.correct(frame, t_s, point)) {
-                Some((px, r)) => (px, Some(r)),
-                None          => (point, ray),
             }
         };
 
@@ -1031,10 +754,6 @@ impl Converter {
     fn forget_hold(&mut self) {
         self.hold = None;
         self.origin_log.clear();
-
-        if let Some(state) = &mut self.offset {
-            state.forget();
-        }
     }
 
     /// The logged origin nearest to time `t`, within a small pairing gap.
@@ -1143,23 +862,12 @@ impl Converter {
     }
 }
 
-/// The binocular midpoint of a frame, tracker space mm, for keying the offset to the
-/// head. Both eyes give it directly and refresh `half_ipd`; one eye gives it through
-/// the remembered half spacing, or the eye itself before any binocular frame has been
-/// seen; no eyes give nothing.
-fn posture_origin(frame: &Et5Frame, half_ipd: &mut Option<DVec3>) -> Option<DVec3> {
-    let l = frame.left_valid().then_some(frame.eye_origin_l_mm).flatten().map(DVec3::from_array);
-    let r = frame.right_valid().then_some(frame.eye_origin_r_mm).flatten().map(DVec3::from_array);
-
-    match (l, r) {
-        (Some(l), Some(r)) => {
-            *half_ipd = Some((r - l) * 0.5);
-
-            Some((l + r) * 0.5)
-        }
-        (Some(l), None) => Some(l + half_ipd.unwrap_or(DVec3::ZERO)),
-        (None, Some(r)) => Some(r - half_ipd.unwrap_or(DVec3::ZERO)),
-        (None, None)    => None,
+/// `p` moved onto `out`'s logical rect: the nearest pixel of the panel, the last
+/// pixel on each axis being one short of the far edge as `contains_px` counts it.
+fn clamp_to_output(out: &OutputGeometry, p: GlobalPx) -> GlobalPx {
+    GlobalPx {
+        x : p.x.clamp(out.logical_x, out.logical_x + out.logical_w - 1.0),
+        y : p.y.clamp(out.logical_y, out.logical_y + out.logical_h - 1.0),
     }
 }
 
@@ -1274,7 +982,6 @@ mod tests {
             combiner       : EyeCombiner::new(),
             hold           : None,
             origin_log     : std::collections::VecDeque::new(),
-            offset         : None,
         }
     }
 
@@ -1290,118 +997,6 @@ mod tests {
     }
 
     #[test]
-    fn the_offset_state_undoes_the_mount_pitch() {
-        // A desk point rotated into the sensor frame must come back to itself through
-        // the state's rotation, or the corrected ray would be intersected with a desk
-        // it was not measured against.
-        let desk  = converter().geometry;
-        let state = OffsetState::new(&desk, 13.0, OnlineOffset::new(OffsetParams::default(), None));
-
-        let p      = DVec3::new(-38.0, 200.0, 687.0);
-        let sensor = DVec3::from_array(desk_to_sensor(p.to_array(), 13.0));
-        let back   = state.sensor_to_desk * sensor;
-
-        assert!(back.abs_diff_eq(p, 1e-9), "{back:?} vs {p:?}");
-    }
-
-    /// A converter running the offset under the fixture desk with nothing learnt, so
-    /// the corrected point is the calibrated one and every effect seen is a click's.
-    fn converter_with_offset() -> Converter {
-        let mut c = converter();
-
-        c.offset = Some(OffsetState::new(
-            &c.geometry, 0.0, OnlineOffset::new(OffsetParams::default(), None),
-        ));
-
-        c
-    }
-
-    #[test]
-    fn an_empty_offset_leaves_the_calibrated_point_where_it_was() {
-        let mut plain = converter();
-        let mut with  = converter_with_offset();
-
-        let a = plain.sample(&frame_2d(0.3, 0.7), 0.0).point.expect("point");
-        let b = with.sample(&frame_2d(0.3, 0.7), 0.0).point.expect("point");
-
-        assert!((a.x - b.x).abs() < 1e-6 && (a.y - b.y).abs() < 1e-6, "{a:?} vs {b:?}");
-    }
-
-    #[test]
-    fn a_click_on_the_gaze_point_is_accepted_with_no_leftover() {
-        let mut c = converter_with_offset();
-
-        let mut point = None;
-
-        for i in 0..40 {
-            point = c.sample(&frame_2d(0.5, 0.5), i as f64 * 0.01).point;
-        }
-
-        let px = point.expect("the offset path lands on the panel");
-        let fed = c.offset.as_mut().unwrap().observe_click(px, 0.4).expect("attributed");
-
-        match fed {
-            ClickFeedback::Accepted { leftover_deg, .. } => {
-                assert!(leftover_deg[0].abs() < 0.05 && leftover_deg[1].abs() < 0.05,
-                        "{leftover_deg:?}");
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_click_beside_the_gaze_point_pulls_the_next_sample_towards_it() {
-        let mut c = converter_with_offset();
-
-        let mut point = None;
-
-        for i in 0..40 {
-            point = c.sample(&frame_2d(0.5, 0.5), i as f64 * 0.01).point;
-        }
-
-        // 30 px right is 18 mm on this panel, about 1.6 degrees at the fixture's eye:
-        // inside the gate, past nothing.
-        let before = point.expect("point");
-        let click  = GlobalPx { x: before.x + 30.0, y: before.y };
-
-        let fed = c.offset.as_mut().unwrap().observe_click(click, 0.4).expect("attributed");
-
-        let ClickFeedback::Accepted { leftover_deg, offset_deg, anchors } = fed else {
-            panic!("{fed:?}");
-        };
-
-        let size = leftover_deg[0].hypot(leftover_deg[1]);
-
-        assert!((1.3..2.0).contains(&size), "leftover {leftover_deg:?}");
-        assert!(leftover_deg[1].abs() < 0.1, "a horizontal click moved pitch: {leftover_deg:?}");
-
-        // The first click at a posture founds its anchor and enters over the prior count.
-        let first = leftover_deg[0] / (crate::offset::PRIOR_CLICKS as f64 + 1.0);
-
-        assert_eq!(anchors, 1);
-        assert!((offset_deg[0] - first).abs() < 1e-6, "{offset_deg:?} vs {leftover_deg:?}");
-
-        // The same frame now lands to the right of where it did: the offset is live.
-        let after = c.sample(&frame_2d(0.5, 0.5), 0.5).point.expect("point");
-
-        assert!(after.x > before.x + 1.0, "before {before:?} after {after:?}");
-        assert!((after.y - before.y).abs() < 0.5, "before {before:?} after {after:?}");
-
-        // Well past the gate: refused, and the offset stays put.
-        let far = GlobalPx { x: before.x + 200.0, y: before.y };
-
-        assert!(matches!(c.offset.as_mut().unwrap().observe_click(far, 0.5),
-                         Some(ClickFeedback::Rejected { .. })));
-        let held = c.offset.as_ref().unwrap().offset.global_deg();
-
-        assert!((held[0] - offset_deg[0]).abs() < 1e-9 && (held[1] - offset_deg[1]).abs() < 1e-9,
-                "{held:?} vs {offset_deg:?}");
-
-        // A click with no rays in its window is not attributed at all.
-        assert!(c.offset.as_mut().unwrap().observe_click(click, 9.0).is_none());
-    }
-
-    #[test]
     fn a_2d_reading_just_past_the_edge_maps_to_the_edge_at_ordinary_sigma() {
         let mut c = converter();
 
@@ -1412,6 +1007,25 @@ mod tests {
         assert_eq!(p.x, 1000.0);
         assert!((p.y - 200.0).abs() < 1e-9);
         assert!(s.sigma_deg < 1.5, "sigma {}", s.sigma_deg);
+    }
+
+    /// A field-corrected point past the panel's edge lands on the panel's last pixel,
+    /// not on the neighbour whose rect begins there.
+    #[test]
+    fn a_corrected_point_never_leaves_the_trained_panel() {
+        let c   = converter();
+        let out = c.geometry.outputs.iter().find(|o| o.name == "DP-9").expect("fixture output");
+
+        let inside = GlobalPx { x: out.logical_x + 10.0, y: out.logical_y + 10.0 };
+        let beyond = GlobalPx { x: out.logical_x + out.logical_w + 40.0, y: out.logical_y - 5.0 };
+
+        assert_eq!(clamp_to_output(out, inside), inside);
+
+        let clamped = clamp_to_output(out, beyond);
+
+        assert!(out.contains_px(clamped), "{clamped:?} is off the panel");
+        assert_eq!(clamped.x, out.logical_x + out.logical_w - 1.0);
+        assert_eq!(clamped.y, out.logical_y);
     }
 
     #[test]

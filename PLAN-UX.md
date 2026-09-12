@@ -130,7 +130,7 @@ forty flags sorts into three piles, decided 2026-09-10 after the modes session:
 - **Dies with the prototype.** Provider selection and everything it drags in (synthetic,
   replay, webcam, the grabbed mouse, noise overrides, seed, gain), record, seconds,
   show-truth, the debug look, dry run versus click, freeze-offset, no-flywheel. Seconds,
-  the debug look, dry run versus click and freeze-offset stay in `gaze-proto`'s `Args` as
+  the debug look and dry run versus click stay in `gaze-proto`'s `Args` as
   the dev harness; the rest went with the non-ET5 paths and the model on 2026-09-10. Two were features and are cut outright:
   wheel routing to the window under gaze (`--scroll`) and focus-follows-gaze, both of
   which moved the pointer on their own initiative, which the borrow-and-return model
@@ -152,14 +152,23 @@ forty flags sorts into three piles, decided 2026-09-10 after the modes session:
   snap engine are rebuilt, the overlay is restyled, the scroller, the controller mapper
   and the perception thread take new parameters in place.
 
+**What covers the windows.** The overlay's layer surfaces subscribe to
+`zcosmic_overlap_notify_v1` (2026-09-12), so the session knows where the panel, the dock
+and any other top or overlay layer surface is, including an auto-hidden panel the moment
+it shows. A gaze there starts no edge scroll and shows no band; a scroll already running
+keeps going, since its parked pointer at the screen edge is what reveals the panel.
+Popups of layer surfaces (an applet's) are not reported, so the applet tells the daemon
+over the bus (`SetPopupOpen`) while its own popup is up and the same rule holds
+everywhere; other applets' popups are still unseen.
+
 **Live state and commands** over the session D-Bus (`zbus`, as `gaze-a11y` already
 uses), name and path `dev.techgeek1.CosmicGaze` / `/dev/techgeek1/CosmicGaze`:
-properties `Tracker`, `Calibrated`, `Model`, `Controller`, `Paused` (booleans), `Mode`
-(`no-tracker`, `paused`, `reading`, `pointing`, `scrolling`), `OffsetUpdates`,
-`OffsetJumps`, `OffsetYawDeg`, `OffsetPitchDeg`; methods `Pause`, `Resume`,
-`ResetOffset`, `Quit`. Recalibrate arrives with U4. `gaze_config::Status` is the Rust side of
+properties `Tracker`, `Calibrated`, `Controller`, `Paused` (booleans), `Mode`
+(`no-tracker`, `paused`, `reading`, `pointing`, `scrolling`, `calibrating`); methods
+`Pause`, `Resume`, `SetPopupOpen`, `Calibrate`, `Quit`. The offset properties and `ResetOffset` went
+with the online offset on 2026-09-12. `gaze_config::Status` is the Rust side of
 those properties, filled by the session loop through `gaze_proto::Live`, which also
-carries the pause and reset flags and the tuning in.
+carries the pause and calibrate flags and the tuning in.
 
 The daemon retries the tracker every few seconds when it is not on the bus, and runs
 the session again if it ends. The overlay stays in-process for latency. Not started with
@@ -169,9 +178,11 @@ the session: the applet's Start button runs it and its Stop button calls `Quit`
 ## U3. Applet — built 2026-09-10
 
 `gaze-applet` (`cosmic-ext-applet-gaze`), a libcosmic panel applet on the same pin as
-the overlay's cosmic-config. Status icon; a popup with the live state (tracker,
-calibration, controller, mode, offset), a Start/Stop button that runs the installed `gazed` and
-calls `Quit`, a pause toggle, and an "Advanced" section that draws every
+the overlay's cosmic-config. Status icon; a popup in two fixed groups so nothing
+reflows as the daemon comes and goes (2026-09-12): Status, with the mode beside the
+switch that runs the installed `gazed` and calls `Quit`, and the calibrated dot beside
+the Calibrate button (U4); Gaze, with the tracker and controller dots; then an
+"Advanced" section holding the pause toggle and every
 `KNOBS` entry as a slider writing straight to cosmic-config, so the feel can be tuned
 on the running system without a rebuild or a restart. It polls the daemon's properties
 over D-Bus (one `GetAll` a second, faster while open), which survives the daemon
@@ -180,16 +191,22 @@ restarting. Nothing gaze-specific in it beyond `gaze-config`.
 ## U4. Self-contained: calibrate in the daemon, a generated desk file, downloaded models
 
 Ruled 2026-09-10: setting up a new machine and recalibrating must not need the CLI, and
-there is no fit step (the residual model went; the offset is the correction). Three
-pieces:
+there is no fit step (the residual model went). Three pieces:
 
-- **Calibrate in the daemon.** The daemon holds the device, so the retrain ceremony and
-  its health check leave `gaze-et5-cli calibrate` and run in the daemon on its overlay,
-  behind a `Calibrate` method and a `calibrating` mode; the applet has a Calibrate
-  button and a Cancel while it runs. Points are accepted on the gate's vote as the CLI
-  does by default, the controller's pad commits when it is paired, and the prompts that
-  went to stdout become the overlay caption. The blob and the calibration land in the
-  XDG config dir and the session restarts on them; the offset starts over.
+- **Calibrate in the daemon — built 2026-09-12 as the quick ceremony.** The daemon
+  holds the device, so calibration runs in the daemon between two sessions, behind a
+  `Calibrate` method and a `calibrating` mode, and the applet has a Calibrate button
+  (reads "Calibrating" while it runs; Stop aborts it, nothing written). What runs is
+  `retrain::plan_quick` (PLAN-ET5 A6): the current blob seeds the device, one round of
+  five targets (centre and the training rectangle's corners) is shown over the dimmed
+  desktop, accepted on the gate's vote with the dwell fallback, applied once; the
+  device is reopened to prove it kept the model, and the blob and calibration are
+  written to the XDG config dir (previous files kept as `*.prev-<unix>`), the session
+  restarting on them. The CLI's 4x4 health check follows the round (ruled 2026-09-12:
+  once per session is not long), so the log carries rms and median per run and the
+  correction field is refitted every time. The full two-background ceremony and the
+  Daydream commit stay in the CLI; the online offset, which was to start over here, is
+  gone.
 - **A generated desk file.** What the ET5 path reads from `desk.toml` is the tracked
   output's logical rect and physical size (the compositor knows both), the panel pose
   relative to the camera (a mount constant for the clip bar, centred under the panel),

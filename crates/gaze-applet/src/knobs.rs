@@ -30,11 +30,6 @@ pub fn format_value(knob: &Knob, value: f64) -> String {
     }
 }
 
-/// The offset row: both angles signed to two decimals, then the counts.
-pub fn format_offset(yaw_deg: f64, pitch_deg: f64, updates: u64, jumps: u64) -> String {
-    format!("yaw {yaw_deg:+.2}°, pitch {pitch_deg:+.2}°, {updates} clicks, {jumps} jumps")
-}
-
 // --- Tests ---
 
 #[cfg(test)]
@@ -59,13 +54,5 @@ mod tests {
 
         assert_eq!(format_value(&seconds, 0.25), "0.25 s");
         assert_eq!(format_value(&bare, 2.0), "2");
-    }
-
-    #[test]
-    fn the_offset_row_signs_both_angles() {
-        assert_eq!(
-            format_offset(0.5, -1.25, 12, 1),
-            "yaw +0.50°, pitch -1.25°, 12 clicks, 1 jumps",
-        );
     }
 }

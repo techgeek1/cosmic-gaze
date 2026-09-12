@@ -5,12 +5,15 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-gaze-core   = { workspace = true }
-gaze-config = { workspace = true }
-gaze-proto  = { workspace = true }
+gaze-core         = { workspace = true }
+gaze-config       = { workspace = true }
+gaze-overlay      = { workspace = true }
+gaze-proto        = { workspace = true }
+gaze-provider-et5 = { workspace = true }
 
 anyhow             = { workspace = true }
 clap               = { workspace = true }
+crossbeam-channel  = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 
@@ -19,8 +22,8 @@ tracing-subscriber = { workspace = true }
 # as every other zbus user in the workspace, so the reactor never skews.
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 
-# SIGTERM and SIGINT stop the session cleanly (the pointer is returned, the offset is
-# saved) instead of killing the process mid-warp.
+# SIGTERM and SIGINT stop the session cleanly (the pointer is returned) instead of
+# killing the process mid-warp.
 signal-hook = "0.3"
 
 [[bin]]

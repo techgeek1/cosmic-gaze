@@ -14,8 +14,8 @@ silent to other readers: for any physical press exactly one open node speaks. A 
 picks up nodes that appear mid-run (a re-enumeration, a wireless reconnect).
 `gaze-inject`'s own virtual pointer is never read; those presses are the gaze clicking.
 
-The session (`gaze-proto/src/feedback.rs`) hands each press, with the pointer position
-at that moment, to the ET5's online offset as a gaze label.
+The session no longer reads it: the online offset those presses fed was removed on
+2026-09-12. The reader stays for the CLI below.
 
 ```sh
 cargo run --bin gaze-clicks-cli -- devices             # which nodes a session reads

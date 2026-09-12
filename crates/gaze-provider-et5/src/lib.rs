@@ -7,8 +7,7 @@
 //! calibration ops, and the 0x500 gaze notification stream. The device does the eye
 //! tracking; this crate turns its tracker-space output into `gaze_core::GazeSample`s
 //! with a desk-frame ray, and owns the calibration story: the on-device eye model,
-//! the declared plane, a client-side correction field fitted from the health check,
-//! and the day's offset learnt from real clicks.
+//! the declared plane, and a client-side correction field fitted from the health check.
 //!
 //! Layering, bottom up:
 //!
@@ -21,18 +20,18 @@
 //! - [`retrain`]: the ceremony that writes the on-device eye model, once, and the
 //!   health check that follows it.
 //! - [`calibration`], [`field`]: the calibration file and the correction field.
-//! - [`offset`]: the online offset the real clicks feed.
 //! - [`provider`]: the `GazeProvider` implementation on top of it all.
 //!
 //! The residual model, its trainer and the click flywheel that fed it were removed on
-//! 2026-09-10 (git history): the offset alone carried the day.
+//! 2026-09-10, and the online offset that learnt a bias from real clicks on 2026-09-12
+//! (git history for both): it needed twenty clicks the user could not place while the
+//! gaze was off, so a quick retrain from the applet replaced it.
 
 pub mod blob;
 pub mod calibration;
 pub mod device;
 pub mod field;
 pub mod gaze;
-pub mod offset;
 pub mod provider;
 pub mod retrain;
 pub mod transport;
@@ -42,6 +41,5 @@ pub use blob::{BlobCheck, BlobReport, CalibrationResult};
 pub use calibration::{Et5Calibration, HealthStop};
 pub use device::{ConnectOptions, Device, DeviceError};
 pub use gaze::Et5Frame;
-pub use offset::{ClickFeedback, ClickVia, OffsetParams, OnlineOffset};
-pub use provider::{Et5Provider, OffsetSummary};
+pub use provider::Et5Provider;
 pub use ttp::{DisplayArea, DisplayRect};

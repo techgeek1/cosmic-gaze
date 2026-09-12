@@ -45,8 +45,6 @@ pub struct SourceSpec {
     pub calibration : Option<PathBuf>,
     /// The on-device calibration blob re-declared on every connect.
     pub device_blob : PathBuf,
-    /// Where the online offset persists; `None` freezes it in memory.
-    pub offset      : Option<PathBuf>,
 }
 
 /// Whether and which Daydream controller to read.

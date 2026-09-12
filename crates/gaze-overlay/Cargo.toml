@@ -18,6 +18,10 @@ tiny-skia = "0.12"
 # the overlay never takes keyboard focus. `calloop` gives us the event loop and the
 # wayland event source, and re-exports every wayland crate so versions cannot skew.
 smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
+
+# `zcosmic_overlap_notify_v1`: which layer surfaces (the panel above all) cover the
+# overlay's, so the session knows what is on top of the windows. Same pin as gaze-capture.
+cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", rev = "32283d7", default-features = false, features = ["client"] }
 serde = { workspace = true }
 
 # The watcher type `cosmic-config` hands back, so it can be kept alive by name. Pinned to

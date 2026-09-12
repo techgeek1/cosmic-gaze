@@ -788,6 +788,7 @@ mod tests {
             output     : "DP-1".into(),
             activated  : true,
             minimized  : false,
+            visible    : true,
             fullscreen : false,
             focus_rank : 1,
         }

@@ -2,7 +2,7 @@
 
 **Status 2026-08-26: complete. Verdict and numbers in DESIGN.md §10b. Next phase: fine channel
 (Daydream controller daemon + refine modes in gaze-proto), then online recalibration.
-ET5 provider rebuild (host-owned device state, the online offset): `PLAN-ET5.md`. The
+ET5 provider rebuild (host-owned device state, the retrain ceremony): `PLAN-ET5.md`. The
 Phase 0 apparatus this plan describes (the synthetic provider, the bench, the truth
 scoring, the noise model) was removed 2026-09-10 once the ET5 was the only path; the
 contracts below are kept as the record of what was built and why.**
@@ -146,7 +146,7 @@ Was the passive click collector (PLAN-ET5 B4): the real mouse read-only, the out
 under the pointer captured on the press, the element recognised, the frames written as
 a session file for the residual model's fit. It went with the model. What the session
 still uses stays: `mouse::MouseReader` (every mouse-shaped evdev node, never grabbed,
-rescanned) feeding presses to the ET5's online offset, and `tree::TreeService`, the
+rescanned, now only behind its CLI since the online offset went on 2026-09-12), and `tree::TreeService`, the
 watched accessibility-tree thread the verifier and the edge scroller ask. See
 `crates/gaze-clicks/README.md`.
 

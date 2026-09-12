@@ -7,18 +7,29 @@
 //! interactivity is `none` and the exclusive zone is -1, which asks the compositor not to
 //! reserve any space and to let the surface sit over layer shell panels as well as
 //! windows.
+//!
+//! Sitting over the panels has a use beyond drawing: `zcosmic_overlap_notify_v1` tells a
+//! layer surface which other layer surfaces overlap it and where, so the overlay learns
+//! where the panel (and any other top or overlay layer surface: a notification, a
+//! launcher) is covering the windows, including an auto-hidden panel the moment it
+//! shows. [`OverlayHandle::occluders`] hands those rectangles to the session, which
+//! treats a gaze on one as off the window underneath.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use cosmic_protocols::overlap_notify::v1::client::zcosmic_overlap_notification_v1::{
+    Event as OverlapEvent, ZcosmicOverlapNotificationV1,
+};
+use cosmic_protocols::overlap_notify::v1::client::zcosmic_overlap_notify_v1::ZcosmicOverlapNotifyV1;
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
 use smithay_client_toolkit::output::{OutputHandler, OutputInfo, OutputState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
-    LayerSurfaceConfigure,
+    LayerSurfaceConfigure, SurfaceKind,
 };
 use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
@@ -33,7 +44,10 @@ use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::{Transform, WlOutput};
 use smithay_client_toolkit::reexports::client::protocol::wl_shm::Format;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
-use smithay_client_toolkit::reexports::client::{Connection, Proxy, QueueHandle};
+use smithay_client_toolkit::reexports::client::{
+    Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop,
+};
+use smithay_client_toolkit::reexports::protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer as WlrLayer;
 use tiny_skia::PixmapMut;
 use tracing::{debug, error, warn};
 
@@ -83,9 +97,22 @@ pub struct Overlay {
 #[derive(Clone)]
 pub struct OverlayHandle {
     /// Wakes the overlay's event loop and delivers the new state.
-    sender : Sender<Message>,
+    sender    : Sender<Message>,
     /// Set to ask the overlay thread to finish.
-    stop   : Arc<AtomicBool>,
+    stop      : Arc<AtomicBool>,
+    /// What covers the windows right now; see [`Occluder`].
+    occluders : Arc<Mutex<Vec<Occluder>>>,
+}
+
+/// A layer surface on the top or overlay layer that covers part of the desk: the
+/// panel, a dock, a notification, a launcher. Whatever is under it is not on screen.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Occluder {
+    /// The layer shell namespace the surface was created with (`cosmic-panel` for
+    /// the panel and the dock).
+    pub namespace : String,
+    /// The covered area, global logical pixels.
+    pub rect      : Rect,
 }
 
 // --- Overlay ---
@@ -113,6 +140,13 @@ impl Overlay {
         let pool        = SlotPool::new(INITIAL_POOL_BYTES, &shm)?;
         let region      = Region::new(&compositor)?;
 
+        // Optional: without it nothing is known to cover the windows.
+        let overlap: Option<ZcosmicOverlapNotifyV1> = globals.bind(&qh, 1..=1, ()).ok();
+
+        if overlap.is_none() {
+            debug!("no zcosmic_overlap_notify_v1: layer surfaces over the windows go unnoticed");
+        }
+
         let mut app = App {
             registry_state : RegistryState::new(&globals),
             output_state   : OutputState::new(&globals, &qh),
@@ -121,6 +155,9 @@ impl Overlay {
             shm            : shm,
             pool           : pool,
             empty_region   : region,
+            overlap        : overlap,
+            overlaps       : Vec::new(),
+            occluders      : Arc::new(Mutex::new(Vec::new())),
             qh             : qh,
             surfaces       : Vec::new(),
             state          : OverlayState::default(),
@@ -227,8 +264,9 @@ impl Overlay {
     /// the channel.
     pub fn handle(&self) -> OverlayHandle {
         OverlayHandle {
-            sender : self.sender.clone(),
-            stop   : self.stop.clone(),
+            sender    : self.sender.clone(),
+            stop      : self.stop.clone(),
+            occluders : Arc::clone(&self.app.occluders),
         }
     }
 
@@ -299,6 +337,12 @@ impl OverlayHandle {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
+
+    /// The layer surfaces covering the windows right now, as the compositor last
+    /// reported them. Empty when the compositor cannot say.
+    pub fn occluders(&self) -> Vec<Occluder> {
+        self.occluders.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 /// What crosses the channel into the overlay thread. The state is by far the larger
@@ -328,6 +372,13 @@ struct App {
     /// Kept alive for the lifetime of the overlay so the object is never destroyed while
     /// a surface still refers to it.
     empty_region   : Region,
+    /// The overlap notifier, when the compositor has one.
+    overlap        : Option<ZcosmicOverlapNotifyV1>,
+    /// Every overlapping layer surface the compositor has reported and not withdrawn,
+    /// by its identifier, whatever layer it is on.
+    overlaps       : Vec<Overlap>,
+    /// The ones that cover the windows, published for [`OverlayHandle::occluders`].
+    occluders      : Arc<Mutex<Vec<Occluder>>>,
     /// Needed to create surfaces and request frame callbacks outside a handler.
     qh             : QueueHandle<App>,
     surfaces       : Vec<OutputSurface>,
@@ -339,6 +390,20 @@ struct App {
     theme_watch    : Option<ThemeWatch>,
     /// The presenter's timeline starts when the overlay does.
     clock          : Instant,
+}
+
+/// One layer surface overlapping one of ours, as the compositor described it.
+struct Overlap {
+    /// The compositor's identifier for the surface, the key `layer_leave` uses.
+    identifier : String,
+    /// Which of our surfaces it was reported against, so the rectangle can be
+    /// placed on the desk.
+    output     : Rect,
+    /// Above the windows: the top or overlay layer.
+    above      : bool,
+    namespace  : String,
+    /// The overlapping area, in our surface's coordinates.
+    area       : Rect,
 }
 
 /// One output's layer surface and the buffers behind it.
@@ -658,6 +723,12 @@ impl App {
         // The initial commit carries no buffer; the compositor answers with a configure.
         layer.commit();
 
+        // Ask what covers this surface. The notification is tagged with the output's
+        // rectangle, which is what turns its surface-local areas into desk pixels.
+        if let (Some(overlap), SurfaceKind::Wlr(wlr)) = (&self.overlap, layer.kind()) {
+            overlap.notify_on_overlap(wlr, &self.qh, mapping.logical);
+        }
+
         debug!(
             output = %mapping.name,
             "overlay surface created for {:?} scale {}",
@@ -680,6 +751,29 @@ impl App {
     /// Index of the surface owning a `wl_surface`.
     fn surface_index(&self, surface: &WlSurface) -> Option<usize> {
         self.surfaces.iter().position(|s| s.layer.wl_surface() == surface)
+    }
+
+    /// Rebuilds the published occluders from the overlaps: the ones above the windows
+    /// that are not the overlay's own surfaces, in desk pixels.
+    fn publish_occluders(&self) {
+        let occluders: Vec<Occluder> = self
+            .overlaps
+            .iter()
+            .filter(|o| o.above && o.namespace != NAMESPACE)
+            .map(|o| Occluder {
+                namespace : o.namespace.clone(),
+                rect      : Rect {
+                    x : o.output.x + o.area.x,
+                    y : o.output.y + o.area.y,
+                    w : o.area.w,
+                    h : o.area.h,
+                },
+            })
+            .collect();
+
+        debug!(count = occluders.len(), "layer surfaces over the windows: {occluders:?}");
+
+        *self.occluders.lock().unwrap_or_else(|e| e.into_inner()) = occluders;
     }
 }
 
@@ -818,6 +912,49 @@ impl ProvidesRegistryState for App {
     registry_handlers![OutputState];
 }
 
+impl Dispatch<ZcosmicOverlapNotificationV1, Rect> for App {
+    /// Layer surfaces entering and leaving ours. Toplevels are reported too, but the
+    /// session has a better source for those.
+    fn event(
+        app    : &mut Self,
+        _proxy : &ZcosmicOverlapNotificationV1,
+        event  : OverlapEvent,
+        output : &Rect,
+        _conn  : &Connection,
+        _qh    : &QueueHandle<Self>,
+    ) {
+        match event {
+            OverlapEvent::LayerEnter { identifier, namespace, exclusive: _, layer, x, y, width, height } => {
+                let above = matches!(layer, WEnum::Value(WlrLayer::Top | WlrLayer::Overlay));
+
+                app.overlaps.retain(|o| o.identifier != identifier);
+                app.overlaps.push(Overlap {
+                    identifier : identifier,
+                    output     : *output,
+                    above      : above,
+                    namespace  : namespace,
+                    area       : Rect {
+                        x : f64::from(x),
+                        y : f64::from(y),
+                        w : f64::from(width),
+                        h : f64::from(height),
+                    },
+                });
+
+                app.publish_occluders();
+            }
+
+            OverlapEvent::LayerLeave { identifier } => {
+                app.overlaps.retain(|o| o.identifier != identifier);
+                app.publish_occluders();
+            }
+
+            _ => {}
+        }
+    }
+}
+
+delegate_noop!(App: ignore ZcosmicOverlapNotifyV1);
 delegate_compositor!(App);
 delegate_output!(App);
 delegate_shm!(App);

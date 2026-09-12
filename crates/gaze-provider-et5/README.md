@@ -129,6 +129,11 @@ nottobii keeps one session across its whole init; nothing observed here needs th
   driver does. SIGINT is held off for the duration; **a process killed mid-upload
   wedges the tracker until it is physically unplugged and replugged**. Replaces the
   old `cal-restore`, which uploaded with no plane and no verification.
+- The daemon's Calibrate button runs the **quick ceremony** (`retrain::plan_quick`):
+  seeded with the current blob, one round of five targets (centre and the training
+  rectangle's corners) over the dimmed desktop, applied once, then the same health
+  check as below. A top-up for a session that feels off; the full ceremony is for a
+  remount.
 - `calibrate [--daydream] [--manual]` — **the retrain ceremony** (`src/retrain.rs`):
   the one command that writes the tracker's own eye model. With `--daydream` the
   controller's pad click takes each point (the gate's vote only checks that the reported
@@ -190,10 +195,9 @@ nottobii keeps one session across its whole init; nothing observed here needs th
   re-enumerated as it finished, so the file it wrote described a model the device no
   longer had.
 
-  **Retrain once.** The correction field and the online offset are keyed to the
-  blob's hash, so a retrain starts both over. Run this after a remount, a fresh
-  device, or a deliberate experiment — not when a session feels off; the offset
-  absorbs a day's drift by itself.
+  **Retrain after a remount, a fresh device, or a deliberate experiment.** When a
+  session merely feels off, the applet's Calibrate button runs the quick ceremony
+  below instead.
 
 - `health [--grid 4] [--daydream]` — the health check on its own against the committed
   model: uploads the blob, declares the trained plane, dwells on the grid, replaces the
@@ -209,9 +213,9 @@ nottobii keeps one session across its whole init; nothing observed here needs th
 `gaze-proto` (and `gazed`) run the full snap/click session on this provider; they pick
 up `config/calibration-et5.toml` from the desk's files. In direct mode the firmware's
 trained 2D output is mapped to the panel, run through the head-gain correction and the
-correction field the health check fitted, and then moved by the online offset.
+correction field the health check fitted.
 
-The online offset (`offset.rs`, PLAN-ET5 D5) is the day's yaw/pitch bias, learnt from
+
 the real mouse and the Daydream pad while the session runs. The ray from the eyes
 through the calibrated point is rotated by the offset for the current posture and
 intersected with the desk again (`correct_direction`, the inverse of the leftover a
@@ -251,11 +255,7 @@ decoder, the correction field fits, the head-gain regression, the retrain's plan
 function (the nearest-target vote with and without a radius, and a one-target round
 accepting on frames alone) and its seed resolution against a real blob, the
 point-suggestion decoder, the provider's edge-pinning and dropout-hold behaviour and
-its sensor-to-desk rotation, the ray-correction inverse and the yaw/pitch
-decomposition against reference values, the online offset's convergence, gate, clip
-and file round trip, and the provider's click attribution (an empty offset leaves the
-calibrated point alone, a click on the gaze point leaves nothing, a click beside it
-moves the next sample towards it, a far click is refused), the connect sequence
+its sensor-to-desk rotation, the connect sequence
 ordering
 (`device::connect_sequence` for every combination of blob, plane and double upload),
 the blob hashing and diff helpers, the trailer decoder against the last 1 KB of two

@@ -113,6 +113,21 @@ own limit (~0.7° inside the cone), with drift that corrects itself from ordinar
   from `calibrate`; recording moves to Phase B. Keep the pose solver and the lag/saccade
   helpers as library code (B2 uses them).
 
+### A6. Quick ceremony from the applet (built 2026-09-12)
+- The daemon runs `retrain::plan_quick` between two sessions on a `Calibrate` bus call:
+  the same plane and nine-point grid as A5, one round of five points (centre, then the
+  four corners in Talon's far-apart order) on the desktop dimmed under translucent
+  black, seeded with the current blob, applied once, `min_points` five.
+- Five and not nine so the fourteen-point FIFO keeps nine of the seed's points beside the
+  new ones: the two-background coverage of A5 survives a top-up, and a quick ceremony is
+  a correction of the model rather than a replacement.
+- No pupil-adaptation wait (one second to find the dot, overlapped with the seed
+  upload). A5's 4x4 health check follows, so every run logs rms and median and refits the
+  field. `verify_persistence` and the file write-out are shared with the CLI
+  (`retrain::write_calibration`).
+- Replaces the online offset (D5) as the answer to "it drifted": a fresh firmware fit
+  in seconds, on demand, instead of twenty clicks the user cannot place while it is off.
+
 ## Phase B — Recording (removed 2026-09-10; git history before `169862f`)
 
 ### B1. `record` command
@@ -334,6 +349,10 @@ acquisition.
   **Decoupled 2026-09-10** from the removed model: the offset runs whenever there is a
   direct-mode calibration, keyed to the calibration's blob, and moves the calibrated
   point (after the field and the head gain) in angle space.
+  **Removed 2026-09-12** (git history). Twenty accepted clicks per posture is a price
+  that cannot be paid while the gaze is off, and the user cannot place the clicks that
+  would fix it. The daemon's quick retrain (A6) replaces it: a fresh firmware fit in
+  seconds, on demand, from the applet. The mouse feed (`feedback.rs`) went with it.
 
 ## Phase E — Flywheel (E1 and E3 removed 2026-09-10; E2 is live in the offset)
 

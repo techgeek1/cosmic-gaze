@@ -14,7 +14,7 @@ just install-desk   # desk.toml, the ET5 calibration and the detector models int
 ```
 
 Then add the "Gaze" applet to a panel (Settings, Desktop, Panel, Configure panel
-applets) and press Start in its popup. Stop, Pause, Reset offset and the tuning sliders
+applets) and flip the switch in its popup. Calibrate, Pause and the tuning sliders
 are in the same popup; the daemon's log is `~/.local/state/cosmic-gaze/gazed.log`. The
 daemon does not start with the session, so the tracker only runs while it is wanted.
 

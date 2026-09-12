@@ -51,9 +51,11 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    // Info by default; RUST_LOG overrides it.
+    // Info by default; RUST_LOG overrides it. Stderr, not the default stdout: the applet
+    // discards the daemon's stdout and keeps its stderr as the log file.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_writer(std::io::stderr)
         .init();
 
     let args  = Args::parse();

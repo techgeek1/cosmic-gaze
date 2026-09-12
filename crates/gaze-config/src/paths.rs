@@ -17,7 +17,7 @@ pub struct Paths {
     pub config_dir : PathBuf,
     /// The ONNX models. Large, downloaded, never edited.
     pub models_dir : PathBuf,
-    /// The online offset: what the daemon writes as it runs.
+    /// What the daemon writes as it runs: its log.
     pub state_dir  : PathBuf,
 }
 
@@ -39,8 +39,7 @@ impl Paths {
         }
     }
 
-    /// A checkout's layout: `DIR/config` for config and state both (the prototype kept
-    /// the offset next to the calibration) and `DIR/models`.
+    /// A checkout's layout: `DIR/config` for config and state both, and `DIR/models`.
     pub fn home(dir: &Path) -> Paths {
         Paths {
             config_dir : dir.join("config"),
@@ -64,11 +63,6 @@ impl Paths {
         self.config_dir.join("calibration-et5.bin")
     }
 
-    /// Where the online offset persists across runs.
-    pub fn offset(&self) -> PathBuf {
-        self.state_dir.join("offset-et5.json")
-    }
-
 }
 
 // --- Tests ---
@@ -86,7 +80,6 @@ mod tests {
         assert_eq!(paths.desk(),        Path::new("./config/desk.toml"));
         assert_eq!(paths.calibration(), Path::new("./config/calibration-et5.toml"));
         assert_eq!(paths.device_blob(), Path::new("./config/calibration-et5.bin"));
-        assert_eq!(paths.offset(),      Path::new("./config/offset-et5.json"));
         assert_eq!(paths.models_dir,    Path::new("./models"));
     }
 

@@ -8,11 +8,9 @@
 //! the ET5 is the only path left, so this is a thin face over its provider that the
 //! session and the daemon's status read through.
 
-use std::path::Path;
-use std::time::Instant;
 use anyhow::{Context, Result};
-use gaze_core::{DesktopGeometry, GazeProvider, GazeSample, GlobalPx};
-use gaze_provider_et5::{ClickFeedback, Et5Calibration, Et5Provider, OffsetParams, OffsetSummary};
+use gaze_core::{DesktopGeometry, GazeProvider, GazeSample};
+use gaze_provider_et5::{Et5Calibration, Et5Provider};
 use tracing::{info, warn};
 
 use crate::config::SourceSpec;
@@ -91,7 +89,6 @@ impl GazeSource {
     /// end-to-end mapping never applies, so its absence is loud.
     pub fn open(spec: &SourceSpec, geometry: &DesktopGeometry) -> Result<GazeSource> {
         let calibration = spec.calibration.as_deref();
-        let offset      = spec.offset.as_deref();
 
         let loaded_calibration = {
             match calibration {
@@ -106,27 +103,15 @@ impl GazeSource {
                    (gaze-et5-cli calibrate fixes it)");
         }
 
-        // A frozen offset is a gain of zero with nowhere to write: clicks are still
-        // attributed and logged, so a run can watch the leftovers without moving anything.
-        let offset_params = match offset {
-            Some(_) => OffsetParams::default(),
-            None    => OffsetParams { alpha: 0.0, ..OffsetParams::default() },
-        };
-
         let provider = Et5Provider::create()
             .geometry(geometry.clone())
             .calibration(loaded_calibration)
-            .offset_path(offset.map(Path::to_path_buf))
-            .offset_params(offset_params)
             .device_blob(&spec.device_blob)
             .start()
             .context("starting the ET5 provider (tracker on the bus, nothing else holding it?)")?;
 
         info!(
             calibration = ?calibration.map(|p| p.display().to_string()),
-            offset      = ?offset.map(|p| p.display().to_string()),
-            frozen      = offset.is_none(),
-            commits     = "the controller's pad; no mouse is read for commits",
             "provider: et5"
         );
 
@@ -138,23 +123,6 @@ impl GazeSource {
         self.provider.next()
     }
 
-    /// The clock real clicks must be stamped on to be attributed, when this source can
-    /// learn from them: the provider running its online offset. `None` is also the
-    /// signal not to read the real mouse for labels.
-    pub fn click_clock(&self) -> Option<Instant> {
-        self.provider.offset_summary().map(|_| self.provider.started_at())
-    }
-
-    /// Hands a real click to the online offset. See `Et5Provider::observe_click`.
-    pub fn observe_click(&mut self, px: GlobalPx, t_s: f64) -> Option<ClickFeedback> {
-        self.provider.observe_click(px, t_s)
-    }
-
-    /// Forgets the online offset.
-    pub fn reset_offset(&mut self) {
-        self.provider.reset_offset();
-    }
-
     /// Whether the samples are flowing: the ET5's link is up.
     pub fn connected(&self) -> bool {
         self.provider.connected()
@@ -163,11 +131,6 @@ impl GazeSource {
     /// Whether a calibration was loaded.
     pub fn calibrated(&self) -> bool {
         self.provider.calibrated()
-    }
-
-    /// The online offset in brief, when it is running.
-    pub fn offset_summary(&self) -> Option<OffsetSummary> {
-        self.provider.offset_summary()
     }
 
     /// What this source is called in logs.

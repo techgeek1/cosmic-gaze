@@ -6,9 +6,9 @@
 //! `gaze_core::DesktopGeometry` and gaze-inject has no use for it.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use gaze_core::{GlobalPx, Rect};
+use gaze_core::{DesktopGeometry, GlobalPx, Rect};
 use serde::Deserialize;
 
 use crate::{InjectError, Result};
@@ -72,6 +72,29 @@ impl DeskLayout {
         }
 
         Ok(DeskLayout { outputs: config.outputs })
+    }
+
+    /// The layout of an already parsed desk geometry: the same `[[outputs]]` rects,
+    /// without a second read of the file. What the daemon uses, so the injector never
+    /// depends on the working directory.
+    pub fn from_geometry(geometry: &DesktopGeometry) -> Result<DeskLayout> {
+        if geometry.outputs.is_empty() {
+            return Err(InjectError::EmptyLayout { path: PathBuf::from("<geometry>") });
+        }
+
+        let outputs = geometry
+            .outputs
+            .iter()
+            .map(|o| OutputLayout {
+                name      : o.name.clone(),
+                logical_x : o.logical_x,
+                logical_y : o.logical_y,
+                logical_w : o.logical_w,
+                logical_h : o.logical_h,
+            })
+            .collect();
+
+        Ok(DeskLayout { outputs: outputs })
     }
 
     /// Union bounding box of every output's logical rect, in global px:
