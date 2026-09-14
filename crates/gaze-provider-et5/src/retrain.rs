@@ -152,10 +152,14 @@ pub const BLACK: [u8; 4] = [0, 0, 0, 255];
 /// Fully opaque white, the high-illumination half.
 pub const WHITE: [u8; 4] = [255, 255, 255, 255];
 
-/// Translucent black over the desktop, the quick ceremony's background: dark enough
-/// that the target reads against anything under it, light enough that the screen
-/// still shows through and the pupil stays put.
+/// Translucent black over the desktop, the quick ceremony's background on a dark
+/// desktop: dark enough that the target reads against anything under it, light enough
+/// that the screen still shows through and the pupil stays put.
 pub const DIM: [u8; 4] = [0, 0, 0, 176];
+
+/// The same veil for a light desktop: translucent white, so the screen dims towards the
+/// colour it already is rather than going dark on a user whose pupil is set for light.
+pub const DIM_LIGHT: [u8; 4] = [255, 255, 255, 176];
 
 /// Pixels per degree fallback when the geometry cannot supply a local scale.
 const FALLBACK_PX_PER_DEG: f64 = 60.0;
@@ -317,6 +321,9 @@ pub struct RetrainConfig {
     /// What the health check runs on. Grey by default, so its numbers compare across
     /// runs; the daemon keeps the quick ceremony's dim so the two read as one thing.
     pub health_background : Background,
+    /// Whether the desktop is in its dark mode, which picks the veil's colour
+    /// (`Background::Dim`). The caller reads it from the theme; true when unknown.
+    pub dark              : bool,
 }
 
 impl Default for RetrainConfig {
@@ -336,6 +343,7 @@ impl Default for RetrainConfig {
             manual            : false,
             health_steps      : HEALTH_STEPS,
             health_background : Background::Neutral,
+            dark              : true,
         }
     }
 }
@@ -470,20 +478,21 @@ pub enum Background {
     /// Opaque mid grey, the health check's default: neither pupil extreme, so its
     /// numbers describe an ordinary screen rather than the training conditions.
     Neutral,
-    /// The desktop dimmed under a translucent black, for the quick ceremony: the
+    /// The desktop dimmed under a translucent veil, for the quick ceremony: the
     /// targets are visible, the screen is still there, and the pupil stays near the
-    /// state it works at.
+    /// state it works at. Black over a dark desktop, white over a light one.
     Dim,
 }
 
 impl Background {
-    /// The colour the overlay paints.
-    pub fn color(&self) -> [u8; 4] {
+    /// The colour the overlay paints. `dark` is the desktop's mode, which only the
+    /// veil follows: the extremes and the grey are the same on any desktop.
+    pub fn color(&self, dark: bool) -> [u8; 4] {
         match self {
-            Self::Black => BLACK,
+            Self::Black   => BLACK,
             Self::White   => WHITE,
             Self::Neutral => NEUTRAL,
-            Self::Dim     => DIM,
+            Self::Dim     => if dark { DIM } else { DIM_LIGHT },
         }
     }
 
@@ -1053,7 +1062,7 @@ pub fn run_retrain(
             Some(round) => {
                 let anchor = anchor_point(plan, round)?;
 
-                set_overlay_background(Some(round.background.color()));
+                set_overlay_background(Some(round.background.color(config.dark)));
                 show_target(overlay, anchor.px, 0.0)?;
 
                 Some((round.background, anchor.px, Instant::now()))
@@ -1241,7 +1250,7 @@ fn run_round(
     // that would be labelled with an illumination the eye had not reached.
     if *background != Some(round.background) {
         *background = Some(round.background);
-        set_overlay_background(Some(round.background.color()));
+        set_overlay_background(Some(round.background.color(config.dark)));
 
         let anchor = anchor_point(plan, round)?;
 
@@ -1608,7 +1617,7 @@ pub fn run_health(
     let frames_rx  = device.gaze_stream();
     let (u_lo, u_hi, v_lo, v_hi) = plan.train_uv;
 
-    set_overlay_background(Some(config.health_background.color()));
+    set_overlay_background(Some(config.health_background.color(config.dark)));
 
     let steps     = config.health_steps.max(2);
     let mut stops = Vec::with_capacity(steps * steps);

@@ -23,8 +23,15 @@ pub struct Service {
 impl Service {
     /// Claims the bus name and serves the interface. The connection runs on zbus's own
     /// thread; dropping it drops the name.
+    ///
+    /// The name is claimed without replacement either way: zbus's default lets a second
+    /// `gazed` take it from a running one, which then kept the tracker, the uinput
+    /// devices and a dead cursor tracker while the applet's Stop reached only the
+    /// newcomer (2026-09-13). A second start fails here instead, and its log says so.
     pub fn serve(live: Arc<Live>) -> zbus::Result<Connection> {
         let conn = Builder::session()?
+            .allow_name_replacements(false)
+            .replace_existing_names(false)
             .name(BUS_NAME)?
             .serve_at(BUS_PATH, Service { live: live })?
             .build()?;

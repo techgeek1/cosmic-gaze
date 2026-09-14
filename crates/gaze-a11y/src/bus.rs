@@ -675,6 +675,12 @@ const SPAN_SAMPLE: usize = 2;
 /// something to scroll, and a page with this little to scroll is not worth the pointer.
 const MIN_OVERFLOW_PX: f64 = 48.0;
 
+/// Largest coordinate or size a node's extents may have and still be a placed node,
+/// logical pixels. A toolkit reports a node it has not laid out at `i32::MIN` or thereabouts
+/// (a `frame` on the LG, 2026-09-12, whose "content" then began 2^31 px above it), and
+/// taken as content that put a scroll up on a window with nothing to scroll.
+const MAX_EXTENT_PX: f64 = 1.0e6;
+
 /// A clipping node shorter than this is not a scroll viewport, and the walk continues
 /// past it. A table cell whose glyphs overhang it, a one-line label taller than its row:
 /// these overflow their parent by the geometric test too, and taking the first of them
@@ -716,7 +722,7 @@ pub const MIN_CLIP_PX: f64 = 120.0;
 pub fn clip_surface(chain: &[Node], window_h: f64) -> Option<Surface> {
     let placed : Vec<&Node> = chain
         .iter()
-        .filter(|n| n.rect.is_some_and(|r| r.w > 0.0 && r.h > 0.0))
+        .filter(|n| n.rect.is_some_and(is_placed))
         .collect();
 
     for pair in placed.windows(2) {
@@ -744,6 +750,17 @@ pub fn clip_surface(chain: &[Node], window_h: f64) -> Option<Surface> {
     }
 
     None
+}
+
+/// Whether extents describe a node that has been laid out: a positive size, and
+/// coordinates a screen could hold rather than a toolkit's "nowhere" sentinel.
+fn is_placed(r: Rect) -> bool {
+    r.w > 0.0
+        && r.h > 0.0
+        && r.x.abs() <= MAX_EXTENT_PX
+        && r.y.abs() <= MAX_EXTENT_PX
+        && r.w <= MAX_EXTENT_PX
+        && r.h <= MAX_EXTENT_PX
 }
 
 /// The smallest rectangle holding both.
@@ -942,6 +959,18 @@ mod tests {
         assert_eq!(surface.clip.role, "document web");
         assert_eq!(surface.content, Rect { x: 1283.0, y: 251.0, w: 1271.0, h: 4836.0 });
         assert!(surface.content.y >= surface.viewport.y, "nothing above: at the top of the page");
+    }
+
+    #[test]
+    fn a_node_at_the_toolkits_nowhere_sentinel_is_not_overflowing_content() {
+        // The LG's Firefox frame on 2026-09-12: a child laid out at i32::MIN made the
+        // frame a surface with 2^31 px "above", and the top band offered a scroll up.
+        let chain = vec![
+            boxed("section" , 2559.0, -2147483648.0, 3840.0, 1600.0),
+            boxed("frame"   , 2559.0,           0.0, 3840.0, 1600.0),
+        ];
+
+        assert!(clip_surface(&chain, 1600.0).is_none());
     }
 
     #[test]

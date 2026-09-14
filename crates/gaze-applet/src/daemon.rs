@@ -4,12 +4,14 @@
 //! at once ([`poll`]) on a timer, which survives the daemon restarting or not being there
 //! at all, and calls the methods as fire-and-forget tasks. One bus connection is made
 //! lazily and kept for the life of the process. Starting the daemon is the one thing
-//! not done over the bus: [`start`] runs the installed `gazed`.
+//! not done over the bus: [`start`] runs the installed `gazed`, and keeps the child so
+//! that [`stop`] can signal a daemon that does not answer its bus `Quit`.
 
 use std::fs::{self, OpenOptions};
-use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use gaze_config::{BUS_NAME, BUS_PATH, GazeProxy, Paths, Status};
@@ -28,10 +30,25 @@ const DAEMON: &str = "gazed";
 /// The daemon's log, under the XDG state directory, appended to across runs.
 const LOG_NAME: &str = "gazed.log";
 
+/// How long a daemon gets to exit after its bus `Quit` before it is signalled, and
+/// again after `SIGTERM` before `SIGKILL`. The daemon's own stop grace is five seconds;
+/// a daemon still there after that is not winding down.
+const STOP_GRACE: Duration = Duration::from_secs(6);
+
+/// How often [`stop`] checks whether the daemon has exited.
+const STOP_POLL: Duration = Duration::from_millis(100);
+
+/// The daemon this applet started, until it is seen to exit. Only this applet's own
+/// child: a daemon started elsewhere is reachable over the bus alone.
+static CHILD: Mutex<Option<Child>> = Mutex::new(None);
+
 /// Runs the daemon. It reads its files from the XDG locations and logs to
-/// [`LOG_NAME`]; whether it came up is what the next poll says. A thread reaps it, so
-/// a daemon that exits does not linger as a zombie of the panel.
+/// [`LOG_NAME`]; whether it came up is what the next poll says. The child is kept for
+/// [`stop`], and reaped by [`reap`] on every poll so a daemon that exits on its own
+/// does not linger as a zombie of the panel.
 pub fn start() -> Result<()> {
+    reap();
+
     let state = Paths::xdg().state_dir;
 
     fs::create_dir_all(&state).with_context(|| format!("creating {}", state.display()))?;
@@ -43,7 +60,7 @@ pub fn start() -> Result<()> {
         .open(&log_path)
         .with_context(|| format!("opening {}", log_path.display()))?;
 
-    let mut child = Command::new(DAEMON)
+    let child = Command::new(DAEMON)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log)
@@ -52,25 +69,100 @@ pub fn start() -> Result<()> {
 
     tracing::info!(pid = child.id(), log = %log_path.display(), "daemon started");
 
-    thread::Builder::new()
-        .name("gazed-reaper".to_string())
-        .spawn(move || match child.wait() {
-            Ok(status) => tracing::info!(%status, "daemon exited"),
-            Err(e)     => tracing::warn!("waiting for the daemon failed: {e}"),
-        })
-        .context("spawning the reaper thread")?;
+    *CHILD.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
 
     Ok(())
 }
 
-/// Asks the daemon to end its session and exit.
-pub async fn quit() {
+/// Collects the daemon this applet started if it has exited, logging its status.
+/// Called on every poll and before every start; harmless when there is nothing to reap.
+pub fn reap() {
+    let mut slot = CHILD.lock().unwrap_or_else(|e| e.into_inner());
+
+    let exited = match slot.as_mut() {
+        Some(child) => match child.try_wait() {
+            Ok(Some(status)) => {
+                tracing::info!(%status, "daemon exited");
+
+                true
+            }
+
+            Ok(None) => false,
+
+            Err(e) => {
+                tracing::warn!("waiting for the daemon failed: {e}");
+
+                true
+            }
+        },
+
+        None => false,
+    };
+
+    if exited {
+        *slot = None;
+    }
+}
+
+/// Asks the daemon to end its session and exit, and sees that it does. The bus `Quit`
+/// is the polite way and the only way to a daemon another applet started; for this
+/// applet's own child, a daemon still running after [`STOP_GRACE`] gets `SIGTERM`, and
+/// after another grace `SIGKILL`. The waiting happens on a thread of its own, so the
+/// popup stays live; the next polls show the daemon going.
+pub async fn stop() {
+    quit().await;
+
+    if CHILD.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+        return;
+    }
+
+    if let Err(e) = thread::Builder::new()
+        .name("gazed-stop".to_string())
+        .spawn(ensure_stopped)
+    {
+        tracing::warn!("cannot watch the daemon stop: {e}");
+    }
+}
+
+/// Asks the daemon over the bus to end its session and exit.
+async fn quit() {
     let Some(proxy) = gaze_proxy().await else {
         return;
     };
 
     if let Err(e) = proxy.quit().await {
         tracing::warn!("daemon quit failed: {e}");
+    }
+}
+
+/// Waits for this applet's daemon to exit, escalating to signals when it does not.
+fn ensure_stopped() {
+    for signal in [libc::SIGTERM, libc::SIGKILL] {
+        let since = Instant::now();
+
+        while since.elapsed() < STOP_GRACE {
+            reap();
+
+            if CHILD.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                return;
+            }
+
+            thread::sleep(STOP_POLL);
+        }
+
+        let slot = CHILD.lock().unwrap_or_else(|e| e.into_inner());
+
+        let Some(child) = slot.as_ref() else {
+            return;
+        };
+
+        tracing::warn!(pid = child.id(), signal = signal, "daemon did not exit after quit, signalling");
+
+        // The pid is this applet's unreaped child, so it cannot have been reused.
+        // SAFETY: `kill` has no memory-safety preconditions.
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, signal);
+        }
     }
 }
 
@@ -97,7 +189,10 @@ async fn connection() -> Option<Connection> {
 }
 
 /// Reads every property in one round trip. `None` when the daemon is not on the bus.
+/// Also the reaper's tick.
 pub async fn poll() -> Option<Status> {
+    reap();
+
     let conn = connection().await?;
 
     let proxy = PropertiesProxy::builder(&conn)

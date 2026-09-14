@@ -135,6 +135,13 @@ trait InjectBackend {
     /// reports it; the caller keeps them consistent.
     fn wheel(&mut self, clicks: i32, hi_res: i32) -> Result<()>;
 
+    /// Whether this backend can measure the pointer right now: a cursor tracker is
+    /// connected. False for the absolute backend and while the relative one is open loop,
+    /// when `last_known_position` is `None` for want of a tracker rather than a pointer.
+    fn measures(&self) -> bool {
+        false
+    }
+
     /// Last known measured cursor position, if this backend can observe one. The default
     /// `None` covers the absolute backend and the relative backend's open-loop fallback,
     /// neither of which has a cursor tracker to ask; the closed-loop relative backend
@@ -239,8 +246,18 @@ impl Injector {
     /// closed-loop relative backend can; the open-loop fallback and the absolute backend
     /// cannot and return `Ok(None)`). Useful for confirming where a `move_to` actually
     /// landed without eyeballing it, e.g. `gaze-inject-cli --probe`.
+    ///
+    /// A long-running caller should call this every few milliseconds whether or not it
+    /// wants the answer: it is also what drains the cursor tracker's connection, and a
+    /// compositor hangs up on a client that leaves its socket unread (see `rel`).
     pub fn last_known_position(&mut self) -> Result<Option<GlobalPx>> {
         self.backend.last_known_position()
+    }
+
+    /// Whether [`Injector::last_known_position`] measures anything right now. False
+    /// means its `None` is "cannot tell", not "on no output".
+    pub fn measures(&self) -> bool {
+        self.backend.measures()
     }
 }
 

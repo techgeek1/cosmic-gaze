@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -30,6 +30,11 @@ use crate::supervise::Options;
 /// How often the tuning watch flag is polled. A slider drag writes many keys a second;
 /// each poll folds whatever landed into one reload.
 const TUNING_POLL: Duration = Duration::from_millis(100);
+
+/// How long the session gets to wind down after a stop before the process exits
+/// without it. The loop notices within a sample and the provider closes in well under a
+/// second; the rest is the grace for a device that is slow to release.
+const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// The daemon's command line. Everything else is the tuning and the desk's files.
 #[derive(Debug, Parser)]
@@ -51,10 +56,21 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    // Info by default; RUST_LOG overrides it. Stderr, not the default stdout: the applet
-    // discards the daemon's stdout and keeps its stderr as the log file.
+    // Info by default, with RUST_LOG's directives on top rather than instead: the panel
+    // starts the daemon with the session's `RUST_LOG=cosmic_greeter=info`, and taken as
+    // the whole filter that kept every gaze line out of the log. (`EnvFilter`'s default
+    // directive only applies when the variable is empty, so the spec is joined by hand.)
+    // Stderr, not the default stdout: the applet discards the daemon's stdout and keeps
+    // its stderr as the log file.
+    let filter = {
+        match std::env::var("RUST_LOG") {
+            Ok(spec) if !spec.trim().is_empty() => format!("info,{spec}"),
+            _                                   => "info".to_string(),
+        }
+    };
+
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(EnvFilter::new(filter))
         .with_writer(std::io::stderr)
         .init();
 
@@ -103,7 +119,8 @@ fn main() -> Result<()> {
     // --- control interface ---
 
     // Kept alive for the life of the process: dropping the connection drops the name.
-    let _conn = Service::serve(Arc::clone(&live)).context("serving the control interface")?;
+    let _conn = Service::serve(Arc::clone(&live))
+        .context("serving the control interface (is another gazed running?)")?;
 
     // --- signals ---
 
@@ -151,6 +168,21 @@ fn main() -> Result<()> {
             if tuning != live.tuning() {
                 live.set_tuning(tuning);
             }
+        }
+
+        thread::sleep(TUNING_POLL);
+    }
+
+    // A session that does not wind down (a provider stuck in a blocking read) must not
+    // keep the process, its devices and the bus name alive: the applet's Stop and a
+    // signal both have to end it.
+    let asked = Instant::now();
+
+    while !session.is_finished() {
+        if asked.elapsed() > STOP_GRACE {
+            warn!(grace_s = STOP_GRACE.as_secs_f64(), "session did not stop in time, exiting anyway");
+
+            std::process::exit(1);
         }
 
         thread::sleep(TUNING_POLL);

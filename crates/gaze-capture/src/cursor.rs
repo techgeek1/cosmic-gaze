@@ -209,9 +209,12 @@ impl CursorTracker {
 
     /// Blocks until the compositor reports a new pointer position, or `timeout` elapses.
     ///
-    /// Returns the new position on success. Returns `Ok(None)` both on timeout and when
-    /// the new event was a `leave`, because in either case there is no current position to
-    /// act on; use [`position`](Self::position) afterwards if the distinction matters.
+    /// Returns the new position on success and `Ok(None)` on timeout. A `leave` on its
+    /// own does not end the wait: crossing from one output to the next arrives as a
+    /// leave, an enter and a position, sometimes over two reads, and a caller stepping
+    /// the pointer that took the leave as an answer kept its stale estimate and stepped
+    /// again blind, which is how a warp to the seam between two displays wandered 140 px
+    /// into the lower one before settling. The position that follows is the answer.
     pub fn wait_position(&mut self, timeout: Duration)
         -> Result<Option<GlobalPx>, CaptureError>
     {
@@ -221,8 +224,10 @@ impl CursorTracker {
         loop {
             self.pump()?;
 
-            if self.state.updates != start {
-                return Ok(self.state.last);
+            if self.state.updates != start
+                && let Some(position) = self.state.last
+            {
+                return Ok(Some(position));
             }
 
             let now = Instant::now();
@@ -273,10 +278,10 @@ impl CursorTracker {
     /// queue is dispatched both before and after it so events that were already parsed are
     /// not left sitting until the next call.
     fn pump(&mut self) -> Result<(), CaptureError> {
-        self.queue.flush().map_err(wayland_err)?;
+        self.queue.flush().map_err(|e| self.failed(e))?;
         self.queue
             .dispatch_pending(&mut self.state)
-            .map_err(|e| CaptureError::Protocol { detail: e.to_string() })?;
+            .map_err(|e| self.failed_str(e.to_string()))?;
 
         // `prepare_read` returns None when events are already queued, in which case the
         // dispatch above and below is all that is needed.
@@ -288,20 +293,43 @@ impl CursorTracker {
                 Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {}
 
                 Err(e) => {
-                    return Err(wayland_err(e));
+                    return Err(self.failed(e));
                 }
             }
         }
 
         self.queue
             .dispatch_pending(&mut self.state)
-            .map_err(|e| CaptureError::Protocol { detail: e.to_string() })?;
+            .map_err(|e| self.failed_str(e.to_string()))?;
 
         // Outputs that appeared or vanished in this batch get their sessions fixed up.
         self.state.sync_sessions(&self.qh);
-        self.queue.flush().map_err(wayland_err)?;
+        self.queue.flush().map_err(|e| self.failed(e))?;
 
         Ok(())
+    }
+
+    /// Wraps a backend error as a protocol error, naming the compositor's own error
+    /// when it posted one. A broken pipe on its own says the compositor hung up; the
+    /// `wl_display.error` it may have sent first says why, and only the connection
+    /// still has it.
+    fn failed(&self, e: WaylandError) -> CaptureError {
+        self.failed_str(e.to_string())
+    }
+
+    /// [`CursorTracker::failed`] for an error already rendered as text.
+    fn failed_str(&self, e: String) -> CaptureError {
+        let detail = {
+            match self.conn.protocol_error() {
+                Some(p) => format!(
+                    "{e} (compositor error {} on {}@{}: {})",
+                    p.code, p.object_interface, p.object_id, p.message,
+                ),
+                None    => e,
+            }
+        };
+
+        CaptureError::Protocol { detail: detail }
     }
 
     /// Waits up to `timeout` for the wayland socket to become readable.
@@ -673,9 +701,3 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, u32> for CursorState {
 }
 delegate_noop!(CursorState: ignore ZxdgOutputManagerV1);
 
-// --- Helpers ---
-
-/// Wraps a backend error as a protocol error, which is the only shape callers care about.
-fn wayland_err(e: WaylandError) -> CaptureError {
-    CaptureError::Protocol { detail: e.to_string() }
-}

@@ -1,5 +1,5 @@
 //! The relative backend: a plain `REL_X`/`REL_Y` mouse. Two modes behind the same
-//! `move_to`, chosen once at construction:
+//! `move_to`, chosen per call by whether a cursor tracker is connected:
 //!
 //! - **Closed-loop** (primary): when `gaze_capture::CursorTracker::connect()` succeeds,
 //!   `move_to` reads the real cursor position, emits a relative step capped in magnitude
@@ -13,6 +13,15 @@
 //!   imprecise scheme - accurate only if the device happens to be configured for the
 //!   `flat` libinput accel profile at unity speed - kept as a last resort so the backend
 //!   still does *something* on a cosmic-comp without the cursor-position protocol.
+//!
+//! The tracker is a Wayland connection, and the compositor hangs up on a client that
+//! stops reading its socket: every mouse motion is a `position` event, and a session
+//! that only read the tracker around its own warps found the connection dead ("broken
+//! pipe") after twenty seconds to a few minutes of ordinary mouse use, and stayed on
+//! the last warp's position for the rest of the day. So the tracker is drained on
+//! every [`InjectBackend::last_known_position`], which the session calls once a sample,
+//! and a tracker that fails is dropped and reconnected after [`TRACKER_RETRY`]: a move
+//! in between goes open loop rather than failing.
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -68,10 +77,12 @@ const STEP_GAIN: f64 = 0.5;
 /// correction.
 const MIN_STEP_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Closed-loop convergence tolerance, in global px. "Within 1 px" per the design: cursor
-/// position is reported in integer device pixels, so anything under this is as exact as
-/// measurement allows.
-const CONVERGENCE_PX: f64 = 1.0;
+/// Closed-loop convergence tolerance, in global px. Cursor position is reported in
+/// integer device pixels, so on one output a pixel is as exact as measurement allows;
+/// at the seam between outputs of different scales a one-count step lands on a
+/// different pixel grid, and a 1 px tolerance had the pointer hopping across the seam
+/// for the whole correction budget. Two pixels is under what a hand notices.
+const CONVERGENCE_PX: f64 = 2.0;
 
 /// Maximum closed-loop correction steps before giving up and returning
 /// `InjectError::Unreachable`.
@@ -87,26 +98,34 @@ const MAX_ITERATIONS: u32 = 8;
 /// on the following step instead of stacking blind resends.
 const POLL_TIMEOUT: Duration = Duration::from_millis(200);
 
-/// `REL_X`/`REL_Y` device: a plain mouse. Which `move_to` strategy is used is decided once
-/// at construction time by whether `tracker` is `Some`; see the module docs.
+/// How long after a cursor tracker fails before another connection is tried. Short
+/// enough that a warp rarely goes open loop twice in a row, long enough not to hammer a
+/// compositor that is refusing the capture protocol.
+const TRACKER_RETRY: Duration = Duration::from_secs(2);
+
+/// `REL_X`/`REL_Y` device: a plain mouse. Which `move_to` strategy is used is decided per
+/// call by whether `tracker` is `Some`; see the module docs.
 pub(crate) struct RelativeInjector {
-    device  : VirtualDevice,
+    device   : VirtualDevice,
     /// Top-left corner of the desk layout's union bounding box, in global px. Used as the
     /// open-loop fallback's homing target, and as the closed-loop path's best guess for
     /// "just homed, no position observed yet".
-    origin  : GlobalPx,
-    /// `Some` when `gaze_capture::CursorTracker::connect()` succeeded at construction -
-    /// closed-loop mode. `None` when it failed - open-loop fallback mode.
-    tracker : Option<CursorTracker>,
+    origin   : GlobalPx,
+    /// `Some` while a cursor tracker is connected: closed-loop mode. `None` after a
+    /// connection failed or died: open-loop fallback until the next reconnect succeeds.
+    tracker  : Option<CursorTracker>,
+    /// When the tracker may next be reconnected, after a failure. `None` when one is
+    /// connected, or none has ever failed.
+    retry_at : Option<Instant>,
 }
 
 // --- RelativeInjector ---
 
 impl RelativeInjector {
     /// Opens `/dev/uinput` and registers the relative device, then tries to connect a
-    /// cursor tracker. A tracker failure is not fatal here - it just selects the
-    /// open-loop fallback for every subsequent `move_to` - so it's logged and swallowed
-    /// rather than propagated.
+    /// cursor tracker. A tracker failure is not fatal here - it selects the open-loop
+    /// fallback until a later reconnect succeeds - so it's logged and swallowed rather
+    /// than propagated.
     pub(crate) fn create(layout: &DeskLayout) -> Result<RelativeInjector> {
         let mut keys = AttributeSet::<KeyCode>::new();
         keys.insert(KeyCode::BTN_LEFT);
@@ -144,14 +163,58 @@ impl RelativeInjector {
             }
         };
 
-        Ok(RelativeInjector { device: device, origin: origin, tracker: tracker })
+        let retry_at = tracker.is_none().then(|| Instant::now() + TRACKER_RETRY);
+
+        Ok(RelativeInjector { device: device, origin: origin, tracker: tracker, retry_at: retry_at })
+    }
+
+    /// The cursor tracker, reconnecting it first if one failed and the retry is due.
+    /// `None` means open loop for now.
+    fn tracker(&mut self) -> Option<&mut CursorTracker> {
+        if self.tracker.is_none()
+            && self.retry_at.is_some_and(|at| Instant::now() >= at)
+        {
+            match CursorTracker::connect() {
+                Ok(tracker) => {
+                    tracing::info!("cursor tracker reconnected; pointer moves are closed loop again");
+
+                    self.tracker  = Some(tracker);
+                    self.retry_at = None;
+                }
+
+                Err(err) => {
+                    tracing::debug!("cursor tracker still unavailable ({err})");
+
+                    self.retry_at = Some(Instant::now() + TRACKER_RETRY);
+                }
+            }
+        }
+
+        self.tracker.as_mut()
+    }
+
+    /// Drops a tracker whose connection failed and schedules the reconnect. The error
+    /// carries the compositor's own reason when it sent one.
+    fn lose_tracker(&mut self, err: &InjectError) {
+        tracing::warn!(
+            "cursor tracker lost ({err}); pointer moves are open loop until it reconnects"
+        );
+
+        self.tracker  = None;
+        self.retry_at = Some(Instant::now() + TRACKER_RETRY);
     }
 
     /// Closed-loop `move_to`: repeatedly measures the real cursor position and steps
-    /// toward `target`, capping each step so acceleration stays in a sane regime. Only
-    /// called when `self.tracker` is `Some`.
-    fn move_to_closed_loop(&mut self, target: GlobalPx) -> Result<()> {
-        let mut current = self.measured_or_homed_position()?;
+    /// toward `target`, capping each step so acceleration stays in a sane regime.
+    fn move_to_closed_loop(
+        device  : &mut VirtualDevice,
+        tracker : &mut CursorTracker,
+        origin  : GlobalPx,
+        target  : GlobalPx,
+    )
+        -> Result<()>
+    {
+        let mut current = Self::measured_or_homed_position(device, tracker, origin)?;
 
         // Coarse stage: one uncapped jump straight at the target before the paced,
         // capped fine loop below. This is not optional for a large correction - measured
@@ -172,9 +235,7 @@ impl RelativeInjector {
             let dx = (target.x - current.x).round() as i32;
             let dy = (target.y - current.y).round() as i32;
 
-            Self::emit_rel(&mut self.device, dx, dy)?;
-
-            let tracker = self.tracker.as_mut().expect("closed loop requires a tracker");
+            Self::emit_rel(device, dx, dy)?;
 
             if let Some(p) = tracker.wait_position(POLL_TIMEOUT * 2).map_err(InjectError::CursorTracker)? {
                 current = p;
@@ -202,12 +263,8 @@ impl RelativeInjector {
             let dx = clamp_step(target.x - current.x);
             let dy = clamp_step(target.y - current.y);
 
-            Self::emit_rel(&mut self.device, dx, dy)?;
+            Self::emit_rel(device, dx, dy)?;
             last_emit = Some(Instant::now());
-
-            // `tracker` is `Some` for the whole lifetime of the closed-loop path; only
-            // `create` decides which mode a given `RelativeInjector` runs in.
-            let tracker = self.tracker.as_mut().expect("closed loop requires a tracker");
 
             if let Some(p) = tracker.wait_position(POLL_TIMEOUT).map_err(InjectError::CursorTracker)? {
                 current = p;
@@ -228,7 +285,7 @@ impl RelativeInjector {
     }
 
     /// Open-loop `move_to`: home to the layout corner, then one uncorrected relative
-    /// delta from there. Only called when `self.tracker` is `None`.
+    /// delta from there. The path taken while there is no tracker.
     fn move_to_open_loop(&mut self, target: GlobalPx) -> Result<()> {
         Self::home(&mut self.device)?;
 
@@ -241,21 +298,22 @@ impl RelativeInjector {
     /// Best known starting position for a closed-loop move: the tracker's last observed
     /// position if it has one, or - on a fresh session that hasn't seen the cursor move
     /// yet - home to the corner and wait for the resulting position event.
-    fn measured_or_homed_position(&mut self) -> Result<GlobalPx> {
-        {
-            let tracker = self.tracker.as_mut().expect("closed loop requires a tracker");
-
-            if let Some(p) = tracker.position().map_err(InjectError::CursorTracker)? {
-                return Ok(p);
-            }
+    fn measured_or_homed_position(
+        device  : &mut VirtualDevice,
+        tracker : &mut CursorTracker,
+        origin  : GlobalPx,
+    )
+        -> Result<GlobalPx>
+    {
+        if let Some(p) = tracker.position().map_err(InjectError::CursorTracker)? {
+            return Ok(p);
         }
 
-        Self::home(&mut self.device)?;
+        Self::home(device)?;
 
-        let tracker = self.tracker.as_mut().expect("closed loop requires a tracker");
-        let homed   = tracker.wait_position(POLL_TIMEOUT).map_err(InjectError::CursorTracker)?;
+        let homed = tracker.wait_position(POLL_TIMEOUT).map_err(InjectError::CursorTracker)?;
 
-        Ok(homed.unwrap_or(self.origin))
+        Ok(homed.unwrap_or(origin))
     }
 
     /// Emits the saturating negative `REL_X`/`REL_Y` pair that homes the cursor to the
@@ -282,11 +340,26 @@ impl RelativeInjector {
 
 impl InjectBackend for RelativeInjector {
     fn move_to(&mut self, target: GlobalPx) -> Result<()> {
-        if self.tracker.is_some() {
-            self.move_to_closed_loop(target)
-        }
-        else {
-            self.move_to_open_loop(target)
+        // Reconnect first if due; then the closed loop runs on the disjoint borrows of
+        // the device and the tracker, so a failure can drop the tracker afterwards.
+        let _ = self.tracker();
+
+        let origin  = self.origin;
+        let outcome = self.tracker.as_mut().map(|tracker| {
+            Self::move_to_closed_loop(&mut self.device, tracker, origin, target)
+        });
+
+        match outcome {
+            // The tracker died mid-move (the compositor hung up): this move goes open
+            // loop, and the next one tries the tracker again.
+            Some(Err(err @ InjectError::CursorTracker(_))) => {
+                self.lose_tracker(&err);
+
+                self.move_to_open_loop(target)
+            }
+
+            Some(result) => result,
+            None         => self.move_to_open_loop(target),
         }
     }
 
@@ -331,10 +404,26 @@ impl InjectBackend for RelativeInjector {
         self.device.emit(&events).map_err(InjectError::Emit)
     }
 
+    fn measures(&self) -> bool {
+        self.tracker.is_some()
+    }
+
+    /// Also the tracker's drain: see the module docs on why it must be called often.
+    /// A tracker that fails here is dropped for reconnection and reads as no position,
+    /// which every caller already handles.
     fn last_known_position(&mut self) -> Result<Option<GlobalPx>> {
-        match &mut self.tracker {
-            Some(tracker) => tracker.position().map_err(InjectError::CursorTracker),
-            None => Ok(None),
+        let Some(tracker) = self.tracker() else {
+            return Ok(None);
+        };
+
+        match tracker.position() {
+            Ok(position) => Ok(position),
+
+            Err(e) => {
+                self.lose_tracker(&InjectError::CursorTracker(e));
+
+                Ok(None)
+            }
         }
     }
 }
@@ -366,8 +455,8 @@ mod tests {
     fn converged_false_outside_tolerance() {
         let target = GlobalPx { x: 100.0, y: 100.0 };
 
-        assert!(!converged(target, GlobalPx { x: 102.0, y: 100.0 }));
-        assert!(!converged(target, GlobalPx { x: 100.0, y: 98.0 }));
+        assert!(!converged(target, GlobalPx { x: 102.5, y: 100.0 }));
+        assert!(!converged(target, GlobalPx { x: 100.0, y: 97.5 }));
     }
 
     #[test]

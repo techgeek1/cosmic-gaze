@@ -33,6 +33,11 @@ const UV_EPS: f64 = 1e-9;
 /// `f64` noise.
 const JACOBIAN_STEP_PX: f64 = 2.0;
 
+/// How far past an output's edge a neighbouring output may start and still count as
+/// beyond that edge, logical pixels. Compositors place adjacent outputs edge to edge, but
+/// a layout arranged by hand can leave a pixel or two of gap or overlap.
+const EDGE_SLACK_PX: f64 = 4.0;
+
 /// One physical output and its placement. Loaded from `config/desk.toml`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OutputGeometry {
@@ -114,6 +119,48 @@ impl DesktopGeometry {
     /// Output containing `p`, if any enabled output's logical rect does.
     pub fn output_at(&self, p: GlobalPx) -> Option<&OutputGeometry> {
         self.outputs.iter().find(|o| o.enabled && o.contains_px(p))
+    }
+
+    /// The output that claims a point past `from`'s edge, if one does. `p` is where a
+    /// ray landed on `from`'s surface extended past its edges (see
+    /// [`OutputGeometry::project_px`]); a point still inside `from` is nobody else's.
+    /// Another output claims it when its logical rect contains it, or when it sits
+    /// beyond the edge `p` left through and spans `p` along that edge: a display
+    /// arranged below another owns everything under that edge across its width, however
+    /// far down, because the eyes there are on it, not past a bezel.
+    ///
+    /// Disabled outputs count. A display the tracker's calibration does not cover is
+    /// disabled for ray intersection so it cannot steal hits, but it is still on the desk,
+    /// and a gaze on it is not a gaze past the calibrated one's edge.
+    pub fn output_beyond(&self, from: &str, p: GlobalPx) -> Option<&OutputGeometry> {
+        let a = self.outputs.iter().find(|o| o.name == from)?;
+
+        if a.contains_px(p) {
+            return None;
+        }
+
+        let a_right  = a.logical_x + a.logical_w;
+        let a_bottom = a.logical_y + a.logical_h;
+
+        self.outputs.iter().filter(|b| b.name != from).find(|b| {
+            if b.contains_px(p) {
+                return true;
+            }
+
+            let b_right  = b.logical_x + b.logical_w;
+            let b_bottom = b.logical_y + b.logical_h;
+            let spans_x  = p.x >= b.logical_x && p.x < b_right;
+            let spans_y  = p.y >= b.logical_y && p.y < b_bottom;
+
+            // Only one edge can be the one `p` left through on each axis; the other
+            // output has to lie on that side of `a` and cover `p` along the edge.
+            let below = p.y >= a_bottom    && b.logical_y >= a_bottom - EDGE_SLACK_PX && spans_x;
+            let above = p.y <  a.logical_y && b_bottom    <= a.logical_y + EDGE_SLACK_PX && spans_x;
+            let right = p.x >= a_right     && b.logical_x >= a_right - EDGE_SLACK_PX && spans_y;
+            let left  = p.x <  a.logical_x && b_right     <= a.logical_x + EDGE_SLACK_PX && spans_y;
+
+            below || above || right || left
+        })
     }
 
     /// World point on the panel surface under a global pixel. `None` if no enabled output
@@ -830,6 +877,38 @@ mod tests {
         assert!(out.dir.is_finite());
         assert!((out.dir.length() - 1.0).abs() < 1.0e-12);
         assert!((out.dir - DVec3::Y).length() < 1.0e-9);
+    }
+
+    #[test]
+    fn an_output_below_claims_the_gaze_past_the_bottom_edge_across_its_width() {
+        let g = desk();
+
+        // The fixture's portable panel sits below the seam, under DP-2's right part
+        // (x 1506..3176 at y 1600). A projected point under DP-2 in that span is on it,
+        // inside its rect and far below it alike; under DP-2's left part nothing is.
+        let under_right = GlobalPx { x: 2000.0, y: 1700.0 };
+        let far_below   = GlobalPx { x: 2000.0, y: 4000.0 };
+        let under_left  = GlobalPx { x: 500.0, y: 1700.0 };
+        let inside      = GlobalPx { x: 2000.0, y: 1500.0 };
+
+        assert_eq!(g.output_beyond("DP-2", under_right).map(|o| o.name.as_str()), Some("HDMI-A-1"));
+        assert_eq!(g.output_beyond("DP-2", far_below).map(|o| o.name.as_str()), Some("HDMI-A-1"));
+        assert_eq!(g.output_beyond("DP-2", under_left), None);
+        assert_eq!(g.output_beyond("DP-2", inside), None);
+
+        // Past DP-2's right edge is the LG, whatever its `enabled` flag says.
+        let mut g = g;
+        let right = GlobalPx { x: 2600.0, y: 800.0 };
+
+        assert_eq!(g.output_beyond("DP-2", right).map(|o| o.name.as_str()), Some("DP-1"));
+
+        for o in &mut g.outputs {
+            o.enabled = o.name == "DP-2";
+        }
+
+        assert_eq!(g.output_beyond("DP-2", right).map(|o| o.name.as_str()), Some("DP-1"));
+        assert_eq!(g.output_beyond("DP-2", under_right).map(|o| o.name.as_str()), Some("HDMI-A-1"));
+        assert_eq!(g.output_beyond("nope", right), None);
     }
 
     #[test]

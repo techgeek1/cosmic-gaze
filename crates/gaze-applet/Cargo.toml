@@ -18,6 +18,9 @@ tracing-subscriber = { workspace = true }
 # this workspace shares one feature set.
 zbus = { version = "5", default-features = false, features = ["async-io"] }
 
+# `kill(2)` for the daemon that ignores its bus `Quit`: `std` can only send SIGKILL.
+libc = "0.2"
+
 # The same pin cosmic-term builds against on this machine, so the git checkout is
 # already local (and shared with `gaze-overlay`'s cosmic-config). `applet` brings
 # autosize, multi-window and cosmic-panel-config; `tokio` is iced's executor.

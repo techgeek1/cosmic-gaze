@@ -1012,7 +1012,10 @@ only. Build plan and contracts: `PLAN-ET5.md`.
   extended past its edges, and the scroller takes `Eyes::Off(px)`: past the edge it is
   scrolling towards it counts as full depth and the scroll continues; past any other edge
   it is a look-away and stops; and it never *starts* a scroll, because the eyes below the
-  monitor are as likely on the keyboard as on the page.
+  monitor are as likely on the keyboard as on the page. 2026-09-12: a projection that
+  lands where another configured display sits (`DesktopGeometry::output_beyond`, the log
+  panel below the tracker's display) is a look at that display and a look-away here, and
+  the provider no longer clamps such a ray to the edge above it either.
 - 2026-09-04, **edge scroll: faster when asked.** "If I know I just want to go to the top
   that's very slow." Two multipliers on the band speed, both flags: a *hold* that starts
   after 1 s parked in the outer 40% of the band and doubles the speed every second after

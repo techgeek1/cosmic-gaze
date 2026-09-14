@@ -81,6 +81,15 @@ thread presents it on its own clock (`present.rs`). Rules:
   mouse and gaze are fully decoupled. The controller's
   held/idle arbitration against the mouse (gyro thresholds, a six-second window) is
   gone: the thumb is the intent, and nothing gaze-side moves the pointer otherwise.
+- **A hand on the mouse holds the scroller off.** The session reads the pointer every
+  sample (which also keeps the cursor tracker's connection drained; the compositor hangs
+  up on a client that leaves it unread, and did, for hours at a time, until 2026-09-12).
+  Motion it did not cause is the mouse in use, and for a second after the last of it the
+  scroller is shown nothing: no band, no start, and a running scroll stops. Reading a
+  PR's sticky file header while ticking "Viewed" no longer scrolls it away. Likewise a
+  gaze that leaves the tracker's display towards another configured display (the log
+  panel below it) is a look at that display, not a look past the bezel, so it neither
+  sustains a scroll at turbo nor, clamped to the edge above it, starts one.
 - **The calibration mark (2026-09-10).** The ceremonies (`calibrate`, the sweeps, the
   recording sessions) drew the debug look: an amber square, a magenta cross and a
   caption in the 5x7 font. They now draw a mark in the pointer look's language: a

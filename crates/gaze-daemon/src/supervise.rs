@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use gaze_config::{Mode, Paths, Status};
 use gaze_core::DesktopGeometry;
-use gaze_overlay::Overlay;
+use gaze_overlay::{Overlay, Theme};
 use gaze_proto::config::{DaydreamSpec, OverlayMode, SessionConfig, SourceSpec};
 use gaze_proto::{Live, session};
 use gaze_provider_et5::calibration::load_tracker_pitch;
@@ -181,6 +181,7 @@ fn calibrate(options: &Options, live: &Arc<Live>) -> Result<()> {
         tracker_pitch_deg : load_tracker_pitch(&desk),
         min_points        : QUICK_MIN_POINTS,
         health_background : Background::Dim,
+        dark              : Theme::cosmic().dark,
         ..RetrainConfig::default()
     };
 

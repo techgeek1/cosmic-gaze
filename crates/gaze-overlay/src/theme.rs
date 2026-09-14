@@ -53,6 +53,9 @@ pub struct Theme {
     /// Corner radius of the highlight, logical pixels: the theme's small radius, the
     /// one its buttons use, so the highlight looks like the widget it surrounds.
     pub radius_px : f64,
+    /// Whether the desktop is in its dark mode. What draws over the desktop (the
+    /// calibration ceremony's veil) picks a light or a dark version by this.
+    pub dark      : bool,
 }
 
 /// Keeps the theme's config watchers alive and records that something changed.
@@ -73,7 +76,7 @@ pub struct ThemeWatch {
 impl Theme {
     /// The stock COSMIC dark look, for when there is no theme to read.
     pub fn fallback() -> Theme {
-        Theme::from_parts(DEFAULT_DARK_ACCENT, DEFAULT_RADIUS_PX)
+        Theme::from_parts(DEFAULT_DARK_ACCENT, DEFAULT_RADIUS_PX, true)
     }
 
     /// Reads the active theme. Any key that cannot be read falls back to the stock
@@ -100,7 +103,7 @@ impl Theme {
             Err(e)    => {
                 warn!("cosmic theme config unavailable, using the stock look: {e}");
 
-                return Theme::from_parts(default_accent, DEFAULT_RADIUS_PX);
+                return Theme::from_parts(default_accent, DEFAULT_RADIUS_PX, dark);
             }
         };
 
@@ -122,7 +125,7 @@ impl Theme {
             }
         };
 
-        let theme = Theme::from_parts(accent, radius);
+        let theme = Theme::from_parts(accent, radius, dark);
 
         debug!(
             accent    = ?theme.accent,
@@ -134,12 +137,13 @@ impl Theme {
         theme
     }
 
-    /// Builds a theme from an opaque accent and a radius, deriving the halo.
-    pub fn from_parts(accent: [u8; 4], radius_px: f64) -> Theme {
+    /// Builds a theme from an opaque accent, a radius and the mode, deriving the halo.
+    pub fn from_parts(accent: [u8; 4], radius_px: f64, dark: bool) -> Theme {
         Theme {
             accent    : [accent[0], accent[1], accent[2], 255],
             halo      : halo_for(accent),
             radius_px : radius_px.max(0.0),
+            dark      : dark,
         }
     }
 
@@ -293,7 +297,7 @@ mod tests {
     /// Alpha scaling keeps the colour and clamps the alpha.
     #[test]
     fn alpha_is_replaced_not_multiplied() {
-        let theme = Theme::from_parts([10, 20, 30, 255], 8.0);
+        let theme = Theme::from_parts([10, 20, 30, 255], 8.0, true);
 
         assert_eq!(theme.accent_at(0.5), [10, 20, 30, 128]);
         assert_eq!(theme.accent_at(2.0), [10, 20, 30, 255]);

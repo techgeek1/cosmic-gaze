@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use gaze_core::{DesktopGeometry, Ray};
-use gaze_overlay::{Overlay, OverlayState};
+use gaze_overlay::{Overlay, OverlayState, Theme};
 use gaze_provider_et5::blob::{
     BlobCheck, BlobReport, CalibrationResult, EyeResult, body, body_sha256_hex,
     decode_trailer, first_difference,
@@ -1296,6 +1296,7 @@ fn health_cmd(
         tracker_pitch_deg : load_tracker_pitch(config),
         health_steps      : grid.max(2),
         health_background : Background::Neutral,
+        dark              : Theme::cosmic().dark,
         ..RetrainConfig::default()
     };
 
@@ -1409,6 +1410,7 @@ fn calibrate(args: CalibrateArgs) -> Result<()> {
         manual            : args.manual,
         health_steps      : args.health_grid.max(2),
         health_background : Background::Neutral,
+        dark              : Theme::cosmic().dark,
     };
 
     let plan = retrain::plan(&geometry, &retrain_config)?;

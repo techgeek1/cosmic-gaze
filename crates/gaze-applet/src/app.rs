@@ -357,7 +357,7 @@ impl cosmic::Application for App {
 
             Message::Stop => {
                 return cosmic::task::future(async {
-                    daemon::quit().await;
+                    daemon::stop().await;
 
                     Message::Called
                 });

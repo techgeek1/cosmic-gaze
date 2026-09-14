@@ -37,6 +37,9 @@ pub struct Warper {
     last_point : Option<GlobalPx>,
     /// When that warp happened.
     last_at    : Option<Instant>,
+    /// When the session last moved the pointer at all, warp or nudge. Motion the
+    /// tracker reports soon after is the session's own, not the mouse's.
+    touched_at : Option<Instant>,
     /// Warps performed (or, in a dry run, logged).
     warps      : u64,
 }
@@ -53,7 +56,19 @@ impl Warper {
     pub fn record_warp(&mut self, point: GlobalPx, now: Instant) {
         self.last_point = Some(point);
         self.last_at    = Some(now);
+        self.touched_at = Some(now);
         self.warps     += 1;
+    }
+
+    /// Records a nudge: the session moved the pointer without a destination of its own
+    /// (a refine step), so the motion the tracker reports next is not the mouse's.
+    pub fn record_nudge(&mut self, now: Instant) {
+        self.touched_at = Some(now);
+    }
+
+    /// When this session last moved the pointer by any means, if it has.
+    pub fn touched_at(&self) -> Option<Instant> {
+        self.touched_at
     }
 
     /// Where the last warp sent the pointer, if there has been one.

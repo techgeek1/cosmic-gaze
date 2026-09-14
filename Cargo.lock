@@ -1992,6 +1992,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gaze-config",
+ "libc",
  "libcosmic",
  "serde",
  "tracing",

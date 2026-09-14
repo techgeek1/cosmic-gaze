@@ -85,6 +85,22 @@ const REFINE_MIN_PX: f64 = 2.0;
 /// farther and something else (the mouse, a scroll) has moved it, so the point is stale.
 const RESUME_NEAR_PX: f64 = 24.0;
 
+/// Pointer motion between two samples beyond this, logical pixels, that this session did
+/// not cause is the mouse being used. The tracker quantises to physical pixels and a
+/// still mouse reports nothing, so anything over a couple of pixels is a hand.
+const MOUSE_MOVE_PX: f64 = 3.0;
+
+/// How long after the mouse last moved the eyes may not scroll, seconds. A hand on the
+/// mouse is the user driving; the eyes reading a PR's sticky file header while the hand
+/// ticks "Viewed" must not scroll it away. Long enough to cover the pauses within a
+/// gesture, short enough that reading resumes scrolling soon after the hand rests.
+const MOUSE_QUIET_S: f64 = 1.0;
+
+/// How long after this session moved the pointer its reported motion is still the
+/// session's own, seconds. The tracker reports a warp a frame or two late, and a
+/// closed-loop warp settles over several reports.
+const TOUCH_SETTLE_S: f64 = 0.3;
+
 /// The scroll zone's closing reach as a multiple of its opening one
 /// ([`APPROACH_FRACTION`] band heights), so its inner edge does not blink the zone.
 const ZONE_HYSTERESIS: f64 = 1.5;
@@ -310,6 +326,10 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
     // Where the pointer was before an edge scroll warped it into the surface; it goes
     // back there when the scroll stops, so scrolling by eye leaves the pointer alone.
     let mut parked      : Option<GlobalPx> = None;
+    // The pointer as the tracker last reported it, and when motion the session did not
+    // cause was last seen there: the mouse in use, which holds the scroller off.
+    let mut pointer_seen : Option<GlobalPx> = None;
+    let mut mouse_at     : Option<Instant>  = None;
     // The element the overlay is marking, as of the last sample, and its centre. With a
     // thumb on the pad the pointer is borrowed and sits on it: what is highlighted is
     // what a pad press clicks, and the hover the app shows agrees.
@@ -524,6 +544,8 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
                         // measure-and-correct flurry shakes the cursor visibly.
                         let (dx, dy) = r.take_step();
 
+                        warper.record_nudge(Instant::now());
+
                         if let Some(injector) = injector.as_mut()
                             && let Err(e) = injector.move_by(dx, dy)
                         {
@@ -627,6 +649,33 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
         // and a control in the band never holds a scroll off.
         let input = (pad_down || latched) && !paused;
 
+        // The pointer, every sample: it drains the cursor tracker, which the compositor
+        // otherwise hangs up on, and motion this session did not cause is the mouse in
+        // use. The eyes do not scroll under a hand that is driving.
+        if let Some(injector) = injector.as_mut()
+            && let Ok(Some(pointer)) = injector.last_known_position()
+        {
+            let now    = Instant::now();
+            let jumped = pointer_seen.is_some_and(|p| {
+                (p.x - pointer.x).hypot(p.y - pointer.y) > MOUSE_MOVE_PX
+            });
+            let ours   = warper.touched_at().is_some_and(|at| {
+                now.duration_since(at).as_secs_f64() < TOUCH_SETTLE_S
+            });
+
+            if jumped && !ours {
+                if mouse_at.is_none_or(|at| now.duration_since(at).as_secs_f64() >= MOUSE_QUIET_S) {
+                    debug!(x = %format_args!("{:.0}", pointer.x), y = %format_args!("{:.0}", pointer.y), "the mouse is in use");
+                }
+
+                mouse_at = Some(now);
+            }
+
+            pointer_seen = Some(pointer);
+        }
+
+        let mouse = mouse_at.is_some_and(|at| at.elapsed().as_secs_f64() < MOUSE_QUIET_S);
+
         // Edge scrolling first: a scroll decides whether the snap engine may retarget at
         // all this sample, and a scroll that starts here takes the highlight down with it.
         let (scrolling, zone) = {
@@ -641,7 +690,7 @@ pub fn run(config: &SessionConfig, live: &Live) -> Result<()> {
             let covered            = !was
                 && (live.popup_open()
                     || gaze.is_some_and(|g| overlay.occluders().iter().any(|o| o.rect.contains(g))));
-            let quiet              = input || paused || covered;
+            let quiet              = input || paused || covered || mouse;
             let (stopped, surface) = edge_scroll(
                 &mut scroller,
                 &mut surfaces,
@@ -1108,9 +1157,16 @@ fn wheel(injector: Option<&mut Injector>, warper: &Warper, detents: i32) {
 /// delivers wheel motion to the surface under the pointer and nowhere else, so borrowing
 /// it is the least the scroll can do without compositor help.)
 ///
-/// `quiet` (the eyes are pointing: a thumb on the pad or the latch on) shows the
-/// scroller no surface and no eyes, which stops a running scroll and arms nothing,
-/// without the gaze ever reaching it.
+/// `quiet` (the eyes are pointing: a thumb on the pad or the latch on; or the hand is
+/// on the mouse) shows the scroller no surface and no eyes, which stops a running
+/// scroll and arms nothing, without the gaze ever reaching it.
+///
+/// Eyes tracked but on no panel are projected onto the surface's own panel extended
+/// past its edges, so the scroller can tell "went off the bottom" from "looked away".
+/// A projected point another display claims (`DesktopGeometry::output_beyond`) is a
+/// look at that display, and the scroller sees a look-away: the portable panel below
+/// the tracker's display is not "past the bezel", and a scroll sustained at turbo by a
+/// glance at the log terminal there was the bug.
 #[allow(clippy::too_many_arguments)]
 fn edge_scroll(
     scroller : &mut EdgeScroller,
@@ -1132,7 +1188,7 @@ fn edge_scroll(
     };
 
     // Eyes tracked but on no panel: project the ray onto the surface's own panel, extended
-    // past its edges, so the scroller can tell "went off the bottom" from "looked away".
+    // past its edges, unless another display is where the projection lands.
     let eyes = match (gaze, filtered.sample.valid, &filtered.sample.ray) {
         _ if quiet              => Eyes::Lost,
         (Some(g), _, _)         => Eyes::On(g),
@@ -1140,7 +1196,14 @@ fn edge_scroll(
             surface
                 .and_then(|s| output_at(geometry, s.viewport.center()))
                 .and_then(|name| geometry.outputs.iter().find(|o| o.name == name))
-                .and_then(|output| output.project_px(ray))
+                .and_then(|output| {
+                    let projected = output.project_px(ray)?;
+
+                    match geometry.output_beyond(&output.name, projected) {
+                        Some(_) => None,
+                        None    => Some(projected),
+                    }
+                })
                 .map_or(Eyes::Lost, Eyes::Off)
         }
         _                      => Eyes::Lost,
@@ -1152,7 +1215,17 @@ fn edge_scroll(
         EdgeAction::Start { dir, point } => {
             let surface  = surface.expect("a start comes from a surface");
             let viewport = surface.viewport;
-            let pointer  = pointer_position(injector.as_deref_mut(), warper);
+            // Where the pointer is parked is where the stop returns it, so only a
+            // measured position is worth keeping when one is possible at all: the
+            // last warp's point stands in for a backend that cannot measure, but a
+            // measuring one that sees no pointer (on an output with no cursor
+            // session) must not send it to wherever the last warp went.
+            let pointer  = {
+                match injector.as_deref().is_some_and(Injector::measures) {
+                    true  => injector.as_deref_mut().and_then(|i| i.last_known_position().ok().flatten()),
+                    false => pointer_position(injector.as_deref_mut(), warper),
+                }
+            };
 
             info!(
                 dir   = ?dir,

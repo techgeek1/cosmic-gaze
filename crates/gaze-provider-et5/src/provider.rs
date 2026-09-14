@@ -36,7 +36,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 
 use crossbeam_channel::{RecvTimeoutError, TryRecvError};
 use glam::{DQuat, DVec3};
@@ -889,8 +889,14 @@ fn mean_origin(frame: &Et5Frame) -> Option<DVec3> {
 /// between the panel-centre anchor (which hits) and the miss direction. A panel is a
 /// candidate while the ray is within [`CLAMP_MARGIN_DEG`] of its angular extent: the
 /// angle to its centre less the angle its farthest corner subtends from that centre.
+///
+/// A ray that lands on another configured display when carried past the panel's edge
+/// is not clamped to that edge: the eyes are on the other display, calibrated or not
+/// (`DesktopGeometry::output_beyond`). The portable panel below the tracker's display
+/// has no calibration, so it catches no rays, and without this a look at its top rows
+/// was a fixation pinned to the bottom edge above it, which started edge scrolls there.
 fn edge_point(geometry: &DesktopGeometry, ray: &Ray) -> Option<gaze_core::GlobalPx> {
-    let mut candidates: Vec<(f64, DVec3)> = geometry.outputs.iter()
+    let mut candidates: Vec<(f64, DVec3, &gaze_core::OutputGeometry)> = geometry.outputs.iter()
         .filter(|o| o.enabled)
         .map(|o| {
             let centre = o.uv_to_world(0.5, 0.5) - ray.origin;
@@ -899,16 +905,25 @@ fn edge_point(geometry: &DesktopGeometry, ray: &Ray) -> Option<gaze_core::Global
                 .fold(0.0_f64, f64::max);
             let beyond = centre.angle_between(ray.dir) - extent;
 
-            (beyond, centre)
+            (beyond, centre, o)
         })
-        .filter(|(beyond, _)| beyond.is_finite())
+        .filter(|(beyond, _, _)| beyond.is_finite())
         .collect();
 
     candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    for (beyond, centre) in candidates {
+    for (beyond, centre, out) in candidates {
         if beyond.to_degrees() > CLAMP_MARGIN_DEG {
             break;
+        }
+
+        // Another display under the extended ray owns the gaze; no edge of this one does.
+        if let Some(projected) = out.project_px(ray)
+            && let Some(other) = geometry.output_beyond(&out.name, projected)
+        {
+            trace!(panel = %out.name, on = %other.name, "ray past the edge lands on another display, not clamped");
+
+            continue;
         }
 
         let anchor = centre.normalize();
