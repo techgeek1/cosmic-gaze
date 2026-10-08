@@ -52,7 +52,7 @@
 //!   (confirmed live: DP-2, DP-1, and HDMI-A-1 centres all landed within 1 px), this
 //!   wasn't worth building for Phase 0.
 
-// The style guide (`(private notes)`) requires explicit field syntax
+// The project's code style (CLAUDE.md) requires explicit field syntax
 // (`Foo { x: x }`) everywhere, which clippy's default lints read as redundant. Every
 // other crate in this workspace carries the same allow for the same reason.
 #![allow(clippy::redundant_field_names)]

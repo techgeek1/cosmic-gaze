@@ -16,7 +16,9 @@ each report a `PropertiesChanged` on `Value`, and one match rule over the device
 also carries the device's `Connected` property, so a controller going to sleep and coming
 back is handled on the same iterator. No HCI socket, no async runtime, no `bluer`.
 
-Pair once (the controller must be awake: hold Home until the light blinks):
+Pair once (the controller must be awake: hold Home until the light blinks). Find your
+controller's address in the scan output: it is the device named `Daydream controller`.
+`bluetoothctl devices` lists the addresses BlueZ has seen once the scan has run.
 
 ```
 bluetoothctl scan on

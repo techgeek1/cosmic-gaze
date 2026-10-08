@@ -1,3 +1,8 @@
+# The author's desk, checked in as a worked example. Every number below describes one
+# particular set of monitors, mount and seating position; edit it for yours (output
+# names and logical rects from `cosmic-randr list`, sizes and positions in mm from a
+# tape measure) before running gazed or a calibration against it.
+#
 # Physical layout of the desk. World frame: origin at the ET5's camera, which is
 # clip-mounted centred under DP-2's bottom bezel (2026-09-09 remount; it lived under
 # DP-1 from the 2026-08 pivot until then), +X right, +Y up, +Z toward the user, mm.

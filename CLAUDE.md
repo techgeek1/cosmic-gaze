@@ -6,9 +6,9 @@ tracker provider and its calibration, `PLAN-UX.md` for the overlay, daemon and a
 and `PLAN-INTENT.md` for the intent models (recorder, trainer, scorer, forecaster).
 
 ## Code style
-Follow `(private notes)` exactly (column-aligned fields/args, `// --- X ---`
-section headers, explicit struct field syntax, docs on every item, edition 2024, no
-`mod.rs`). Verification and scope rules: `(private notes)`.
+Column-aligned fields and args, `// --- X ---` section headers, explicit struct field
+syntax (`Foo { x: x }`), docs on every item, edition 2024, no `mod.rs`. Match the code
+around you.
 
 ## Verification
 - `cargo build --workspace` and `cargo test --workspace` must pass with zero warnings.
