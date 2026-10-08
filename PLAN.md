@@ -1,5 +1,11 @@
 # Phase 0 build plan: does gaze + vision snapping work at all?
 
+> **Historical record.** This is a design and planning document kept as it was written
+> while the project was built. Parts of what it describes were later removed (the
+> residual model and its trainer, the webcam provider and its sidecar, the benchmark
+> harness, the online offset), and some plans in it were never built. The code is the
+> source of truth; where this disagrees with it, the code wins.
+
 **Status 2026-08-26: complete. Verdict and numbers in DESIGN.md §10b. Next phase: fine channel
 (Daydream controller daemon + refine modes in gaze-proto), then online recalibration.
 ET5 provider rebuild (host-owned device state, the retrain ceremony): `PLAN-ET5.md`. The

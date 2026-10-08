@@ -1,5 +1,12 @@
 # cosmic-gaze — Design & Research Dossier
 
+> **Historical record.** This is a design and planning document kept as it was written
+> while the project was built. Parts of what it describes were later removed (the
+> residual model and its trainer, the webcam provider and its sidecar, the benchmark
+> harness, the online offset), and some plans in it were never built. The code is the
+> source of truth; where this disagrees with it, the code wins. Mentions of "Agentic
+> Memory" refer to the author's private notes and are not part of this repo.
+
 **Status:** pre-implementation research complete. **Research date:** 2026-08-25 (links and market facts are time-sensitive). Findings are also mirrored in Agentic Memory (`gaze-input-landscape-2026-08`, `gaze-snapping-design-references-2026-08`, `cua-pipeline-mining-2026-08`).
 
 ---

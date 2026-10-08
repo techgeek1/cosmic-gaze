@@ -1,5 +1,12 @@
 # PLAN-INTENT: which thing did they mean
 
+> **Historical record.** This is a design and planning document kept as it was written
+> while the project was built. Parts of what it describes were later removed (the
+> residual model and its trainer, the webcam provider and its sidecar, the benchmark
+> harness, the online offset), and some plans in it were never built. The code is the
+> source of truth; where this disagrees with it, the code wins. Mentions of "Agentic
+> Memory" refer to the author's private notes and are not part of this repo.
+
 **Status 2026-09-10: planned, nothing built.** Research pass and sources: DESIGN.md §3 and
 the Agentic Memory note `cosmic-gaze-intent-model-research-2026-09-10`.
 

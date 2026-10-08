@@ -1,5 +1,11 @@
 # UX build plan: a quiet overlay, a daemon, an applet
 
+> **Historical record.** This is a design and planning document kept as it was written
+> while the project was built. Parts of what it describes were later removed (the
+> residual model and its trainer, the webcam provider and its sidecar, the benchmark
+> harness, the online offset), and some plans in it were never built. The code is the
+> source of truth; where this disagrees with it, the code wins.
+
 **Status 2026-09-10: U1, U2 and U3 built; U4 next.** Everything before this was a prototype driven from a
 terminal with a debug overlay that drew the raw gaze point, a box on whatever the snap
 engine favoured and a caption. It worked and it was exhausting to look at: a ring on the

@@ -1,5 +1,11 @@
 # ET5 provider build plan: host-owned device state, then a state-conditioned model
 
+> **Historical record.** This is a design and planning document kept as it was written
+> while the project was built. Parts of what it describes were later removed (the
+> residual model and its trainer, the webcam provider and its sidecar, the benchmark
+> harness, the online offset), and some plans in it were never built. The code is the
+> source of truth; where this disagrees with it, the code wins.
+
 **Status 2026-09-10: Phase A, D5 and E2 are the product. Phases B, C, D1–D3 and E1/E3 were
 built (2026-09-04 to 09-09) and removed on 2026-09-10 by the user's ruling: Phase C ran on
 five click sessions and the per-eye direction kernel model took the held-out per-click
