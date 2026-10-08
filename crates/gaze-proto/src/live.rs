@@ -1,8 +1,9 @@
 //! What crosses between the session loop and whoever runs it, while it runs.
 //!
 //! The daemon holds one [`Live`] per session: it pushes tuning in when the config
-//! changes, flips the pause flag and asks for an offset reset from its D-Bus methods,
-//! and reads the [`Status`] the loop keeps current for its properties. The loop polls
+//! changes, flips the pause flag, records whether the applet's popup is open, asks for a
+//! quick calibration and for the session to stop, all from its D-Bus methods, and reads
+//! the [`Status`] the loop keeps current for its properties. The loop polls
 //! it once per sample. Everything is a flag or a small copy behind a mutex, so the loop
 //! never blocks on the daemon and the daemon never blocks on the loop.
 

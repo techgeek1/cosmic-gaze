@@ -88,8 +88,8 @@ impl Et5Frame {
 // --- Ray assembly ---
 
 /// The naive combined gaze ray of a frame: midpoint origin, mean direction, or the
-/// single tracked eye. Stateless; `EyeCombiner` is what the provider and the sweep
-/// actually use, because near the tracking envelope one eye degrades badly before it
+/// single tracked eye. Stateless; `EyeCombiner` is what the provider actually uses,
+/// because near the tracking envelope one eye degrades badly before it
 /// drops and an unweighted average follows it down.
 pub fn combined_ray(frame: &Et5Frame) -> Option<(DVec3, DVec3, bool)> {
     let left  = eye_ray(frame.left_valid(), frame.eye_origin_l_mm, frame.gaze_3d_l_mm);

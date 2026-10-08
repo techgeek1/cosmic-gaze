@@ -9,8 +9,8 @@
 //!
 //! The trailer is not device scratch. Measured 2026-08-28 on a 604948 byte blob, the
 //! last 520 bytes are 13 records of 40 bytes, one per unique target of the retrain
-//! ceremony (`sweep.rs`'s ring plus the lean dots), each holding the target and the
-//! position each eye was measured at. Reading a blob back re-expresses that table in
+//! ceremony of the time (a ring plus four lean dots, from the since-removed
+//! `sweep.rs`), each holding the target and the position each eye was measured at. Reading a blob back re-expresses that table in
 //! whatever display area is declared *at read time*: the same table retrieved under
 //! the trained plane and under the oversized virtual plane differs by exactly the
 //! affine map between the two planes (measured: scale 0.3669 across and 0.2604 down,
@@ -448,7 +448,7 @@ mod tests {
         assert_eq!(table.targets.len(), 13);
 
         // The ring (centre, right, then anticlockwise around RING_RX/RING_RY) followed
-        // by the four lean dots, exactly the order `sweep.rs` lays them out.
+        // by the four lean dots, exactly the order the since-removed `sweep.rs` laid them out.
         let expected = [
             [0.50, 0.50], [0.70, 0.50], [0.50, 0.80], [0.30, 0.50],
             [0.35, 0.50], [0.65, 0.50], [0.50, 0.35], [0.50, 0.65],

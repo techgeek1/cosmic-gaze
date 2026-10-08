@@ -197,7 +197,7 @@ nottobii keeps one session across its whole init; nothing observed here needs th
 
   **Retrain after a remount, a fresh device, or a deliberate experiment.** When a
   session merely feels off, the applet's Calibrate button runs the quick ceremony
-  below instead.
+  above instead.
 
 - `health [--grid 4] [--daydream]` — the health check on its own against the committed
   model: uploads the blob, declares the trained plane, dwells on the grid, replaces the
@@ -215,37 +215,12 @@ up `config/calibration-et5.toml` from the desk's files. In direct mode the firmw
 trained 2D output is mapped to the panel, run through the head-gain correction and the
 correction field the health check fitted.
 
+There is no online correction on top of that. An offset learnt from real clicks used
+to sit here; it was removed on 2026-09-12 because it needed about twenty clicks the
+user could not place while the gaze was off. When a session drifts, the applet's
+quick calibration replaces it (git history has the old offset code and its notes).
 
-the real mouse and the Daydream pad while the session runs. The ray from the eyes
-through the calibrated point is rotated by the offset for the current posture and
-intersected with the desk again (`correct_direction`, the inverse of the leftover a
-click measures). Every physical press (and every pad commit) is attributed against the
-corrected rays of the 0.4 s before it and the median leftover, if under 3°, enters the
-offset clipped at 2°. The bias is keyed to where the eyes are: a set of anchors in tracker space, one per
-posture (60 mm reach on the binocular midpoint, rebuilt from the last eye spacing when
-one eye drops), each holding its own bias and blended by distance, so sitting up and
-slouching each keep their own correction instead of relearning one over twenty clicks.
-A click far from every anchor founds a new one at the blended prediction and its clicks
-enter at `1/(n+1)` over a two-click prior; established anchors move by a tenth. It
-persists to `config/offset-et5.json`, keyed to the calibration's blob; `gaze-proto
---freeze-offset` attributes and logs without moving it, and deleting the file starts
-cold. Leave-one-session-out on the 2026-09-04 click sessions put a single bias at
-0.2 to 0.3° of median error, the largest term after the firmware's own; the residual
-model that sat under it (1.83° to 1.44° held out, Phases C and D) was removed on
-2026-09-10 along with its trainer, recorder, exporter and flywheel, because the
-offset alone carried the day and the model's gain sat under the snap radius.
-
-The 3° gate has a way to be wrong: a bias larger than it (glasses moved, a knocked
-mount, a posture the anchors have not seen) rejects every click and the filter can
-never learn its way out. So rejects are held (PLAN-ET5 E2): when four recent rejects
-near one eye position agree to within 1° *and* were clicks on places at least 30 mm
-apart, their median is the truth, the anchor jumps to it in one unclipped step, and
-the session log says so (`click adopted`). Scattered rejects, and one widget clicked
-four times, stay rejected. A jump count lives in the offset file; a day with several
-wants a retrain, not a filter.
-
-Calibration files, blobs and the offset are gitignored (`/config/calibration*`,
-`/config/offset*.json`).
+Calibration files and blobs are gitignored (`/config/calibration*`).
 
 ## What was and was not run
 

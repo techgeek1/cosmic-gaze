@@ -6,9 +6,8 @@
 //! +Z toward the user). The desk world frame is defined with its origin at the tracker
 //! (`config/desk.toml`), so this provider treats tracker space as the world, with one
 //! optional correction: the tracker is physically pitched up at the face, and
-//! `tracker_pitch_deg` rotates device vectors into the desk frame until the
-//! calibration sweep solves display poses in tracker space directly (which makes the
-//! correction moot; solved poses live in the same frame as the rays).
+//! `tracker_pitch_deg` (from `desk.toml`) rotates device vectors into the desk frame.
+//! Display poses come from the desk file; nothing solves them from gaze data.
 //!
 //! # What a sample carries
 //!
@@ -170,7 +169,8 @@ impl Et5Provider {
     }
 
     /// Converts one already-received frame, for callers that stream `Et5Frame`s
-    /// directly (the calibration sweep) but want the standard sample view too.
+    /// directly (the retrain ceremony and health check) but want the standard sample
+    /// view too.
     pub fn convert(&mut self, frame: &Et5Frame) -> GazeSample {
         let t_s = self.t0.elapsed().as_secs_f64();
 
@@ -416,9 +416,9 @@ impl Et5ProviderBuilder {
         self
     }
 
-    /// Client-side calibration from a sweep: solved display poses replace the
-    /// configured ones, and each intersected point runs through the display's
-    /// correction field.
+    /// Client-side calibration (`config/calibration-et5.toml`): its display poses
+    /// replace the configured ones, and each intersected point runs through the
+    /// display's correction field.
     pub fn calibration(mut self, calibration: Option<Et5Calibration>) -> Self {
         self.calibration = calibration;
 
@@ -426,7 +426,7 @@ impl Et5ProviderBuilder {
     }
 
     /// Rotation about +X mapping device vectors into the desk frame, for a tracker
-    /// pitched up at the face. Zero once display poses are solved in tracker space.
+    /// pitched up at the face. Zero when the tracker sits level with the desk frame.
     pub fn tracker_pitch_deg(mut self, deg: f64) -> Self {
         self.tracker_pitch_deg = deg;
 
@@ -456,13 +456,13 @@ impl Et5ProviderBuilder {
         if let Some(calibration) = &self.calibration {
             calibration.apply_poses(&mut geometry);
 
-            // A display the sweep did not cover keeps a configured pose in a frame
+            // A display the calibration does not cover keeps a configured pose in a frame
             // that need not match the tracker's (and is certainly stale after a
             // remount); letting it catch rays would steal intersections from the
             // displays that are actually calibrated. The direct-mode display is the
             // exception: its plane is the one declared to the device, and it is the
             // per-eye ray's landing surface whenever the combined 2D drops out at an
-            // edge, whether or not a sweep ever wrote an entry for it.
+            // edge, whether or not the calibration has an entry for it.
             for out in &mut geometry.outputs {
                 let direct = calibration.device_output.as_deref() == Some(out.name.as_str());
 
@@ -566,8 +566,8 @@ fn load_device_blob(path: &std::path::Path) -> Option<Vec<u8>> {
 
 // --- Converter ---
 
-/// Frame-to-sample conversion state, separate from the provider so the sweep can run
-/// the identical mapping on frames it drained itself.
+/// Frame-to-sample conversion state, separate from the provider so a caller that drains
+/// frames itself can run the identical mapping on them.
 struct Converter {
     geometry       : DesktopGeometry,
     calibration    : Option<Et5Calibration>,

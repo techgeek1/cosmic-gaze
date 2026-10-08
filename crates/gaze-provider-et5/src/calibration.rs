@@ -1,18 +1,23 @@
-//! What a calibration sweep produces and `config/calibration-et5.toml` stores: solved
-//! display poses in tracker space and a correction field per display, plus the lag
-//! estimate and enough metadata to judge staleness.
+//! What the retrain ceremony (`crate::retrain`) writes and `config/calibration-et5.toml`
+//! stores: the plane the on-device model was trained against, the hash of that model's
+//! blob, the firmware's own per-point report, the post-retrain health check, and per
+//! display a correction field fitted from that health check.
 //!
 //! The on-device eye model is not in this file; it lives in the tracker's flash (and
 //! its blob is backed up separately, named here by the hash of its body). What the
 //! firmware itself reported about that model's calibration does travel here, decoded
-//! off the blob's trailer into `device_result`. The rest is everything client side:
-//! where the panels actually are relative to the tracker, and the residual 2D warp
-//! left after the device model and the pose mapping have done their part.
+//! off the blob's trailer into `device_result`. The rest is client side: the residual
+//! 2D warp left after the device model has done its part.
+//!
+//! Each display entry also carries a pose. Nothing solves poses from gaze any more (the
+//! calibration sweep that did was removed); the retrain copies the configured pose from
+//! the desk file, so `apply_poses` is a no-op on a calibration it wrote. The pose fields
+//! stay so older files still load.
 //!
 //! Applying a calibration means two things, in order:
 //!
-//! 1. `apply_poses` rewrites the pose fields of a `DesktopGeometry`'s outputs, so ray
-//!    intersection happens against the panels where they really are.
+//! 1. `apply_poses` rewrites the pose fields of a `DesktopGeometry`'s outputs from the
+//!    file (the configured ones, for a retrain-written file).
 //! 2. `correct_point` maps an intersected pixel through the display's fitted
 //!    `FieldMap`, in the display's normalised coordinates.
 
@@ -47,7 +52,7 @@ pub const VIRTUAL_AREA: DisplayRect = DisplayRect {
 
 // --- Types ---
 
-/// A display's solved pose in tracker space. Mirrors the pose fields of
+/// A display's pose in tracker space. Mirrors the pose fields of
 /// `OutputGeometry`; shape and logical rect stay with the live desk config.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OutputPose {
@@ -165,16 +170,16 @@ impl HeadGain {
     }
 }
 
-/// Everything the sweep learned about one display.
+/// What the calibration holds for one display.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OutputCalibration {
     /// Connector name, matched against `OutputGeometry::name`.
     pub name           : String,
-    /// Solved pose in tracker space.
+    /// Pose in tracker space (the configured one, for a retrain-written file).
     pub pose           : OutputPose,
     /// Residual correction field in the display's normalised coordinates.
     pub field          : FieldMap,
-    /// RMS angular residual of the pose solve, degrees.
+    /// RMS angular residual of the pose solve, degrees. Zero since nothing solves poses.
     pub pose_rms_deg   : f64,
     /// Leave-one-out RMS of the field fit, normalised units.
     pub field_rms_norm : f64,
@@ -232,12 +237,11 @@ pub struct FieldFit {
 pub struct Et5Calibration {
     /// Format version, `CALIBRATION_FORMAT` at write time.
     pub format             : u32,
-    /// Unix time the sweep finished.
+    /// Unix time the calibration was written.
     pub created_unix_s     : f64,
     /// Estimated tracker-plus-pursuit latency from the glide segments, seconds.
     pub lag_s              : f64,
-    /// The display whose plane the on-device model was trained against, when the
-    /// sweep ran in direct mode.
+    /// The display whose plane the on-device model was trained against.
     #[serde(default)]
     pub device_output      : Option<String>,
     /// The exact plane declared during that training. The firmware's 2D output is
@@ -305,7 +309,7 @@ impl Et5Calibration {
             .unwrap_or(0.0)
     }
 
-    /// The entry for a display, if the sweep covered it.
+    /// The entry for a display, if the calibration covers it.
     pub fn output(&self, name: &str) -> Option<&OutputCalibration> {
         self.outputs.iter().find(|o| o.name == name)
     }
@@ -358,7 +362,7 @@ impl Et5Calibration {
     }
 
     /// Rewrites the pose fields of every matching output in `geometry` with the
-    /// solved poses. Outputs the sweep did not cover keep their configured pose.
+    /// stored poses. Outputs the calibration does not cover keep their configured pose.
     pub fn apply_poses(&self, geometry: &mut DesktopGeometry) {
         for out in &mut geometry.outputs {
             let Some(entry) = self.outputs.iter().find(|o| o.name == out.name) else {
@@ -373,7 +377,7 @@ impl Et5Calibration {
     }
 
     /// Maps an intersected pixel through the display's correction field. Points on
-    /// displays the sweep did not cover pass through unchanged; the corrected point
+    /// displays the calibration does not cover pass through unchanged; the corrected point
     /// is clamped to the display so a correction can never move it onto a neighbour.
     pub fn correct_point(&self, output: &OutputGeometry, p: GlobalPx) -> GlobalPx {
         let Some(entry) = self.output(&output.name) else {

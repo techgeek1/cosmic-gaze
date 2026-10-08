@@ -1,6 +1,6 @@
 //! The per-display correction field: a low-order 2D polynomial from where the
-//! (device-calibrated, pose-mapped) gaze landed to where it should have landed, fitted
-//! on sweep data and applied to every sample at run time.
+//! (device-calibrated) gaze landed to where it should have landed, fitted
+//! on the post-retrain health check and applied to every sample at run time.
 //!
 //! Everything here works in a display's normalised coordinates, `[-1, 1]^2` over the
 //! visible area, so coefficients are dimensionless, comparable between panels, and the
