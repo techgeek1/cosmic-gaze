@@ -1,7 +1,7 @@
 cosmic-gaze
 Copyright (c) 2026 techgeek1
-Licensed under either of the MIT licence (LICENSE-MIT) or the Apache License 2.0
-(LICENSE-APACHE), at your option.
+Licensed under the GNU General Public License, version 3 only (GPL-3.0-only); see
+LICENSE. The licence follows from the tobiifree material described below.
 
 Acknowledgements
 ================
@@ -11,7 +11,11 @@ protocol other people worked out first:
 
 - tobiifree (https://github.com/Aetherall/tobiifree, GPL-3.0) documented the ET5's USB
   protocol: the TTP framing, the TLV payloads, the realm unlock and the gaze stream
-  columns, along with the opcode map and blob framing in its issue #3.
+  columns, along with the opcode map and blob framing in its issue #3. Two things in
+  crates/gaze-provider-et5/src/ttp.rs come from its Zig driver
+  (driver/src/tobiifree_core.zig): the 47-byte hello payload and the 20-byte subscribe
+  template, taken verbatim, and the frame-builder and reassembly tests, translated from
+  its tests with the same scenarios, inputs and expected values.
 - nottobii (https://github.com/puffnfresh/nottobii, GPL-3.0) recorded the Windows
   driver's initialisation order from packet captures, which the connect sequence in
   device.rs follows.
@@ -35,19 +39,13 @@ Models (not distributed by this repository; see README.md)
 - PP-OCRv5 mobile text detector by PaddlePaddle (Apache-2.0), in the ONNX conversion
   published at https://huggingface.co/webnn/PP-OCRv5-ONNX.
 
-Design references
------------------
+References
+----------
 
-The code comments cite these patents as the designs some parts are shaped after. They
-are named as references only.
-
-- Gaze filtering (crates/gaze-snap/src/filter.rs): Tobii, [patent reference removed], zero-delay
-  gaze filtering (an I-VT state machine gating a fixation-only smoother).
-- Target snapping (crates/gaze-snap/src/snap.rs): Apple, [patent reference removed], fuzzy hit
-  testing.
-- Retrain ceremony (crates/gaze-provider-et5/src/retrain.rs): Tobii, [patent reference removed], on
-  calibrating across pupil sizes.
-
-The fixation smoother is the one-euro filter: G. Casiez, N. Roussel, D. Vogel, "1€
-Filter: A Simple Speed-based Low-pass Filter for Noisy Input in Interactive Systems",
-CHI 2012.
+- Fixation classification: D. D. Salvucci and J. H. Goldberg, "Identifying Fixations and
+  Saccades in Eye-Tracking Protocols", ETRA 2000 (the I-VT velocity-threshold method in
+  crates/gaze-snap/src/filter.rs).
+- Fixation smoothing: G. Casiez, N. Roussel, D. Vogel, "1€ Filter: A Simple Speed-based
+  Low-pass Filter for Noisy Input in Interactive Systems", CHI 2012.
+- Edge scrolling: M. Kumar and T. Winograd, "Gaze-enhanced Scrolling Techniques",
+  UIST 2007 (crates/gaze-proto/src/edge_scroll.rs).

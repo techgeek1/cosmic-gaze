@@ -6,10 +6,12 @@ natively. No vendor SDK, no daemon, no Windows.
 ## Protocol provenance
 
 The wire formats (TTP framing, TLV payloads, the HMAC-MD5 realm unlock, the 0x500
-gaze stream columns, calibration ops) are a from-scratch Rust implementation of the
-byte-level protocol documented by the tobiifree reverse-engineering project and
-verified against this unit. No code was copied; `src/ttp.rs` ports the observed byte
-layouts and test vectors only.
+gaze stream columns, calibration ops) follow the byte-level protocol documented by the
+tobiifree reverse-engineering project ([Aetherall/tobiifree](https://github.com/Aetherall/tobiifree),
+GPL-3.0) and were verified against this unit. Parts of `src/ttp.rs` come from tobiifree's
+Zig driver: the 47-byte hello payload and the 20-byte subscribe template were taken from
+it verbatim, and the frame-builder and reassembly tests were translated from its tests
+(same scenarios, inputs and expected values). That is why this project is GPL-3.0-only.
 
 ## Device setup
 
@@ -224,7 +226,7 @@ Calibration files and blobs are gitignored (`/config/calibration*`).
 
 ## What was and was not run
 
-Unit tests cover the wire protocol against captured reference vectors, the gaze
+Unit tests cover the wire protocol against reference vectors translated from tobiifree's tests, the gaze
 decoder, the correction field fits, the head-gain regression, the retrain's plan
 (plane pitch, training rectangle, round schedule), its acceptance gate as a pure
 function (the nearest-target vote with and without a radius, and a one-target round

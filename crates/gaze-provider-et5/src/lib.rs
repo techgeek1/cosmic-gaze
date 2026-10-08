@@ -1,10 +1,11 @@
 //! gaze-provider-et5: a `GazeProvider` for the Tobii Eye Tracker 5, speaking the ET5's
 //! USB protocol natively (no vendor SDK, no daemon).
 //!
-//! The wire protocol is a from-scratch Rust implementation of the byte formats
-//! documented by the tobiifree reverse-engineering effort and confirmed against this
-//! unit: TTP frames over bulk USB with TLV payloads, an HMAC-MD5 realm unlock for the
-//! calibration ops, and the 0x500 gaze notification stream. The device does the eye
+//! The wire protocol is a Rust implementation of the byte formats documented by the
+//! tobiifree reverse-engineering effort (GPL-3.0), confirmed against this unit: TTP
+//! frames over bulk USB with TLV payloads, an HMAC-MD5 realm unlock for the calibration
+//! ops, and the 0x500 gaze notification stream. The hello and subscribe payloads and
+//! the frame tests in [`ttp`] are taken or translated from tobiifree. The device does the eye
 //! tracking; this crate turns its tracker-space output into `gaze_core::GazeSample`s
 //! with a desk-frame ray, and owns the calibration story: the on-device eye model,
 //! the declared plane, and a client-side correction field fitted from the health check.

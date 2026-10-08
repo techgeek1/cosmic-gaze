@@ -2,8 +2,10 @@
 //! inbound reassembly buffer. Byte-level only, no I/O. `crate::transport` moves these
 //! bytes over USB and `crate::device` gives them meaning.
 //!
-//! Wire shapes (reverse engineered; provenance is the tobiifree project, confirmed
-//! against this unit):
+//! The wire shapes were reverse engineered by the tobiifree project (GPL-3.0) and
+//! confirmed against this unit. `HELLO_PAYLOAD` and the subscribe template are taken
+//! verbatim from tobiifree's Zig driver, and the frame-builder and accumulator tests
+//! below are translated from its tests. The shapes:
 //!
 //! - Outbound USB transfer: `[0x00, 0, 0, 0][ttp_len: u32 LE][TTP frame]`. The length
 //!   excludes the 8-byte envelope itself.
@@ -211,8 +213,9 @@ fn empty_command(seq: u32, op: u32) -> Vec<u8> {
 
 // --- Request builders ---
 
-/// Payload of the hello request, replicated byte for byte from USB captures. Encodes a
-/// capability/version list the device expects but whose fields are not understood.
+/// Payload of the hello request, taken verbatim from tobiifree, which replicated it from
+/// USB captures. Encodes a capability/version list the device expects but whose fields
+/// are not understood.
 const HELLO_PAYLOAD: [u8; 47] = [
     0x00, 0x00, 0x17, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x09,
     0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x02,
@@ -225,8 +228,8 @@ pub fn hello(seq: u32) -> Vec<u8> {
     command(seq, OP_HELLO, &HELLO_PAYLOAD)
 }
 
-/// Builds a stream subscription. The 20-byte payload is a captured template with the
-/// stream id patched in at bytes 9..11 (big endian).
+/// Builds a stream subscription. The 20-byte payload is tobiifree's captured template,
+/// taken verbatim, with the stream id patched in at bytes 9..11 (big endian).
 pub fn subscribe(seq: u32, stream_id: u16) -> Vec<u8> {
     let mut payload: [u8; 20] = [
         0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,

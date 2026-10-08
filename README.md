@@ -53,8 +53,13 @@ and a calibration: `cargo run --release --bin gaze-et5-cli -- calibrate` writes
 
 ## Models and licences
 
-The code is MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`). This repo distributes no
-model files. The detector models under `models/` are not ours, and you get them yourself:
+The code is GPL-3.0-only (`LICENSE`). That is not a preference so much as a
+consequence: the ET5 driver includes protocol payloads taken from, and tests translated
+from, [tobiifree](https://github.com/Aetherall/tobiifree), which is GPL-3.0
+(`crates/gaze-provider-et5/README.md` and `NOTICE` say exactly what).
+
+This repo distributes no model files. The detector models under `models/` are not ours,
+and you get them yourself:
 
 - `ch_PP-OCRv5_det.onnx` is PaddlePaddle's PP-OCRv5 mobile text detector, Apache-2.0,
   downloaded by `just fetch-ocr-model` from
@@ -74,4 +79,4 @@ The export tooling is never linked into a binary here.
 
 The ET5 driver stands on tobiifree's protocol documentation, nottobii's capture of the
 Windows driver's init order and Talon's `eye_mouse.py` calibration flow. `NOTICE` has the
-full list, including the papers and patents the filtering and snapping are shaped after.
+full list, along with the papers behind the fixation filter and edge scrolling.
