@@ -1,0 +1,53 @@
+cosmic-gaze
+Copyright (c) 2026 techgeek1
+Licensed under either of the MIT licence (LICENSE-MIT) or the Apache License 2.0
+(LICENSE-APACHE), at your option.
+
+Acknowledgements
+================
+
+The Tobii Eye Tracker 5 driver in crates/gaze-provider-et5 is a Rust implementation of a
+protocol other people worked out first:
+
+- tobiifree (https://github.com/Aetherall/tobiifree, GPL-3.0) documented the ET5's USB
+  protocol: the TTP framing, the TLV payloads, the realm unlock and the gaze stream
+  columns, along with the opcode map and blob framing in its issue #3.
+- nottobii (https://github.com/puffnfresh/nottobii, GPL-3.0) recorded the Windows
+  driver's initialisation order from packet captures, which the connect sequence in
+  device.rs follows.
+- Talon's talon_plugins/eye_mouse.py (https://talonvoice.com) supplied the calibration
+  opcode map and the round schedule the retrain ceremony is modelled on (small rounds
+  with an apply after each, Talon's 1, 4 and 4 points over a 600x340 mm area), along
+  with its gaze-vote acceptance gate.
+
+The Daydream controller packet layout in crates/gaze-daydream follows mrdoob's reverse
+engineering in daydream-controller.js (https://github.com/mrdoob/daydream-controller.js,
+MIT).
+
+Models (not distributed by this repository; see README.md)
+-----------------------------------------------------------
+
+- TargetFinder widget detector: "TargetFinder: Detecting Widgets from Pixels on Desktop
+  Interfaces", arXiv:2607.19907. Code and checkpoints at
+  https://github.com/ahmedbenakouche/target_finder_toolkit (MIT). The checkpoints are an
+  Ultralytics YOLO26n fine-tune whose metadata says AGPL-3.0; the export is made locally
+  by crates/gaze-detect/scripts/fetch_models.py, which runs Ultralytics (AGPL-3.0).
+- PP-OCRv5 mobile text detector by PaddlePaddle (Apache-2.0), in the ONNX conversion
+  published at https://huggingface.co/webnn/PP-OCRv5-ONNX.
+
+Design references
+-----------------
+
+The code comments cite these patents as the designs some parts are shaped after. They
+are named as references only.
+
+- Gaze filtering (crates/gaze-snap/src/filter.rs): Tobii, [patent reference removed], zero-delay
+  gaze filtering (an I-VT state machine gating a fixation-only smoother).
+- Target snapping (crates/gaze-snap/src/snap.rs): Apple, [patent reference removed], fuzzy hit
+  testing.
+- Retrain ceremony (crates/gaze-provider-et5/src/retrain.rs): Tobii, [patent reference removed], on
+  calibrating across pupil sizes.
+
+The fixation smoother is the one-euro filter: G. Casiez, N. Roussel, D. Vogel, "1€
+Filter: A Simple Speed-based Low-pass Filter for Noisy Input in Interactive Systems",
+CHI 2012.
