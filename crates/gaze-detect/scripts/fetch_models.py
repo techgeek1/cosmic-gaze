@@ -32,8 +32,13 @@ Usage
     uv run --python 3.12 crates/gaze-detect/scripts/fetch_models.py --variant yolo26s-640
     uv run --python 3.12 crates/gaze-detect/scripts/fetch_models.py --no-export
 
-Set UV_TORCH_BACKEND=cpu so uv resolves CPU torch instead of the CUDA wheels; there is no
-CUDA on this machine.
+Set UV_TORCH_BACKEND=cpu so uv resolves CPU torch instead of the CUDA wheels, unless you
+have CUDA and want it.
+
+Licence
+    This script installs and runs Ultralytics, which is AGPL-3.0. It runs on your machine
+    and its output stays there: cosmic-gaze does not distribute the exported model, and no
+    binary in the workspace links Ultralytics. `just export-widget-model` runs it.
 """
 
 import argparse

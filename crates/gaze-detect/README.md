@@ -67,12 +67,23 @@ and 95 ms with the default pointer tile (widget 29 ms to 51 ms, OCR 43 ms either
 
 ## Getting the models
 
+This repo does not distribute either model. Both land in `models/` at the repo root,
+which is gitignored.
+
 ```bash
-# from the repo root; models land in models/ (gitignored)
+just fetch-ocr-model       # PP-OCRv5 det (Apache-2.0), straight from Hugging Face
+just export-widget-model   # TargetFinder, exported on your machine (runs Ultralytics, AGPL-3.0)
+```
+
+`export-widget-model` is this script:
+
+```bash
 UV_TORCH_BACKEND=cpu uv run --python 3.12 crates/gaze-detect/scripts/fetch_models.py
 ```
 
-That downloads the TargetFinder PyTorch checkpoint, exports it to ONNX with Ultralytics,
+It runs Ultralytics, which is AGPL-3.0, and the exported `yolo26n-640.onnx` carries the
+AGPL-3.0 string in its metadata (see the licence caveat below). The export is yours; it is
+not something this repo hands you. That script downloads the TargetFinder PyTorch checkpoint, exports it to ONNX with Ultralytics,
 downloads the PP-OCRv5 detection model, and prints both models' tensor shapes. It takes
 about two minutes on a cold cache, almost all of it pulling CPU torch.
 
@@ -80,7 +91,7 @@ about two minutes on a cold cache, almost all of it pulling CPU torch.
 the `.onnx`). `--variant yolo26s-640` picks a bigger backbone; see the table below.
 
 Python 3.12 rather than 3.14 because torch has no 3.14 wheels yet. `UV_TORCH_BACKEND=cpu`
-keeps uv from resolving the CUDA wheels; there is no CUDA on this machine (RX 7900 XT).
+keeps uv from resolving the CUDA wheels; the development machine has no CUDA (an RX 7900 XT).
 
 ## Models
 
