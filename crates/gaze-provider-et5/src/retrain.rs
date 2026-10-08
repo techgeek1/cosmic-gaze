@@ -28,7 +28,7 @@
 //! 4. **Four rounds, `cal_points_apply` after each.** Centre, then the four mid-edges,
 //!    then the four corners on black, then the four corners again on white: thirteen
 //!    points. Two backgrounds because a pupil-radius term in the firmware fit is only
-//!    identifiable if it has seen both extremes (Tobii [patent reference removed]), and the eye
+//!    identifiable if it has seen both extremes of pupil size, and the eye
 //!    needs seconds to adapt after each flip. Thirteen rather than eighteen because
 //!    the device keeps only its newest [`DEVICE_POINT_CAP`] points; see "The point
 //!    cap" below.

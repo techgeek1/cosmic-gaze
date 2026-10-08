@@ -1,9 +1,8 @@
 //! Fuzzy hit testing: turn a noisy gaze point into the target the user meant.
 //!
-//! The shape is Apple's fuzzy hit testing patent ([patent reference removed]): enumerate the
-//! candidates near the gaze point, rank them by element type, then by nesting depth,
-//! then by angular distance, and favour the target that is already selected so the
-//! highlight does not flicker between neighbours. Two deliberate departures:
+//! Enumerate the candidates near the gaze point, rank them by element type, by nesting
+//! depth and by angular distance, and favour the target that is already selected so the
+//! highlight does not flicker between neighbours. How the ranking is done:
 //!
 //! * The ranking is a weighted sum, not a lexicographic sort. Lexicographic ranking says
 //!   a button two degrees away always beats a text run under the gaze point, which is

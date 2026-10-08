@@ -1,8 +1,9 @@
 //! Fixation classification and smoothing, in that order.
 //!
-//! The architecture is Tobii's zero-delay filtering ([patent reference removed]): an I-VT state
-//! machine decides whether the eye is holding still or in flight, and a one-euro
-//! smoother runs *only* while it is holding still. Saccades pass through untouched, so a
+//! A velocity-threshold classifier (I-VT; Salvucci and Goldberg, "Identifying Fixations
+//! and Saccades in Eye-Tracking Protocols", ETRA 2000) decides whether the eye is
+//! holding still or in flight, and a One Euro smoother (Casiez, Roussel and Vogel,
+//! CHI 2012) runs *only* while it is holding still. Saccades pass through untouched, so a
 //! warp lands where the eye landed instead of being dragged back toward where the eye
 //! was, and the smoother restarts from the new fixation's first sample.
 //!
