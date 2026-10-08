@@ -5,9 +5,6 @@
 /.venv
 __pycache__/
 /overlays/
-/sidecar/.venv/
-/sidecar/debug/
-/sidecar/tests/data/
 # Personal: desk-specific calibration and its blob (regenerate with gaze-et5-cli calibrate).
 /config/calibration*.toml
 /config/calibration*.jsonl
